@@ -363,8 +363,8 @@ Planned future improvements for DocSync include:
 - Add user authentication for a future hosted version.
 - Migrate from SQLite to PostgreSQL for hosted deployments.
 - Add secure cloud storage and document synchronisation for a future hosted version.
-- improve the UI with online tools to improve the experience
-
+- Improve the UI with online tools to improve the experience
+- Add indentaions and numbered lists 
 ## Safety model
 
 DocSync is designed around explicit confirmation:
