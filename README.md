@@ -364,7 +364,10 @@ Planned future improvements for DocSync include:
 - Migrate from SQLite to PostgreSQL for hosted deployments.
 - Add secure cloud storage and document synchronisation for a future hosted version.
 - Improve the UI with online tools to improve the experience
-- Add indentaions and numbered lists 
+- Add indentaions and numbered lists
+- Make it online so I can push updates over internet and maintain the program
+
+ 
 ## Safety model
 
 DocSync is designed around explicit confirmation:
