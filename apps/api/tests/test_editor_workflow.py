@@ -683,3 +683,366 @@ def test_invalid_delta_and_unsupported_block_leave_no_version_or_operation(
         assert history.json()["events"] == []
         generated_root = tmp_path / "data" / "generated"
         assert list(generated_root.rglob("*")) == []
+
+
+def test_restore_historical_version_creates_new_current_version_and_audit(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    original_text = "The original wording remains available."
+    replacement_text = "The revised wording is now current."
+    originals = {
+        "Alpha.docx": make_paragraph_docx("Alpha agreement", [original_text]),
+        "Beta.docx": make_paragraph_docx(
+            "Beta agreement",
+            ["This document remains unchanged."],
+        ),
+    }
+
+    app = load_test_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        workspace = upload_set(client, originals)
+        documents = documents_by_name(workspace)
+        alpha = documents["Alpha.docx"]
+        alpha_v1_id = alpha["version_id"]
+        source = block_with_text(
+            read_editor_content(client, alpha_v1_id),
+            original_text,
+        )
+
+        generated = client.post(
+            f"/api/document-sets/{workspace['id']}/editor-generate",
+            json={
+                "base_versions": {alpha["id"]: alpha_v1_id},
+                "source_element_id": source["element_id"],
+                "edit_mode": "per_document",
+                "targets": [
+                    {
+                        "element_id": source["element_id"],
+                        "replacement_text": replacement_text,
+                    }
+                ],
+            },
+        )
+        assert generated.status_code == 201, generated.text
+        alpha_v2 = generated.json()["versions"][0]
+        alpha_v2_id = alpha_v2["version_id"]
+
+        restored = client.post(
+            f"/api/documents/{alpha['id']}/versions/{alpha_v1_id}/restore",
+            json={"expected_current_version_id": alpha_v2_id},
+        )
+        assert restored.status_code == 201, restored.text
+        payload = restored.json()
+        alpha_v3 = payload["version"]
+
+        assert payload["operation_type"] == "version_restore"
+        assert payload["restored_from_version_id"] == alpha_v1_id
+        assert payload["restored_from_version_number"] == 1
+        assert payload["previous_current_version_id"] == alpha_v2_id
+        assert alpha_v3["version_number"] == 3
+        assert alpha_v3["parent_version_id"] == alpha_v2_id
+        assert alpha_v3["restored_from_version_id"] == alpha_v1_id
+        assert alpha_v3["restored_from_version_number"] == 1
+        assert alpha_v3["version_id"] not in {alpha_v1_id, alpha_v2_id}
+        assert alpha_v3["checksum_sha256"] == hashlib.sha256(
+            originals["Alpha.docx"]
+        ).hexdigest()
+
+        versions_response = client.get(f"/api/documents/{alpha['id']}/versions")
+        assert versions_response.status_code == 200, versions_response.text
+        versions_payload = versions_response.json()
+        assert versions_payload["current_version_id"] == alpha_v3["version_id"]
+        assert [
+            version["version_number"] for version in versions_payload["versions"]
+        ] == [3, 2, 1]
+        assert versions_payload["versions"][0]["operation_type"] == "version_restore"
+        assert (
+            versions_payload["versions"][0]["restored_from_version_id"]
+            == alpha_v1_id
+        )
+        assert versions_payload["versions"][0]["restored_from_version_number"] == 1
+
+        original_download = client.get(
+            f"/api/document-versions/{alpha_v1_id}/download"
+        )
+        revised_download = client.get(
+            f"/api/document-versions/{alpha_v2_id}/download"
+        )
+        restored_download = client.get(alpha_v3["download_url"])
+        current_download = client.get(f"/api/documents/{alpha['id']}/download")
+        assert original_download.content == originals["Alpha.docx"]
+        assert replacement_text in "\n".join(
+            paragraph.text
+            for paragraph in Document(io.BytesIO(revised_download.content)).paragraphs
+        )
+        assert restored_download.content == originals["Alpha.docx"]
+        assert current_download.content == originals["Alpha.docx"]
+
+        restored_content = read_editor_content(client, alpha_v3["version_id"])
+        assert restored_content["current_version"] is True
+        assert block_with_text(restored_content, original_text)
+
+        archive = client.get(payload["download_url"])
+        assert archive.status_code == 200, archive.text
+        with zipfile.ZipFile(io.BytesIO(archive.content)) as bundle:
+            assert set(bundle.namelist()) == set(originals)
+            assert bundle.read("Alpha.docx") == originals["Alpha.docx"]
+            assert bundle.read("Beta.docx") == originals["Beta.docx"]
+
+        history = client.get(f"/api/document-sets/{workspace['id']}/history")
+        assert history.status_code == 200, history.text
+        restore_event = history.json()["events"][0]
+        assert restore_event["event_type"] == "version_restore"
+        assert restore_event["operation_type"] == "version_restore"
+        assert restore_event["restored_from_version_id"] == alpha_v1_id
+        assert restore_event["restored_from_version_number"] == 1
+        assert restore_event["previous_current_version_id"] == alpha_v2_id
+        assert restore_event["version_count"] == 1
+        assert restore_event["target_count"] == 0
+
+
+def test_restore_rejects_stale_mismatched_and_current_versions_without_writes(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    original_text = "The first version of Alpha."
+    originals = {
+        "Alpha.docx": make_paragraph_docx("Alpha", [original_text]),
+        "Beta.docx": make_paragraph_docx("Beta", ["The first version of Beta."]),
+    }
+
+    app = load_test_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        workspace = upload_set(client, originals)
+        documents = documents_by_name(workspace)
+        alpha = documents["Alpha.docx"]
+        beta = documents["Beta.docx"]
+        source = block_with_text(
+            read_editor_content(client, alpha["version_id"]),
+            original_text,
+        )
+        generated = client.post(
+            f"/api/document-sets/{workspace['id']}/editor-generate",
+            json={
+                "base_versions": {alpha["id"]: alpha["version_id"]},
+                "source_element_id": source["element_id"],
+                "edit_mode": "per_document",
+                "targets": [
+                    {
+                        "element_id": source["element_id"],
+                        "replacement_text": "The second version of Alpha.",
+                    }
+                ],
+            },
+        )
+        assert generated.status_code == 201, generated.text
+        alpha_v2_id = generated.json()["versions"][0]["version_id"]
+
+        generated_root = tmp_path / "data" / "generated"
+        files_before = {
+            path.relative_to(generated_root)
+            for path in generated_root.rglob("*")
+            if path.is_file()
+        }
+
+        stale = client.post(
+            (
+                f"/api/documents/{alpha['id']}/versions/"
+                f"{alpha['version_id']}/restore"
+            ),
+            json={"expected_current_version_id": alpha["version_id"]},
+        )
+        assert stale.status_code == 409
+        assert "changed after version history was opened" in stale.json()["detail"]
+
+        mismatched = client.post(
+            (
+                f"/api/documents/{alpha['id']}/versions/"
+                f"{beta['version_id']}/restore"
+            ),
+            json={"expected_current_version_id": alpha_v2_id},
+        )
+        assert mismatched.status_code == 422
+        assert "does not belong to this document" in mismatched.json()["detail"]
+
+        already_current = client.post(
+            f"/api/documents/{alpha['id']}/versions/{alpha_v2_id}/restore",
+            json={"expected_current_version_id": alpha_v2_id},
+        )
+        assert already_current.status_code == 409
+        assert "already current" in already_current.json()["detail"]
+
+        versions = client.get(f"/api/documents/{alpha['id']}/versions")
+        assert versions.status_code == 200, versions.text
+        assert versions.json()["current_version_id"] == alpha_v2_id
+        assert len(versions.json()["versions"]) == 2
+
+        history = client.get(f"/api/document-sets/{workspace['id']}/history")
+        assert history.status_code == 200, history.text
+        assert len(history.json()["events"]) == 1
+        assert history.json()["events"][0]["event_type"] == "editor_edit"
+
+        files_after = {
+            path.relative_to(generated_root)
+            for path in generated_root.rglob("*")
+            if path.is_file()
+        }
+        assert files_after == files_before
+
+
+def test_restore_storage_collision_preserves_unowned_directory_and_database(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    original_text = "The original collision-test wording."
+    originals = {
+        "Alpha.docx": make_paragraph_docx("Alpha", [original_text]),
+        "Beta.docx": make_paragraph_docx(
+            "Beta",
+            ["The unchanged collision-test companion."],
+        ),
+    }
+
+    app = load_test_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        workspace = upload_set(client, originals)
+        alpha = documents_by_name(workspace)["Alpha.docx"]
+        source = block_with_text(
+            read_editor_content(client, alpha["version_id"]),
+            original_text,
+        )
+        generated = client.post(
+            f"/api/document-sets/{workspace['id']}/editor-generate",
+            json={
+                "base_versions": {alpha["id"]: alpha["version_id"]},
+                "source_element_id": source["element_id"],
+                "edit_mode": "per_document",
+                "targets": [
+                    {
+                        "element_id": source["element_id"],
+                        "replacement_text": "The second collision-test wording.",
+                    }
+                ],
+            },
+        )
+        assert generated.status_code == 201, generated.text
+        alpha_v2_id = generated.json()["versions"][0]["version_id"]
+
+        collision_id = "11111111-1111-4111-8111-111111111111"
+        collision_directory = (
+            tmp_path
+            / "data"
+            / "generated"
+            / workspace["id"]
+            / collision_id
+        )
+        collision_directory.mkdir(parents=True)
+        sentinel = collision_directory / "do-not-delete.txt"
+        sentinel.write_text("owned by another operation", encoding="utf-8")
+
+        editor_service = sys.modules["app.editor_service"]
+        monkeypatch.setattr(editor_service, "new_id", lambda: collision_id)
+
+        collided = client.post(
+            (
+                f"/api/documents/{alpha['id']}/versions/"
+                f"{alpha['version_id']}/restore"
+            ),
+            json={"expected_current_version_id": alpha_v2_id},
+        )
+        assert collided.status_code == 409, collided.text
+        assert "storage collision" in collided.json()["detail"]
+        assert sentinel.read_text(encoding="utf-8") == "owned by another operation"
+
+        versions = client.get(f"/api/documents/{alpha['id']}/versions")
+        assert versions.status_code == 200, versions.text
+        assert versions.json()["current_version_id"] == alpha_v2_id
+        assert len(versions.json()["versions"]) == 2
+
+        history = client.get(f"/api/document-sets/{workspace['id']}/history")
+        assert history.status_code == 200, history.text
+        assert len(history.json()["events"]) == 1
+
+
+def test_restore_serialization_failure_rolls_back_before_commit(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    original_text = "The original serialization-test wording."
+    originals = {
+        "Alpha.docx": make_paragraph_docx("Alpha", [original_text]),
+        "Beta.docx": make_paragraph_docx(
+            "Beta",
+            ["The unchanged serialization-test companion."],
+        ),
+    }
+
+    app = load_test_app(tmp_path, monkeypatch)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        workspace = upload_set(client, originals)
+        alpha = documents_by_name(workspace)["Alpha.docx"]
+        source = block_with_text(
+            read_editor_content(client, alpha["version_id"]),
+            original_text,
+        )
+        generated = client.post(
+            f"/api/document-sets/{workspace['id']}/editor-generate",
+            json={
+                "base_versions": {alpha["id"]: alpha["version_id"]},
+                "source_element_id": source["element_id"],
+                "edit_mode": "per_document",
+                "targets": [
+                    {
+                        "element_id": source["element_id"],
+                        "replacement_text": "The second serialization-test wording.",
+                    }
+                ],
+            },
+        )
+        assert generated.status_code == 201, generated.text
+        alpha_v2_id = generated.json()["versions"][0]["version_id"]
+
+        generated_root = tmp_path / "data" / "generated"
+        files_before = {
+            path.relative_to(generated_root)
+            for path in generated_root.rglob("*")
+            if path.is_file()
+        }
+
+        document_service = sys.modules["app.document_service"]
+
+        def fail_serialization(_document_set) -> dict:
+            raise RuntimeError("Injected refreshed-set serialization failure.")
+
+        monkeypatch.setattr(
+            document_service,
+            "serialize_document_set",
+            fail_serialization,
+        )
+
+        failed = client.post(
+            (
+                f"/api/documents/{alpha['id']}/versions/"
+                f"{alpha['version_id']}/restore"
+            ),
+            json={"expected_current_version_id": alpha_v2_id},
+        )
+        assert failed.status_code == 500
+
+        versions = client.get(f"/api/documents/{alpha['id']}/versions")
+        assert versions.status_code == 200, versions.text
+        assert versions.json()["current_version_id"] == alpha_v2_id
+        assert len(versions.json()["versions"]) == 2
+
+        history = client.get(f"/api/document-sets/{workspace['id']}/history")
+        assert history.status_code == 200, history.text
+        assert len(history.json()["events"]) == 1
+        assert history.json()["events"][0]["event_type"] == "editor_edit"
+
+        files_after = {
+            path.relative_to(generated_root)
+            for path in generated_root.rglob("*")
+            if path.is_file()
+        }
+        assert files_after == files_before

@@ -177,3 +177,14 @@ class MatchDecisionBatchRequest(BaseModel):
         if len(candidate_ids) != len(set(candidate_ids)):
             raise ValueError("Each candidate may have only one match decision.")
         return value
+
+
+class VersionRestoreRequest(BaseModel):
+    expected_current_version_id: str = Field(min_length=1, max_length=36)
+
+    @field_validator("expected_current_version_id")
+    @classmethod
+    def expected_version_must_be_visible(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("The expected current version ID cannot be blank.")
+        return value

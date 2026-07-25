@@ -127,8 +127,8 @@ textarea:focus-visible {
 
 .brand-logo {
   display: block;
-  width: 110px;
-  height: 54px;
+  width: 220px;
+  height: 108px;
   max-width: 230px;
   object-fit: contain;
   border-radius: 8px;
@@ -181,7 +181,7 @@ textarea:focus-visible {
   letter-spacing: -0.05em;
 }
 
-.hero-text { color: #dce9f5; max-width: 690px; line-height: 1.72; font-size: 1.03rem; }
+.hero-text { color: #2d5d89; line-height: 1.72; font-size: 1.03rem; }
 .trust-row { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 27px; }
 .trust-row span {
   border: 1px solid rgba(255, 255, 255, 0.2);
@@ -1361,7 +1361,7 @@ textarea:focus-visible {
 }
 
 .version-history-menu {
-  width: 280px;
+  width: 350px;
   max-height: 330px;
   position: absolute;
   z-index: 80;
@@ -1375,23 +1375,22 @@ textarea:focus-visible {
   box-shadow: 0 20px 50px rgba(18, 36, 58, 0.2);
 }
 
-.version-history-menu a {
+.version-history-item {
   padding: 9px;
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  justify-content: space-between;
   gap: 12px;
   border-radius: 7px;
   color: var(--ink);
-  text-decoration: none;
 }
 
-.version-history-menu a:hover,
-.version-history-menu a:focus-visible {
+.version-history-item:hover,
+.version-history-item.current {
   background: var(--blue-soft);
 }
 
-.version-history-menu a + a {
+.version-history-item + .version-history-item {
   border-top: 1px solid #eef1f5;
 }
 
@@ -1412,11 +1411,47 @@ textarea:focus-visible {
   font-size: 0.58rem;
 }
 
-.version-history-menu em {
+.version-history-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.version-history-actions a,
+.version-history-actions button {
+  min-height: 28px;
+  padding: 6px 7px;
+  border: 1px solid #cbd6e1;
+  border-radius: 6px;
   color: var(--navy);
+  background: #fff;
+  cursor: pointer;
   font-size: 0.58rem;
-  font-style: normal;
   font-weight: 900;
+  line-height: 1;
+  text-decoration: none;
+}
+
+.version-history-actions a {
+  display: inline-flex;
+  align-items: center;
+}
+
+.version-history-actions button {
+  border-color: #9accc5;
+  color: #07665f;
+  background: #eefaf8;
+}
+
+.version-history-actions a:hover,
+.version-history-actions button:hover:not(:disabled) {
+  border-color: #7d9ab6;
+  background: #edf4fa;
+}
+
+.version-history-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
 }
 
 .workspace-mode-tabs {
@@ -1511,6 +1546,22 @@ textarea:focus-visible {
 }
 
 .editor-inline-error strong {
+  flex: 0 0 auto;
+}
+
+.editor-restore-notice {
+  flex: 0 0 auto;
+  padding: 9px 12px;
+  display: flex;
+  gap: 8px;
+  border-bottom: 1px solid #b9ddd5;
+  color: #075f58;
+  background: #edf9f6;
+  font-size: 0.65rem;
+  line-height: 1.4;
+}
+
+.editor-restore-notice strong {
   flex: 0 0 auto;
 }
 
@@ -1735,6 +1786,35 @@ textarea:focus-visible {
 
 .docsync-quill-toolbar .ql-formats {
   margin-right: 7px !important;
+}
+
+.docsync-quill-toolbar .docsync-history-actions {
+  margin-left: auto;
+  margin-right: 0 !important;
+  display: inline-flex;
+  gap: 4px;
+}
+
+.docsync-quill-toolbar.ql-toolbar.ql-snow .editor-history-button {
+  width: auto;
+  height: 28px;
+  padding: 5px 8px;
+  float: none;
+  border: 1px solid #c8d4df;
+  border-radius: 6px;
+  color: var(--navy);
+  background: #fff;
+  font-family: inherit;
+  font-size: 0.59rem;
+  font-weight: 850;
+  line-height: 1;
+}
+
+.docsync-quill-toolbar.ql-toolbar.ql-snow
+  .editor-history-button:hover:not(:disabled) {
+  border-color: #84a5c1;
+  color: #075f58;
+  background: #eef7f5;
 }
 
 .docsync-quill-toolbar button:disabled,
@@ -2714,7 +2794,7 @@ textarea:focus-visible {
   }
 
   .version-history-menu {
-    width: min(280px, calc(100vw - 38px));
+    width: min(350px, calc(100vw - 38px));
     right: auto;
     left: 0;
   }

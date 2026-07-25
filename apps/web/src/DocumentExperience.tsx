@@ -23,6 +23,7 @@ import {
   previewEdit,
   previewEditorEdit,
   renderDocumentView,
+  restoreDocumentVersion,
   saveMatchDecisions,
   versionDownloadUrl,
 } from "./api";
@@ -60,7 +61,7 @@ import type {
 
 type WorkspaceMode = "layout" | "edit" | "compare";
 type LoadingStatus = "idle" | "loading" | "ready" | "error";
-type EditorAction = "preview" | "generate" | null;
+type EditorAction = "preview" | "generate" | "restore" | null;
 
 interface DocumentExperienceProps {
   documentSet: DocumentSetResponse;
@@ -373,6 +374,10 @@ function normaliseVersions(
           typeof item.created_at === "string" ? item.created_at : "",
         status: typeof item.status === "string" ? item.status : "completed",
         is_current: Boolean(item.is_current),
+        parent_version_id:
+          typeof item.parent_version_id === "string"
+            ? item.parent_version_id
+            : null,
         download_url:
           typeof item.download_url === "string"
             ? item.download_url
@@ -380,6 +385,18 @@ function normaliseVersions(
         generation_id:
           typeof item.generation_id === "string"
             ? item.generation_id
+            : null,
+        operation_type:
+          typeof item.operation_type === "string"
+            ? item.operation_type
+            : null,
+        restored_from_version_id:
+          typeof item.restored_from_version_id === "string"
+            ? item.restored_from_version_id
+            : null,
+        restored_from_version_number:
+          typeof item.restored_from_version_number === "number"
+            ? item.restored_from_version_number
             : null,
       };
     })
@@ -396,7 +413,7 @@ function normaliseVersions(
     current_version_id: currentVersionId,
     versions: versions.map((version) => ({
       ...version,
-      is_current: version.id === currentVersionId || version.is_current,
+      is_current: version.id === currentVersionId,
     })),
   };
 }
@@ -593,13 +610,39 @@ export default function DocumentExperience({
   const [versionStatus, setVersionStatus] =
     useState<LoadingStatus>("idle");
   const [versionApiAvailable, setVersionApiAvailable] = useState(false);
+  const [restoringVersionId, setRestoringVersionId] = useState("");
+  const [restoreNotice, setRestoreNotice] = useState("");
+  const [restoreError, setRestoreError] = useState("");
   const [refreshToken, setRefreshToken] = useState(0);
   const [lastGeneration, setLastGeneration] =
     useState<EditorGenerationResponse | null>(null);
   const previewButtonRef = useRef<HTMLButtonElement>(null);
+  const versionHistoryRef = useRef<HTMLDetailsElement>(null);
+  const mountedRef = useRef(false);
+  const activeDocumentIdRef = useRef(document?.id ?? "");
+  const documentContextRef = useRef({
+    documentId: document?.id ?? "",
+    token: 0,
+  });
   const contentRequestRef = useRef(0);
   const layoutRequestRef = useRef(0);
   const matchRequestRef = useRef(0);
+
+  activeDocumentIdRef.current = document?.id ?? "";
+  if (documentContextRef.current.documentId !== activeDocumentIdRef.current) {
+    documentContextRef.current = {
+      documentId: activeDocumentIdRef.current,
+      token: documentContextRef.current.token + 1,
+    };
+  }
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      documentContextRef.current.token += 1;
+    };
+  }, []);
 
   const selectedBlock = useMemo(
     () =>
@@ -636,6 +679,12 @@ export default function DocumentExperience({
   }, [dirty, onDirtyChange, perDocumentDirty]);
 
   useEffect(() => {
+    setRestoreNotice("");
+    setRestoreError("");
+    setRestoringVersionId("");
+  }, [document?.id]);
+
+  useEffect(() => {
     if (!document) {
       setEditorContent(null);
       setContentStatus("idle");
@@ -657,9 +706,13 @@ export default function DocumentExperience({
     setLastGeneration(null);
 
     async function loadContent() {
+      const requestedVersionId =
+        versions?.document_id === document!.id
+          ? versions.current_version_id
+          : document!.current_version_id ?? document!.version_id;
       try {
         const response = await fetchEditorContent(
-          document!.current_version_id ?? document!.version_id,
+          requestedVersionId,
           controller.signal,
         );
         if (requestId !== contentRequestRef.current) return;
@@ -685,7 +738,7 @@ export default function DocumentExperience({
             fallbackView?.document_id === document!.id
               ? fallbackView
               : await fetchDocumentView(
-                  document!.current_version_id ?? document!.version_id,
+                  requestedVersionId,
                   controller.signal,
                 );
           if (requestId !== contentRequestRef.current) return;
@@ -713,6 +766,8 @@ export default function DocumentExperience({
     document?.current_version_id,
     fallbackView,
     refreshToken,
+    versions?.current_version_id,
+    versions?.document_id,
   ]);
 
   useEffect(() => {
@@ -1154,17 +1209,29 @@ export default function DocumentExperience({
     setPreviewSignature("");
   }
 
-  function cancelDraft() {
+  function discardDraft() {
     if (!selectedBlock) return;
     setDraft({
       delta: selectedBlock.delta,
       text: selectedBlock.text,
     });
-    setTargetReplacements((current) => ({
-      ...current,
-      [selectedBlock.element_id]: selectedBlock.text,
-    }));
+    setTargetReplacements(
+      Object.fromEntries(
+        matches.map((match) => [match.element_id, match.text]),
+      ),
+    );
+    setIncludedElementIds(
+      new Set(
+        matches
+          .filter(
+            (match) =>
+              match.match_type === "source" || match.match_type === "exact",
+          )
+          .map((match) => match.element_id),
+      ),
+    );
     setEditorResetToken((current) => current + 1);
+    setEditMode("shared");
     setPreview(null);
     setPreviewOpen(false);
     setPreviewSignature("");
@@ -1483,11 +1550,123 @@ export default function DocumentExperience({
     editorContent?.version_number ??
     document.version_number ??
     1;
+  const nextVersionNumber =
+    Math.max(
+      0,
+      ...(versions?.versions.map((version) => version.version_number) ?? []),
+    ) + 1;
   const currentDownloadHref = currentVersion?.download_url
     ? absoluteApiUrl(currentVersion.download_url)
     : versionApiAvailable
       ? versionDownloadUrl(currentVersionId)
       : currentDocumentDownloadUrl(document.id);
+
+  async function handleRestoreVersion(version: DocumentVersion) {
+    if (!document || version.is_current || action) return;
+    const activeDocument = document;
+    const documentContextToken = documentContextRef.current.token;
+    const draftWarning =
+      dirty || perDocumentDirty
+        ? "\n\nYour uncommitted draft will be discarded."
+        : "";
+    const confirmed = window.confirm(
+      `Restore Version ${version.version_number}?\n\nDocSync will create Version ${nextVersionNumber} from it. The current version remains in history.${draftWarning}`,
+    );
+    if (!confirmed) return;
+
+    setAction("restore");
+    setRestoringVersionId(version.id);
+    setLocalError("");
+    setRestoreNotice("");
+    setRestoreError("");
+    try {
+      const result = await restoreDocumentVersion(
+        activeDocument.id,
+        version.id,
+        currentVersionId,
+      );
+      if (!mountedRef.current) return;
+      onGenerated({
+        generation_id: result.generation_id ?? result.operation_id,
+        status: result.status,
+        document_set: result.document_set,
+        versions: [result.version],
+      });
+      if (
+        activeDocumentIdRef.current !== activeDocument.id ||
+        documentContextRef.current.token !== documentContextToken
+      ) {
+        return;
+      }
+
+      const restoredVersions = [
+        result.version,
+        ...(versions?.versions ?? []).filter(
+          (candidate) => candidate.id !== result.version.id,
+        ),
+      ]
+        .map((candidate) => ({
+          ...candidate,
+          is_current: candidate.id === result.version.id,
+        }))
+        .sort((left, right) => right.version_number - left.version_number);
+
+      setVersions({
+        document_id: activeDocument.id,
+        current_version_id: result.version.id,
+        versions: restoredVersions,
+      });
+      setVersionStatus("ready");
+      setVersionApiAvailable(true);
+      setEditorContent(null);
+      setContentStatus("loading");
+      setSelectedElementId("");
+      setDraft(null);
+      setMatches([]);
+      setIncludedElementIds(new Set());
+      setTargetReplacements({});
+      setEditMode("shared");
+      setPreview(null);
+      setPreviewOpen(false);
+      setPreviewSignature("");
+      setLastGeneration(null);
+      setEditorResetToken((current) => current + 1);
+      setLayoutView(null);
+      setLayoutRefresh((current) => current + 1);
+      setMode("edit");
+      setRestoreNotice(
+        `Version ${result.version.version_number} was created from Version ${result.restored_from_version_number}.`,
+      );
+      versionHistoryRef.current?.removeAttribute("open");
+      setRefreshToken((current) => current + 1);
+    } catch (error) {
+      if (!mountedRef.current) return;
+      if (
+        activeDocumentIdRef.current !== activeDocument.id ||
+        documentContextRef.current.token !== documentContextToken
+      ) {
+        return;
+      }
+      if (error instanceof ApiError && error.status === 409) {
+        setRestoreError(
+          `${activeDocument.name} changed after version history was opened. No version was restored. The latest history is being reloaded.`,
+        );
+        setRefreshToken((current) => current + 1);
+      } else {
+        setRestoreError(
+          `${activeDocument.name}: ${errorMessage(
+            error,
+            "The selected version could not be restored.",
+          )}`,
+        );
+      }
+    } finally {
+      if (mountedRef.current) {
+        setAction(null);
+        setRestoringVersionId("");
+      }
+    }
+  }
 
   return (
     <>
@@ -1515,21 +1694,21 @@ export default function DocumentExperience({
             >
               Download current
             </a>
-            <details className="version-history">
+            <details
+              ref={versionHistoryRef}
+              className="version-history"
+              aria-busy={action === "restore"}
+            >
               <summary>
                 Version history
                 {versionStatus === "loading" ? "…" : ""}
               </summary>
               <div className="version-history-menu">
                 {versions?.versions.map((version) => (
-                  <a
-                    href={
-                      version.download_url
-                        ? absoluteApiUrl(version.download_url)
-                        : versionApiAvailable
-                          ? versionDownloadUrl(version.id)
-                          : currentDocumentDownloadUrl(document.id)
-                    }
+                  <article
+                    className={`version-history-item ${
+                      version.is_current ? "current" : ""
+                    }`}
                     key={version.id}
                   >
                     <span>
@@ -1538,9 +1717,39 @@ export default function DocumentExperience({
                         {version.is_current ? " · Current" : ""}
                       </strong>
                       <small>{formatDate(version.created_at)}</small>
+                      {version.restored_from_version_number != null && (
+                        <small>
+                          Restored from Version{" "}
+                          {version.restored_from_version_number}
+                        </small>
+                      )}
                     </span>
-                    <em>Download</em>
-                  </a>
+                    <div className="version-history-actions">
+                      <a
+                        href={
+                          version.download_url
+                            ? absoluteApiUrl(version.download_url)
+                            : versionApiAvailable
+                              ? versionDownloadUrl(version.id)
+                              : currentDocumentDownloadUrl(document.id)
+                        }
+                        download
+                      >
+                        Download
+                      </a>
+                      {!version.is_current && versionApiAvailable && (
+                        <button
+                          type="button"
+                          disabled={Boolean(action)}
+                          onClick={() => void handleRestoreVersion(version)}
+                        >
+                          {restoringVersionId === version.id
+                            ? "Restoring…"
+                            : "Restore"}
+                        </button>
+                      )}
+                    </div>
+                  </article>
                 ))}
               </div>
             </details>
@@ -1571,10 +1780,17 @@ export default function DocumentExperience({
           ))}
         </div>
 
-        {localError && (
+        {restoreNotice && (
+          <div className="editor-restore-notice" role="status">
+            <strong>Version restored</strong>
+            <span>{restoreNotice}</span>
+          </div>
+        )}
+
+        {(restoreError || localError) && (
           <div className="editor-inline-error" role="alert">
             <strong>Action needed</strong>
-            <span>{localError}</span>
+            <span>{restoreError || localError}</span>
           </div>
         )}
 
@@ -2177,10 +2393,10 @@ export default function DocumentExperience({
                 <button
                   type="button"
                   className="quiet-button"
-                  onClick={cancelDraft}
+                  onClick={discardDraft}
                   disabled={!dirty && !perDocumentDirty}
                 >
-                  Cancel draft
+                  Discard draft
                 </button>
                 <button
                   ref={previewButtonRef}

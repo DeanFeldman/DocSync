@@ -16,6 +16,18 @@ The editor deliberately does not insert, delete, split, merge, or reorder Word
 blocks. That boundary keeps every editable block mapped to one known DOCX location
 and prevents unsupported content from being silently rewritten.
 
+## Active-block undo and redo
+
+The editor toolbar provides visible **Undo** and **Redo** buttons for the selected
+block. `Ctrl+Z` undoes a draft change; `Ctrl+Y` or `Ctrl+Shift+Z` redoes it.
+The macOS equivalents are `Command+Z` and `Command+Shift+Z`.
+
+These controls operate only on the active block's uncommitted Quill history.
+Opening another block or document version resets that history, and the controls
+are disabled when their history stack is empty or the editor is read-only. Undo
+and redo do not alter a generated version; use version restoration to return
+committed document content to an earlier state.
+
 ## Version and block model
 
 A `DocumentRecord` is the stable logical document. Its original upload is immutable.
@@ -35,6 +47,27 @@ Every version owns immutable `DocumentBlockRevision` snapshots. A snapshot recor
 
 Generated versions receive new current element IDs. Historical snapshots retain
 their original IDs for audit and download purposes.
+
+## Version restoration
+
+Any earlier version in a document's history can be restored without rewriting
+history. DocSync copies the selected version's DOCX content into a staged,
+validated `DocumentVersion` with a new ID and the next version number. The new
+version becomes current only after the operation commits successfully.
+
+The new version's parent is the version that was current immediately before the
+restore. Its audit metadata separately records the selected source as
+`restored_from_version_id` and `restored_from_version_number`. This preserves the
+original upload, the restored-from version, the previously current version, and
+every other historical version for lineage, audit, and download.
+
+The restore request includes `expected_current_version_id`. If the document head
+has changed since history was loaded, DocSync returns `409 Conflict` and creates no
+file, version, operation, or head change. Restoring the already-current version
+also returns `409 Conflict`, while selecting a version from another document
+returns a validation error. A successful restore records an auditable
+`version_restore` operation that links the restored-from source, previous current
+version, and new result.
 
 ## Matching and comparison
 
@@ -74,6 +107,11 @@ DOCUMENTSYNC_NEAR_MATCH_CANDIDATE_LIMIT
 The original upload is never overwritten. A failed generation rolls back database
 state and removes staged output.
 
+Restoration follows the same staged, validated, atomic-write boundary. It checks
+the expected current version immediately before creating a new immutable
+descendant, advances the document head only on success, and leaves every existing
+version intact.
+
 ## Editor API
 
 ```text
@@ -85,6 +123,7 @@ POST /api/document-elements/{element_id}/match-decisions
 POST /api/document-sets/{document_set_id}/editor-preview
 POST /api/document-sets/{document_set_id}/editor-generate
 GET  /api/documents/{document_id}/versions
+POST /api/documents/{document_id}/versions/{target_version_id}/restore
 GET  /api/document-versions/{version_id}/download
 ```
 
@@ -122,4 +161,6 @@ npm.cmd test
 
 Manual acceptance should cover exact shared wording, branch-specific values, list
 preservation, a full override followed by another shared edit, unsupported Word
-objects, stale-version conflict handling, and controlled generation failure.
+objects, active-block undo and redo, successful restoration with preserved
+history, stale-current restoration conflict handling, and controlled generation
+failure.
