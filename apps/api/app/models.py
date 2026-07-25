@@ -2,7 +2,19 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
@@ -28,6 +40,12 @@ class DocumentSet(Base):
     generations: Mapped[list[GenerationJob]] = relationship(
         back_populates="document_set", cascade="all, delete-orphan"
     )
+    match_decisions: Mapped[list[MatchDecision]] = relationship(
+        back_populates="document_set", cascade="all, delete-orphan"
+    )
+    editor_operations: Mapped[list[EditorOperation]] = relationship(
+        back_populates="document_set", cascade="all, delete-orphan"
+    )
 
 
 class DocumentRecord(Base):
@@ -45,6 +63,17 @@ class DocumentRecord(Base):
     document_set: Mapped[DocumentSet] = relationship(back_populates="documents")
     elements: Mapped[list[DocumentElement]] = relationship(
         back_populates="document", cascade="all, delete-orphan"
+    )
+    versions: Mapped[list[DocumentVersion]] = relationship(
+        back_populates="document",
+        cascade="all, delete-orphan",
+        foreign_keys="DocumentVersion.document_id",
+    )
+    version_head: Mapped[DocumentHead | None] = relationship(
+        back_populates="document",
+        cascade="all, delete-orphan",
+        foreign_keys="DocumentHead.document_id",
+        uselist=False,
     )
 
 
@@ -160,3 +189,297 @@ class GenerationTarget(Base):
     after_text: Mapped[str] = mapped_column(Text)
 
     generation: Mapped[GenerationJob] = relationship(back_populates="targets")
+
+
+class DocumentVersion(Base):
+    """Immutable file-level version in a document's explicit lineage."""
+
+    __tablename__ = "document_versions"
+    __table_args__ = (
+        UniqueConstraint(
+            "document_id",
+            "version_number",
+            name="uq_document_version_number",
+        ),
+        UniqueConstraint(
+            "generation_id",
+            "document_id",
+            name="uq_document_version_generation",
+        ),
+        UniqueConstraint(
+            "storage_area",
+            "storage_name",
+            name="uq_document_version_storage",
+        ),
+        CheckConstraint("version_number > 0", name="ck_document_version_number_positive"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    document_id: Mapped[str] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), index=True
+    )
+    parent_version_id: Mapped[str | None] = mapped_column(
+        ForeignKey("document_versions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    generation_id: Mapped[str | None] = mapped_column(
+        ForeignKey("generation_jobs.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    editor_operation_id: Mapped[str | None] = mapped_column(
+        ForeignKey("editor_operations.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    version_number: Mapped[int] = mapped_column(Integer)
+    storage_area: Mapped[str] = mapped_column(String(30))
+    storage_name: Mapped[str] = mapped_column(String(255))
+    download_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    checksum_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    document: Mapped[DocumentRecord] = relationship(
+        back_populates="versions",
+        foreign_keys=[document_id],
+    )
+    parent_version: Mapped[DocumentVersion | None] = relationship(
+        remote_side=[id],
+        back_populates="child_versions",
+        foreign_keys=[parent_version_id],
+    )
+    child_versions: Mapped[list[DocumentVersion]] = relationship(
+        back_populates="parent_version",
+        foreign_keys=[parent_version_id],
+    )
+    blocks: Mapped[list[DocumentBlockRevision]] = relationship(
+        back_populates="version",
+        cascade="all, delete-orphan",
+        order_by="DocumentBlockRevision.ordinal",
+    )
+    editor_operation: Mapped[EditorOperation | None] = relationship(
+        back_populates="versions",
+        foreign_keys=[editor_operation_id],
+    )
+
+
+class DocumentHead(Base):
+    """Mutable pointer used for atomic current-version checks."""
+
+    __tablename__ = "document_heads"
+    __table_args__ = (
+        CheckConstraint("revision > 0", name="ck_document_head_revision_positive"),
+    )
+
+    document_id: Mapped[str] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), primary_key=True
+    )
+    current_version_id: Mapped[str] = mapped_column(
+        ForeignKey("document_versions.id", ondelete="CASCADE"),
+        unique=True,
+        index=True,
+    )
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        onupdate=utc_now,
+    )
+
+    document: Mapped[DocumentRecord] = relationship(
+        back_populates="version_head",
+        foreign_keys=[document_id],
+    )
+    current_version: Mapped[DocumentVersion] = relationship(
+        foreign_keys=[current_version_id]
+    )
+
+
+class DocumentBlockRevision(Base):
+    """Immutable editor/write-back snapshot for one block in one version."""
+
+    __tablename__ = "document_block_revisions"
+    __table_args__ = (
+        UniqueConstraint(
+            "version_id",
+            "element_id",
+            name="uq_document_block_revision_element",
+        ),
+        CheckConstraint("ordinal >= 0", name="ck_document_block_revision_ordinal"),
+        CheckConstraint(
+            "list_level IS NULL OR list_level >= 0",
+            name="ck_document_block_revision_list_level",
+        ),
+        CheckConstraint(
+            "shared_state IN ('shared', 'detached')",
+            name="ck_document_block_revision_shared_state",
+        ),
+        Index(
+            "ix_document_block_revision_document_ordinal",
+            "document_id",
+            "ordinal",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    version_id: Mapped[str] = mapped_column(
+        ForeignKey("document_versions.id", ondelete="CASCADE"), index=True
+    )
+    # Deliberately not a foreign key: historical block identity must survive an
+    # element being replaced in a later document version.
+    element_id: Mapped[str] = mapped_column(String(36), index=True)
+    document_id: Mapped[str] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), index=True
+    )
+    ordinal: Mapped[int] = mapped_column(Integer)
+    element_type: Mapped[str] = mapped_column(String(40))
+    text: Mapped[str] = mapped_column(Text)
+    normalized_text: Mapped[str] = mapped_column(Text, index=True)
+    exact_match_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    structure_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    delta_json: Mapped[dict | list | None] = mapped_column(JSON, nullable=True)
+    formatting_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    list_type: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    list_level: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    alignment: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    location_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    shared_state: Mapped[str] = mapped_column(String(20), default="shared")
+    supported: Mapped[bool] = mapped_column(Boolean, default=True)
+    unsupported_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    version: Mapped[DocumentVersion] = relationship(back_populates="blocks")
+
+
+class MatchDecision(Base):
+    """Persisted user review state for a version-specific near-match pair."""
+
+    __tablename__ = "match_decisions"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_version_id",
+            "source_element_id",
+            "candidate_version_id",
+            "candidate_element_id",
+            name="uq_match_decision_pair",
+        ),
+        CheckConstraint(
+            "similarity_score IS NULL OR "
+            "(similarity_score >= 0 AND similarity_score <= 1)",
+            name="ck_match_decision_similarity",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    document_set_id: Mapped[str] = mapped_column(
+        ForeignKey("document_sets.id", ondelete="CASCADE"), index=True
+    )
+    source_element_id: Mapped[str] = mapped_column(String(36), index=True)
+    candidate_element_id: Mapped[str] = mapped_column(String(36), index=True)
+    source_version_id: Mapped[str] = mapped_column(
+        ForeignKey("document_versions.id", ondelete="CASCADE"), index=True
+    )
+    candidate_version_id: Mapped[str] = mapped_column(
+        ForeignKey("document_versions.id", ondelete="CASCADE"), index=True
+    )
+    decision: Mapped[str] = mapped_column(String(30))
+    similarity_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    algorithm_version: Mapped[str] = mapped_column(String(60), default="token-sequence-v1")
+    difference_json: Mapped[dict | list | None] = mapped_column(JSON, nullable=True)
+    decided_by: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        onupdate=utc_now,
+    )
+
+    document_set: Mapped[DocumentSet] = relationship(back_populates="match_decisions")
+    source_version: Mapped[DocumentVersion] = relationship(
+        foreign_keys=[source_version_id]
+    )
+    candidate_version: Mapped[DocumentVersion] = relationship(
+        foreign_keys=[candidate_version_id]
+    )
+
+
+class EditorOperation(Base):
+    """Preview/generation audit envelope for one confirmed editor request."""
+
+    __tablename__ = "editor_operations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    document_set_id: Mapped[str] = mapped_column(
+        ForeignKey("document_sets.id", ondelete="CASCADE"), index=True
+    )
+    operation_type: Mapped[str] = mapped_column(String(40))
+    status: Mapped[str] = mapped_column(String(30), default="previewed")
+    source_element_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    link_group_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    replacement_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    expected_head_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    preview_json: Mapped[dict | list | None] = mapped_column(JSON, nullable=True)
+    error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    document_set: Mapped[DocumentSet] = relationship(back_populates="editor_operations")
+    targets: Mapped[list[EditorOperationTarget]] = relationship(
+        back_populates="operation",
+        cascade="all, delete-orphan",
+    )
+    versions: Mapped[list[DocumentVersion]] = relationship(
+        back_populates="editor_operation",
+        foreign_keys="DocumentVersion.editor_operation_id",
+    )
+
+
+class EditorOperationTarget(Base):
+    """Immutable per-block before/after audit detail for an editor operation."""
+
+    __tablename__ = "editor_operation_targets"
+    __table_args__ = (
+        UniqueConstraint(
+            "operation_id",
+            "document_id",
+            "element_id",
+            name="uq_editor_operation_target",
+        ),
+        CheckConstraint("ordinal >= 0", name="ck_editor_operation_target_ordinal"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    operation_id: Mapped[str] = mapped_column(
+        ForeignKey("editor_operations.id", ondelete="CASCADE"), index=True
+    )
+    document_id: Mapped[str] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), index=True
+    )
+    element_id: Mapped[str] = mapped_column(String(36), index=True)
+    base_version_id: Mapped[str] = mapped_column(
+        ForeignKey("document_versions.id", ondelete="CASCADE"), index=True
+    )
+    result_version_id: Mapped[str | None] = mapped_column(
+        ForeignKey("document_versions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    expected_head_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    ordinal: Mapped[int] = mapped_column(Integer)
+    before_text: Mapped[str] = mapped_column(Text)
+    after_text: Mapped[str] = mapped_column(Text)
+    before_delta_json: Mapped[dict | list | None] = mapped_column(JSON, nullable=True)
+    after_delta_json: Mapped[dict | list | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    operation: Mapped[EditorOperation] = relationship(back_populates="targets")
+    base_version: Mapped[DocumentVersion] = relationship(
+        foreign_keys=[base_version_id]
+    )
+    result_version: Mapped[DocumentVersion | None] = relationship(
+        foreign_keys=[result_version_id]
+    )

@@ -1,10 +1,13 @@
 export interface DocumentSummary {
   id: string;
   version_id: string;
+  current_version_id?: string;
+  version_number?: number;
   name: string;
   checksum_sha256: string;
   element_count: number;
   view_url: string;
+  download_url?: string;
 }
 
 export interface LinkMember {
@@ -155,4 +158,193 @@ export interface GenerationResponse {
   }>;
   download_url: string;
   document_set: DocumentSetResponse;
+}
+
+export type QuillAttributes = Record<string, string | number | boolean | null>;
+
+export interface QuillOperation {
+  insert?: string | Record<string, unknown>;
+  retain?: number;
+  delete?: number;
+  attributes?: QuillAttributes;
+}
+
+export interface QuillDelta {
+  ops: QuillOperation[];
+}
+
+export type EditorElementType =
+  | "paragraph"
+  | "heading"
+  | "list_item"
+  | "table_cell"
+  | "unsupported"
+  | string;
+
+export interface EditorBlock {
+  element_id: string;
+  document_id: string;
+  version_id: string;
+  element_type: EditorElementType;
+  paragraph_index: number;
+  order: number;
+  page_number?: number;
+  text: string;
+  normalized_text?: string;
+  exact_match_hash?: string;
+  structure_hash?: string | null;
+  delta: QuillDelta;
+  style_name?: string | null;
+  supported: boolean;
+  read_only: boolean;
+  unsupported_reason?: string | null;
+  list_type?: "ordered" | "bullet" | null;
+  indent?: number;
+  alignment?: "left" | "center" | "right" | "justify" | null;
+  table_index?: number;
+  row_index?: number;
+  column_index?: number;
+}
+
+export interface EditorContentResponse {
+  document_id: string;
+  version_id: string;
+  document_name: string;
+  version_number?: number;
+  created_at?: string;
+  blocks: EditorBlock[];
+  unsupported_count: number;
+  unsupported: EditorDiagnostic[];
+  notice?: string;
+}
+
+export interface EditorDiagnostic {
+  id?: string;
+  element_type: string;
+  reason: string;
+  location?: string;
+  text?: string;
+}
+
+export type MatchType = "source" | "exact" | "near";
+export type MatchDecision = "pending" | "confirmed" | "ignored" | "removed";
+
+export type DifferenceKind =
+  | "equal"
+  | "insert"
+  | "delete"
+  | "changed"
+  | "shared"
+  | "different";
+
+export interface DifferenceSpan {
+  text: string;
+  kind: DifferenceKind;
+}
+
+export interface EditorMatch {
+  element_id: string;
+  document_id: string;
+  document_name: string;
+  version_id?: string;
+  paragraph_index: number;
+  element_type: EditorElementType;
+  text: string;
+  style_name?: string | null;
+  match_type: MatchType;
+  similarity_score: number;
+  decision: MatchDecision;
+  difference_spans: DifferenceSpan[];
+  table_index?: number;
+  row_index?: number;
+  column_index?: number;
+}
+
+export interface SimilarMatchesResponse {
+  source_element_id: string;
+  matches: EditorMatch[];
+  threshold?: number;
+}
+
+export interface CompareResponse {
+  source_element_id: string;
+  items: EditorMatch[];
+  shared_spans?: DifferenceSpan[];
+}
+
+export type EditorEditMode =
+  | "shared"
+  | "per_document"
+  | "full_override";
+
+export interface EditorTarget {
+  element_id: string;
+  replacement_text: string;
+  delta?: QuillDelta;
+}
+
+export interface MatchDecisionPayload {
+  element_id: string;
+  decision: MatchDecision;
+}
+
+export interface EditorOperationRequest {
+  base_versions: Record<string, string>;
+  source_element_id: string;
+  edit_mode: EditorEditMode;
+  targets: EditorTarget[];
+  match_decisions: MatchDecisionPayload[];
+}
+
+export interface EditorPreviewChange extends PreviewChange {
+  delta?: QuillDelta;
+  match_type?: MatchType;
+}
+
+export interface EditorPreviewDocument {
+  document_id: string;
+  document_name: string;
+  version_id?: string;
+  changes: EditorPreviewChange[];
+}
+
+export interface EditorPreviewResponse {
+  operation_id?: string;
+  source_element_id: string;
+  edit_mode: EditorEditMode;
+  affected_document_count: number;
+  affected_location_count: number;
+  documents: EditorPreviewDocument[];
+  warnings?: string[];
+}
+
+export interface DocumentVersion {
+  id: string;
+  document_id: string;
+  version_number: number;
+  created_at: string;
+  status: string;
+  is_current: boolean;
+  download_url?: string;
+  generation_id?: string | null;
+}
+
+export interface DocumentVersionsResponse {
+  document_id: string;
+  current_version_id: string;
+  versions: DocumentVersion[];
+}
+
+export interface EditorGenerationResponse {
+  generation_id: string;
+  status: string;
+  download_url?: string;
+  document_set?: DocumentSetResponse;
+  versions?: DocumentVersion[];
+  files?: Array<{
+    source_document_id: string;
+    version_id?: string;
+    name: string;
+    download_url?: string;
+  }>;
 }

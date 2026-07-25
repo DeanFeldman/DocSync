@@ -1,0 +1,2331 @@
+from __future__ import annotations
+
+from collections import defaultdict
+from datetime import datetime, timezone
+from difflib import SequenceMatcher
+from io import BytesIO
+import hashlib
+import json
+import math
+from pathlib import Path
+import re
+import shutil
+import threading
+import unicodedata
+from uuid import uuid4
+import zipfile
+
+from docx import Document
+from docx.document import Document as DocxDocument
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml.ns import qn
+from docx.text.paragraph import Paragraph
+from fastapi import HTTPException, status
+from sqlalchemy import delete, func, select
+from sqlalchemy.orm import Session, selectinload
+
+from .config import settings
+from .models import (
+    DocumentBlockRevision,
+    DocumentElement,
+    DocumentHead,
+    DocumentRecord,
+    DocumentSet,
+    DocumentVersion,
+    EditorOperation,
+    EditorOperationTarget,
+    GeneratedVersion,
+    LinkGroup,
+    MatchDecision,
+)
+from .schemas import (
+    CompareRequest,
+    EditorEditRequest,
+    EditorMatchDecision,
+    EditorTarget,
+    MatchDecisionBatchRequest,
+    QuillDelta,
+)
+
+
+BODY_STYLE_PATTERN = re.compile(r"^body_order:(\d+):(.*)$", re.DOTALL)
+TABLE_STYLE_PATTERN = re.compile(r"^table_cell:(\d+):(\d+):(\d+)$")
+ORDERED_TABLE_STYLE_PATTERN = re.compile(
+    r"^table_cell_order:(\d+):(\d+):(\d+):(\d+)$"
+)
+LIST_LEVEL_SUFFIX = re.compile(r"\s+(\d+)$")
+TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]+|\s+", re.UNICODE)
+EDITOR_GENERATION_LOCK = threading.RLock()
+MATCH_ALGORITHM_VERSION = "nfkc-sequence-v1"
+ALLOWED_INLINE_ATTRIBUTES = {"bold", "italic", "underline"}
+ALLOWED_BLOCK_ATTRIBUTES = {"header", "list", "indent", "align"}
+UNSUPPORTED_XML_TAGS = {
+    qn("w:drawing"): "Drawing or floating object",
+    qn("w:pict"): "Legacy picture or text box",
+    qn("w:object"): "Embedded object",
+    qn("w:fldSimple"): "Word field",
+    qn("w:instrText"): "Word field instruction",
+    qn("w:hyperlink"): "Hyperlink content",
+    qn("w:ins"): "Tracked insertion",
+    qn("w:del"): "Tracked deletion",
+    qn("w:commentReference"): "Comment reference",
+    qn("w:footnoteReference"): "Footnote reference",
+    qn("w:endnoteReference"): "Endnote reference",
+}
+
+
+def new_id() -> str:
+    return str(uuid4())
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def utc_isoformat(value: datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat()
+
+
+def normalise_editor_text(text: str) -> str:
+    """Canonical text used by exact matching and persisted exact hashes."""
+
+    return " ".join(unicodedata.normalize("NFKC", text).split()).casefold()
+
+
+def exact_match_hash(element_type: str, text: str) -> str:
+    normalized = normalise_editor_text(text)
+    return hashlib.sha256(
+        f"{element_type}\0{normalized}".encode("utf-8")
+    ).hexdigest()
+
+
+def _canonical_hash(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _safe_storage_path(storage_area: str, storage_name: str) -> Path:
+    if storage_area not in {"originals", "generated"}:
+        raise HTTPException(status_code=500, detail="Document version storage is invalid.")
+    root = (settings.data_dir / storage_area).resolve()
+    path = (root / storage_name).resolve()
+    if path != root and root not in path.parents:
+        raise HTTPException(status_code=500, detail="Document version storage is invalid.")
+    return path
+
+
+def document_version_path(version: DocumentVersion) -> Path:
+    path = _safe_storage_path(version.storage_area, version.storage_name)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Document version file is missing.")
+    return path
+
+
+def get_version_or_404(session: Session, version_id: str) -> DocumentVersion:
+    version = session.scalar(
+        select(DocumentVersion)
+        .where(DocumentVersion.id == version_id)
+        .options(
+            selectinload(DocumentVersion.document),
+            selectinload(DocumentVersion.blocks),
+        )
+    )
+    if version is None:
+        # A newly inserted logical document may not yet have passed through the
+        # editor initializer. Keep this fallback for non-lifespan unit callers.
+        document = session.get(DocumentRecord, version_id)
+        if document is not None:
+            initialise_original_version(session, document)
+            session.flush()
+            version = session.scalar(
+                select(DocumentVersion)
+                .where(DocumentVersion.id == version_id)
+                .options(
+                    selectinload(DocumentVersion.document),
+                    selectinload(DocumentVersion.blocks),
+                )
+            )
+    if version is None:
+        raise HTTPException(status_code=404, detail="Document version not found.")
+    return version
+
+
+def resolve_document_identifier(
+    session: Session,
+    document_or_version_id: str,
+) -> tuple[DocumentRecord, DocumentVersion]:
+    document = session.get(DocumentRecord, document_or_version_id)
+    if document is not None:
+        version = current_version_for_document(session, document)
+        return document, version
+    version = get_version_or_404(session, document_or_version_id)
+    return version.document, version
+
+
+def current_version_for_document(
+    session: Session,
+    document: DocumentRecord,
+) -> DocumentVersion:
+    head = session.get(DocumentHead, document.id)
+    if head is None:
+        initialise_original_version(session, document)
+        session.flush()
+        head = session.get(DocumentHead, document.id)
+    if head is None:
+        raise HTTPException(status_code=500, detail="Document version head is missing.")
+    return get_version_or_404(session, head.current_version_id)
+
+
+def _display_style_name(style_name: str | None) -> str | None:
+    match = BODY_STYLE_PATTERN.fullmatch(style_name or "")
+    if match is None:
+        if TABLE_STYLE_PATTERN.fullmatch(style_name or ""):
+            return None
+        if ORDERED_TABLE_STYLE_PATTERN.fullmatch(style_name or ""):
+            return None
+        return style_name
+    return match.group(2) or None
+
+
+def _element_type(style_name: str | None) -> str:
+    value = style_name or ""
+    if TABLE_STYLE_PATTERN.fullmatch(value) or ORDERED_TABLE_STYLE_PATTERN.fullmatch(
+        value
+    ):
+        return "table_cell"
+    style = (_display_style_name(value) or "").casefold()
+    if style.startswith(("heading", "title")):
+        return "heading"
+    if style.startswith("list"):
+        return "list_item"
+    return "paragraph"
+
+
+def _element_location(element: DocumentElement) -> tuple[int, dict]:
+    style_name = element.style_name or ""
+    table_match = ORDERED_TABLE_STYLE_PATTERN.fullmatch(style_name)
+    if table_match is not None:
+        order, table_index, row_index, column_index = (
+            int(value) for value in table_match.groups()
+        )
+        return order, {
+            "kind": "table_cell",
+            "document_order": order,
+            "paragraph_index": element.paragraph_index,
+            "table_index": table_index,
+            "row_index": row_index,
+            "column_index": column_index,
+        }
+    legacy_table = TABLE_STYLE_PATTERN.fullmatch(style_name)
+    if legacy_table is not None:
+        table_index, row_index, column_index = (
+            int(value) for value in legacy_table.groups()
+        )
+        return element.paragraph_index, {
+            "kind": "table_cell",
+            "document_order": element.paragraph_index,
+            "paragraph_index": element.paragraph_index,
+            "table_index": table_index,
+            "row_index": row_index,
+            "column_index": column_index,
+        }
+    body_match = BODY_STYLE_PATTERN.fullmatch(style_name)
+    order = int(body_match.group(1)) if body_match is not None else element.paragraph_index
+    return order, {
+        "kind": "body",
+        "document_order": order,
+        "paragraph_index": element.paragraph_index,
+    }
+
+
+def _location_key(location: dict | None) -> str:
+    value = dict(location or {})
+    # paragraph_index is synthetic for cells and is not needed for write-back.
+    if value.get("kind") == "table_cell":
+        value.pop("paragraph_index", None)
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _paragraph_for_element(
+    document: DocxDocument,
+    element: DocumentElement,
+) -> tuple[Paragraph | None, object | None]:
+    _ordinal, location = _element_location(element)
+    if location["kind"] == "body":
+        index = int(location["paragraph_index"])
+        if 0 <= index < len(document.paragraphs):
+            return document.paragraphs[index], None
+        return None, None
+    try:
+        cell = (
+            document.tables[int(location["table_index"])]
+            .rows[int(location["row_index"])]
+            .cells[int(location["column_index"])]
+        )
+    except IndexError:
+        return None, None
+    paragraphs = [paragraph for paragraph in cell.paragraphs if paragraph.text.strip()]
+    return (paragraphs[0] if paragraphs else cell.paragraphs[0]), cell
+
+
+def _alignment_name(paragraph: Paragraph | None) -> str | None:
+    if paragraph is None or paragraph.alignment is None:
+        return None
+    mapping = {
+        WD_ALIGN_PARAGRAPH.LEFT: "left",
+        WD_ALIGN_PARAGRAPH.CENTER: "center",
+        WD_ALIGN_PARAGRAPH.RIGHT: "right",
+        WD_ALIGN_PARAGRAPH.JUSTIFY: "justify",
+        WD_ALIGN_PARAGRAPH.DISTRIBUTE: "justify",
+    }
+    return mapping.get(paragraph.alignment)
+
+
+def _run_attributes(run) -> dict:
+    attributes: dict[str, object] = {}
+    if run.bold:
+        attributes["bold"] = True
+    if run.italic:
+        attributes["italic"] = True
+    if run.underline:
+        attributes["underline"] = True
+    return attributes
+
+
+def _numbering_type(
+    document: DocxDocument,
+    paragraph: Paragraph,
+) -> tuple[str | None, int | None]:
+    style_name = paragraph.style.name if paragraph.style is not None else ""
+    paragraph_properties = paragraph._p.pPr
+    numbering_properties = (
+        paragraph_properties.numPr if paragraph_properties is not None else None
+    )
+    level: int | None = None
+    number_id: int | None = None
+    if numbering_properties is not None:
+        if numbering_properties.ilvl is not None:
+            level = int(numbering_properties.ilvl.val)
+        if numbering_properties.numId is not None:
+            number_id = int(numbering_properties.numId.val)
+
+    list_type: str | None = None
+    if number_id is not None:
+        try:
+            numbering = document.part.numbering_part.element
+            abstract_id: int | None = None
+            for num in numbering.findall(qn("w:num")):
+                if int(num.get(qn("w:numId"))) != number_id:
+                    continue
+                value = num.find(qn("w:abstractNumId"))
+                if value is not None:
+                    abstract_id = int(value.get(qn("w:val")))
+                break
+            if abstract_id is not None:
+                for abstract in numbering.findall(qn("w:abstractNum")):
+                    if int(abstract.get(qn("w:abstractNumId"))) != abstract_id:
+                        continue
+                    requested_level = level or 0
+                    selected_level = None
+                    for item in abstract.findall(qn("w:lvl")):
+                        if int(item.get(qn("w:ilvl"))) == requested_level:
+                            selected_level = item
+                            break
+                    if selected_level is None:
+                        selected_level = abstract.find(qn("w:lvl"))
+                    if selected_level is not None:
+                        number_format = selected_level.find(qn("w:numFmt"))
+                        value = (
+                            number_format.get(qn("w:val"))
+                            if number_format is not None
+                            else ""
+                        )
+                        list_type = "bullet" if value == "bullet" else "ordered"
+                    break
+        except (AttributeError, KeyError, TypeError, ValueError):
+            list_type = None
+
+    folded_style = style_name.casefold()
+    if list_type is None and folded_style.startswith("list"):
+        list_type = "ordered" if "number" in folded_style else "bullet"
+    if list_type is not None and level is None:
+        match = LIST_LEVEL_SUFFIX.search(style_name)
+        level = max(int(match.group(1)) - 1, 0) if match else 0
+    return list_type, level
+
+
+def _paragraph_block_attributes(
+    element_type: str,
+    paragraph: Paragraph | None,
+    list_type: str | None,
+    list_level: int | None,
+    alignment: str | None,
+) -> dict:
+    attributes: dict[str, object] = {}
+    if element_type == "heading" and paragraph is not None:
+        style_name = paragraph.style.name if paragraph.style is not None else ""
+        match = re.fullmatch(r"Heading\s+(\d+)", style_name, re.IGNORECASE)
+        attributes["header"] = (
+            min(max(int(match.group(1)), 1), 6) if match is not None else 1
+        )
+    if list_type is not None:
+        attributes["list"] = list_type
+        if list_level:
+            attributes["indent"] = list_level
+    if alignment is not None and alignment != "left":
+        attributes["align"] = alignment
+    return attributes
+
+
+def _paragraph_delta(
+    text: str,
+    paragraph: Paragraph | None,
+    block_attributes: dict,
+) -> dict:
+    operations: list[dict] = []
+    if paragraph is not None and paragraph.runs:
+        covered = ""
+        for run in paragraph.runs:
+            if not run.text:
+                continue
+            operation = {"insert": run.text}
+            attributes = _run_attributes(run)
+            if attributes:
+                operation["attributes"] = attributes
+            operations.append(operation)
+            covered += run.text
+        # Hyperlinks and some field content are not exposed as normal runs. The
+        # read-only diagnostic handles those; keep the visible text complete.
+        if covered != text and text:
+            operations = [{"insert": text}]
+    elif text:
+        operations.append({"insert": text})
+    newline: dict[str, object] = {"insert": "\n"}
+    if block_attributes:
+        newline["attributes"] = block_attributes
+    operations.append(newline)
+    return {"ops": operations}
+
+
+def _unsupported_reason(
+    paragraph: Paragraph | None,
+    cell: object | None,
+) -> str | None:
+    if paragraph is not None:
+        for node in paragraph._p.iter():
+            reason = UNSUPPORTED_XML_TAGS.get(node.tag)
+            if reason is not None:
+                return f"{reason} is read-only in Edit mode."
+    if cell is not None:
+        if getattr(cell, "tables", None):
+            return "Nested tables are read-only in Edit mode."
+        non_empty = [
+            item for item in getattr(cell, "paragraphs", []) if item.text.strip()
+        ]
+        if len(non_empty) > 1:
+            return (
+                "Table cells containing multiple paragraphs are read-only in Edit mode."
+            )
+    return None
+
+
+def _revision_values(
+    document: DocxDocument,
+    element: DocumentElement,
+    *,
+    shared_state: str = "shared",
+) -> dict:
+    ordinal, location = _element_location(element)
+    element_type = _element_type(element.style_name)
+    paragraph, cell = _paragraph_for_element(document, element)
+    list_type, list_level = (
+        _numbering_type(document, paragraph) if paragraph is not None else (None, None)
+    )
+    if element_type != "list_item" and list_type is not None:
+        element_type = "list_item"
+    alignment = _alignment_name(paragraph)
+    block_attributes = _paragraph_block_attributes(
+        element_type,
+        paragraph,
+        list_type,
+        list_level,
+        alignment,
+    )
+    reason = _unsupported_reason(paragraph, cell)
+    style_name = (
+        paragraph.style.name
+        if paragraph is not None and paragraph.style is not None
+        else _display_style_name(element.style_name)
+    )
+    formatting = {
+        "style_name": style_name,
+        "runs": [
+            {
+                "text": run.text,
+                **_run_attributes(run),
+            }
+            for run in (paragraph.runs if paragraph is not None else [])
+            if run.text
+        ],
+    }
+    delta = _paragraph_delta(element.text, paragraph, block_attributes)
+    structure = {
+        "element_type": element_type,
+        "style_name": style_name,
+        "list_type": list_type,
+        "list_level": list_level,
+        "alignment": alignment,
+    }
+    normalized = normalise_editor_text(element.text)
+    return {
+        "id": new_id(),
+        "element_id": element.id,
+        "document_id": element.document_id,
+        "ordinal": ordinal,
+        "element_type": element_type,
+        "text": element.text,
+        "normalized_text": normalized,
+        "exact_match_hash": exact_match_hash(element_type, element.text),
+        "structure_hash": _canonical_hash(structure),
+        "delta_json": delta,
+        "formatting_json": formatting,
+        "list_type": list_type,
+        "list_level": list_level,
+        "alignment": alignment,
+        "location_json": location,
+        "shared_state": shared_state,
+        "supported": reason is None,
+        "unsupported_reason": reason,
+    }
+
+
+def _load_docx(path: Path) -> DocxDocument:
+    try:
+        return Document(path)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{path.name}: the DOCX could not be opened for structured editing.",
+        ) from exc
+
+
+def _create_revisions_for_existing_elements(
+    session: Session,
+    version: DocumentVersion,
+    document: DocumentRecord,
+    source_path: Path,
+) -> list[DocumentBlockRevision]:
+    docx = _load_docx(source_path)
+    elements = list(
+        session.scalars(
+            select(DocumentElement)
+            .where(DocumentElement.document_id == document.id)
+            .order_by(DocumentElement.paragraph_index, DocumentElement.id)
+        )
+    )
+    revisions = [
+        DocumentBlockRevision(version_id=version.id, **_revision_values(docx, element))
+        for element in elements
+    ]
+    session.add_all(revisions)
+    return revisions
+
+
+def initialise_original_version(
+    session: Session,
+    document: DocumentRecord,
+) -> DocumentVersion:
+    version = session.get(DocumentVersion, document.id)
+    if version is None:
+        version = DocumentVersion(
+            id=document.id,
+            document_id=document.id,
+            parent_version_id=None,
+            generation_id=None,
+            editor_operation_id=None,
+            version_number=1,
+            storage_area="originals",
+            storage_name=document.stored_name,
+            download_name=document.original_name,
+            checksum_sha256=document.checksum_sha256,
+            created_at=document.created_at,
+        )
+        session.add(version)
+        session.flush()
+    head = session.get(DocumentHead, document.id)
+    if head is None:
+        head = DocumentHead(
+            document_id=document.id,
+            current_version_id=version.id,
+            revision=max(version.version_number, 1),
+        )
+        session.add(head)
+        session.flush()
+    revision_count = int(
+        session.scalar(
+            select(func.count(DocumentBlockRevision.id)).where(
+                DocumentBlockRevision.version_id == version.id
+            )
+        )
+        or 0
+    )
+    if revision_count == 0:
+        _create_revisions_for_existing_elements(
+            session,
+            version,
+            document,
+            _safe_storage_path("originals", document.stored_name),
+        )
+        session.flush()
+    return version
+
+
+def _serialize_revision(
+    revision: DocumentBlockRevision,
+    *,
+    document_name: str | None = None,
+) -> dict:
+    location = dict(revision.location_json or {})
+    payload = {
+        "id": revision.element_id,
+        "element_id": revision.element_id,
+        "document_id": revision.document_id,
+        "document_name": document_name,
+        "version_id": revision.version_id,
+        "element_type": revision.element_type,
+        "type": revision.element_type,
+        "order": revision.ordinal,
+        "ordinal": revision.ordinal,
+        "paragraph_index": location.get("paragraph_index", revision.ordinal),
+        "page_number": max(1, revision.ordinal // 18 + 1),
+        "text": revision.text,
+        "normalized_text": revision.normalized_text,
+        "exact_match_hash": revision.exact_match_hash,
+        "structure_hash": revision.structure_hash,
+        "delta": revision.delta_json or {"ops": [{"insert": revision.text}, {"insert": "\n"}]},
+        "formatting": revision.formatting_json or {},
+        "style_name": (revision.formatting_json or {}).get("style_name"),
+        "list_type": revision.list_type,
+        "list_level": revision.list_level,
+        "indent": revision.list_level,
+        "alignment": revision.alignment,
+        "location": location,
+        "shared_state": revision.shared_state,
+        "detached_from_shared": revision.shared_state == "detached",
+        "supported": revision.supported,
+        "read_only": not revision.supported,
+        "unsupported_reason": revision.unsupported_reason,
+    }
+    payload.update(
+        {
+            key: location[key]
+            for key in ("table_index", "row_index", "column_index")
+            if key in location
+        }
+    )
+    return payload
+
+
+def _document_diagnostics(path: Path) -> list[dict]:
+    document = _load_docx(path)
+    diagnostics: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for node in document.element.body.iter():
+        reason = UNSUPPORTED_XML_TAGS.get(node.tag)
+        if reason is None:
+            continue
+        key = (node.tag, reason)
+        if key in seen:
+            continue
+        seen.add(key)
+        diagnostics.append(
+            {
+                "kind": "unsupported_ooxml",
+                "element_type": "unsupported",
+                "label": reason,
+                "reason": f"{reason} is preserved in Layout mode and is read-only.",
+                "read_only": True,
+            }
+        )
+    for section_index, section in enumerate(document.sections):
+        if any(paragraph.text.strip() for paragraph in section.header.paragraphs):
+            diagnostics.append(
+                {
+                    "kind": "header",
+                    "element_type": "unsupported",
+                    "section_index": section_index,
+                    "reason": "Headers are preserved but read-only in Edit mode.",
+                    "read_only": True,
+                }
+            )
+        if any(paragraph.text.strip() for paragraph in section.footer.paragraphs):
+            diagnostics.append(
+                {
+                    "kind": "footer",
+                    "element_type": "unsupported",
+                    "section_index": section_index,
+                    "reason": "Footers are preserved but read-only in Edit mode.",
+                    "read_only": True,
+                }
+            )
+    return diagnostics
+
+
+def serialize_editor_content(session: Session, version_id: str) -> dict:
+    version = get_version_or_404(session, version_id)
+    head = session.get(DocumentHead, version.document_id)
+    blocks = list(
+        session.scalars(
+            select(DocumentBlockRevision)
+            .where(DocumentBlockRevision.version_id == version.id)
+            .order_by(DocumentBlockRevision.ordinal, DocumentBlockRevision.id)
+        )
+    )
+    diagnostics = _document_diagnostics(document_version_path(version))
+    return {
+        "document_id": version.document_id,
+        "document_set_id": version.document.document_set_id,
+        "document_name": version.document.original_name,
+        "version_id": version.id,
+        "version_number": version.version_number,
+        "parent_version_id": version.parent_version_id,
+        "current_version": bool(head and head.current_version_id == version.id),
+        "is_current": bool(head and head.current_version_id == version.id),
+        "created_at": utc_isoformat(version.created_at),
+        "blocks": [
+            _serialize_revision(block, document_name=version.document.original_name)
+            for block in blocks
+        ],
+        "unsupported": diagnostics,
+        "diagnostics": diagnostics,
+        "unsupported_count": len(diagnostics)
+        + sum(not block.supported for block in blocks),
+        "notice": (
+            "Unsupported Word objects remain preserved in Layout mode and are "
+            "read-only in Edit mode."
+            if diagnostics or any(not block.supported for block in blocks)
+            else None
+        ),
+    }
+
+
+def serialize_version_document_view(session: Session, version_id: str) -> dict:
+    """Compatibility structured-view payload backed by immutable block revisions."""
+
+    content = serialize_editor_content(session, version_id)
+    pages: list[dict] = []
+    current: list[dict] = []
+    used_units = 0
+    for block in content["blocks"]:
+        units = max(1, math.ceil(len(block["text"]) / 120))
+        if block["element_type"] == "heading":
+            units += 1
+        if current and used_units + units > 18:
+            pages.append({"page_number": len(pages) + 1, "elements": current})
+            current = []
+            used_units = 0
+        item = {
+            **block,
+            "page_number": len(pages) + 1,
+        }
+        current.append(item)
+        used_units += units
+    if current or not pages:
+        pages.append({"page_number": len(pages) + 1, "elements": current})
+    return {
+        "document_id": content["document_id"],
+        "version_id": content["version_id"],
+        "document_set_id": content["document_set_id"],
+        "document_name": content["document_name"],
+        "render_status": "ready",
+        "render_mode": "structured",
+        "pagination": "estimated",
+        "page_count": len(pages),
+        "notice": (
+            "Structured browser preview backed by an immutable document version. "
+            "Unsupported Word objects remain available in Layout mode and are read-only."
+        ),
+        "pages": pages,
+        "unsupported": content["unsupported"],
+    }
+
+
+def serialize_document_versions(session: Session, document_id: str) -> dict:
+    document = session.get(DocumentRecord, document_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    initialise_original_version(session, document)
+    session.flush()
+    head = session.get(DocumentHead, document.id)
+    versions = list(
+        session.scalars(
+            select(DocumentVersion)
+            .where(DocumentVersion.document_id == document.id)
+            .order_by(DocumentVersion.version_number.desc())
+        )
+    )
+    return {
+        "document_id": document.id,
+        "document_name": document.original_name,
+        "current_version_id": head.current_version_id if head else document.id,
+        "versions": [
+            {
+                "id": version.id,
+                "version_id": version.id,
+                "version_number": version.version_number,
+                "document_id": version.document_id,
+                "parent_version_id": version.parent_version_id,
+                "created_at": utc_isoformat(version.created_at),
+                "checksum_sha256": version.checksum_sha256,
+                "status": "completed",
+                "is_current": bool(head and head.current_version_id == version.id),
+                "generation_id": version.generation_id
+                or version.editor_operation_id,
+                "download_url": f"/api/document-versions/{version.id}/download",
+                "editor_content_url": (
+                    f"/api/document-versions/{version.id}/editor-content"
+                ),
+            }
+            for version in versions
+        ],
+    }
+
+
+def current_version_summary_map(
+    session: Session,
+    document_ids: list[str],
+) -> dict[str, dict]:
+    if not document_ids:
+        return {}
+    rows = session.execute(
+        select(DocumentHead, DocumentVersion)
+        .join(
+            DocumentVersion,
+            DocumentVersion.id == DocumentHead.current_version_id,
+        )
+        .where(DocumentHead.document_id.in_(document_ids))
+    ).all()
+    return {
+        head.document_id: {
+            "version_id": version.id,
+            "version_number": version.version_number,
+            "parent_version_id": version.parent_version_id,
+            "checksum_sha256": version.checksum_sha256,
+        }
+        for head, version in rows
+    }
+
+
+def _get_current_revision_or_404(
+    session: Session,
+    element_id: str,
+) -> tuple[DocumentBlockRevision, DocumentRecord, DocumentHead]:
+    element = session.get(DocumentElement, element_id)
+    if element is None:
+        raise HTTPException(status_code=404, detail="Document element not found.")
+    document = session.get(DocumentRecord, element.document_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    head = session.get(DocumentHead, document.id)
+    if head is None:
+        initialise_original_version(session, document)
+        session.flush()
+        head = session.get(DocumentHead, document.id)
+    revision = session.scalar(
+        select(DocumentBlockRevision).where(
+            DocumentBlockRevision.version_id == head.current_version_id,
+            DocumentBlockRevision.element_id == element_id,
+        )
+    )
+    if revision is None:
+        raise HTTPException(
+            status_code=409,
+            detail="The selected block is no longer part of the current document version.",
+        )
+    return revision, document, head
+
+
+def _latest_decisions(
+    session: Session,
+    source: DocumentBlockRevision,
+) -> dict[str, MatchDecision]:
+    rows = list(
+        session.scalars(
+            select(MatchDecision)
+            .where(
+                MatchDecision.source_version_id == source.version_id,
+                MatchDecision.source_element_id == source.element_id,
+            )
+            .order_by(MatchDecision.updated_at.desc(), MatchDecision.id.desc())
+        )
+    )
+    return {row.candidate_element_id: row for row in rows}
+
+
+def _position_similarity(
+    source: DocumentBlockRevision,
+    candidate: DocumentBlockRevision,
+    maximum_ordinal: int,
+) -> float:
+    return max(
+        0.0,
+        1.0 - abs(source.ordinal - candidate.ordinal) / max(maximum_ordinal, 1),
+    )
+
+
+def _neighbor_context(
+    session: Session,
+    revision: DocumentBlockRevision,
+) -> str:
+    neighbors = list(
+        session.scalars(
+            select(DocumentBlockRevision.normalized_text)
+            .where(
+                DocumentBlockRevision.version_id == revision.version_id,
+                DocumentBlockRevision.ordinal.in_(
+                    [max(revision.ordinal - 1, 0), revision.ordinal + 1]
+                ),
+            )
+            .order_by(DocumentBlockRevision.ordinal)
+        )
+    )
+    return " \u241f ".join(neighbors)
+
+
+def _token_jaccard(left: str, right: str) -> float:
+    left_tokens = set(left.split())
+    right_tokens = set(right.split())
+    if not left_tokens and not right_tokens:
+        return 1.0
+    union = left_tokens | right_tokens
+    return len(left_tokens & right_tokens) / len(union) if union else 0.0
+
+
+def similarity_score(
+    source: DocumentBlockRevision,
+    candidate: DocumentBlockRevision,
+    *,
+    maximum_ordinal: int,
+    session: Session | None = None,
+) -> float:
+    sequence = SequenceMatcher(
+        None,
+        source.normalized_text,
+        candidate.normalized_text,
+        autojunk=False,
+    ).ratio()
+    tokens = _token_jaccard(source.normalized_text, candidate.normalized_text)
+    position = _position_similarity(source, candidate, maximum_ordinal)
+    if session is None:
+        return round(0.8 * sequence + 0.15 * tokens + 0.05 * position, 6)
+    source_context = _neighbor_context(session, source)
+    candidate_context = _neighbor_context(session, candidate)
+    neighbor = (
+        SequenceMatcher(
+            None,
+            source_context,
+            candidate_context,
+            autojunk=False,
+        ).ratio()
+        if source_context or candidate_context
+        else 1.0
+    )
+    return round(
+        0.72 * sequence + 0.14 * tokens + 0.04 * position + 0.10 * neighbor,
+        6,
+    )
+
+
+def difference_spans(source_text: str, candidate_text: str) -> list[dict]:
+    source_tokens = TOKEN_PATTERN.findall(source_text)
+    candidate_tokens = TOKEN_PATTERN.findall(candidate_text)
+    matcher = SequenceMatcher(None, source_tokens, candidate_tokens, autojunk=False)
+    spans: list[dict] = []
+    for operation, left_start, left_end, right_start, right_end in matcher.get_opcodes():
+        source_value = "".join(source_tokens[left_start:left_end])
+        candidate_value = "".join(candidate_tokens[right_start:right_end])
+        kind = {
+            "equal": "equal",
+            "delete": "delete",
+            "insert": "insert",
+            "replace": "changed",
+        }[operation]
+        spans.append(
+            {
+                "kind": kind,
+                "text": candidate_value if candidate_value else source_value,
+                "source_text": source_value,
+                "candidate_text": candidate_value,
+                "source_start": left_start,
+                "source_end": left_end,
+                "candidate_start": right_start,
+                "candidate_end": right_end,
+            }
+        )
+    return spans
+
+
+def _current_candidate_revisions(
+    session: Session,
+    source: DocumentBlockRevision,
+    document_set_id: str,
+) -> list[tuple[DocumentBlockRevision, DocumentRecord]]:
+    return list(
+        session.execute(
+            select(DocumentBlockRevision, DocumentRecord)
+            .join(
+                DocumentHead,
+                DocumentHead.current_version_id == DocumentBlockRevision.version_id,
+            )
+            .join(
+                DocumentRecord,
+                DocumentRecord.id == DocumentBlockRevision.document_id,
+            )
+            .where(
+                DocumentRecord.document_set_id == document_set_id,
+                DocumentBlockRevision.element_type == source.element_type,
+                DocumentBlockRevision.element_id != source.element_id,
+                DocumentBlockRevision.supported.is_(True),
+            )
+            .order_by(
+                DocumentRecord.original_name,
+                DocumentBlockRevision.ordinal,
+            )
+        )
+    )
+
+
+def get_similar_matches(
+    session: Session,
+    element_id: str,
+    *,
+    threshold: float | None = None,
+    limit: int | None = None,
+) -> dict:
+    source, document, _head = _get_current_revision_or_404(session, element_id)
+    effective_threshold = (
+        settings.near_match_threshold if threshold is None else threshold
+    )
+    if not 0 <= effective_threshold <= 1:
+        raise HTTPException(status_code=422, detail="Similarity threshold must be 0–1.")
+    effective_limit = min(
+        limit or settings.near_match_candidate_limit,
+        settings.near_match_candidate_limit,
+    )
+    decisions = _latest_decisions(session, source)
+    candidates = _current_candidate_revisions(
+        session,
+        source,
+        document.document_set_id,
+    )
+    maximum_ordinal = max(
+        [source.ordinal, *(candidate.ordinal for candidate, _record in candidates)],
+        default=1,
+    )
+    matches: list[dict] = []
+    for candidate, candidate_document in candidates[
+        : settings.near_match_candidate_limit * 4
+    ]:
+        if candidate.exact_match_hash == source.exact_match_hash:
+            continue
+        decision = decisions.get(candidate.element_id)
+        if (
+            candidate.shared_state == "detached"
+            and (decision is None or decision.decision != "confirmed")
+        ):
+            continue
+        score = similarity_score(
+            source,
+            candidate,
+            maximum_ordinal=maximum_ordinal,
+            session=session,
+        )
+        if score < effective_threshold:
+            continue
+        spans = difference_spans(source.text, candidate.text)
+        item = {
+            **_serialize_revision(
+                candidate,
+                document_name=candidate_document.original_name,
+            ),
+            "match_type": "near",
+            "similarity_score": score,
+            "score": score,
+            "difference_spans": spans,
+            "diff_spans": spans,
+            "decision": decision.decision if decision is not None else "pending",
+        }
+        matches.append(item)
+    matches.sort(
+        key=lambda item: (
+            -item["similarity_score"],
+            item["document_name"].casefold(),
+            item["ordinal"],
+        )
+    )
+    matches = matches[:effective_limit]
+    return {
+        "source_element_id": source.element_id,
+        "source": _serialize_revision(source, document_name=document.original_name),
+        "threshold": effective_threshold,
+        "algorithm_version": MATCH_ALGORITHM_VERSION,
+        "matches": matches,
+        "similar_matches": matches,
+        "count": len(matches),
+    }
+
+
+def get_editor_matches(session: Session, element_id: str) -> dict:
+    # Preserve the legacy exact-link-group shape while enriching it with
+    # version/hash metadata used by the editor.
+    from .document_service import get_element_matches_or_404
+
+    legacy = get_element_matches_or_404(session, element_id)
+    source, document, _head = _get_current_revision_or_404(session, element_id)
+    rows = _current_candidate_revisions(session, source, document.document_set_id)
+    exact = [
+        {
+            **_serialize_revision(candidate, document_name=record.original_name),
+            "match_type": "exact",
+            "similarity_score": 1.0,
+            "score": 1.0,
+            "difference_spans": difference_spans(source.text, candidate.text),
+        }
+        for candidate, record in rows
+        if candidate.exact_match_hash == source.exact_match_hash
+        and source.shared_state == "shared"
+        and candidate.shared_state == "shared"
+    ]
+    legacy["source"].update(
+        {
+            "version_id": source.version_id,
+            "exact_match_hash": source.exact_match_hash,
+            "delta": source.delta_json,
+            "supported": source.supported,
+            "read_only": not source.supported,
+            "shared_state": source.shared_state,
+        }
+    )
+    legacy["exact_matches"] = exact
+    legacy["matches"] = exact
+    legacy["exact_match_count"] = len(exact)
+    return legacy
+
+
+def compare_elements(
+    session: Session,
+    element_id: str,
+    request: CompareRequest,
+) -> dict:
+    source, document, _head = _get_current_revision_or_404(session, element_id)
+    items: list[dict] = []
+    if request.candidate_element_ids is not None:
+        for candidate_id in request.candidate_element_ids:
+            candidate, candidate_document, _candidate_head = (
+                _get_current_revision_or_404(session, candidate_id)
+            )
+            if candidate_document.document_set_id != document.document_set_id:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Comparison targets must belong to the same document set.",
+                )
+            if candidate.element_type != source.element_type:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Comparison targets must use a compatible block type.",
+                )
+            score = similarity_score(
+                source,
+                candidate,
+                maximum_ordinal=max(source.ordinal, candidate.ordinal, 1),
+                session=session,
+            )
+            spans = difference_spans(source.text, candidate.text)
+            items.append(
+                {
+                    **_serialize_revision(
+                        candidate,
+                        document_name=candidate_document.original_name,
+                    ),
+                    "match_type": (
+                        "exact"
+                        if candidate.exact_match_hash == source.exact_match_hash
+                        else "near"
+                    ),
+                    "similarity_score": score,
+                    "score": score,
+                    "difference_spans": spans,
+                    "diff_spans": spans,
+                }
+            )
+    else:
+        exact_payload = get_editor_matches(session, element_id)
+        items.extend(exact_payload["exact_matches"])
+        if request.include_near_matches:
+            near = get_similar_matches(
+                session,
+                element_id,
+                threshold=request.threshold,
+                limit=request.limit,
+            )
+            items.extend(near["matches"])
+    items.sort(
+        key=lambda item: (
+            0 if item["match_type"] == "exact" else 1,
+            -item["similarity_score"],
+            (item.get("document_name") or "").casefold(),
+        )
+    )
+    items = items[: request.limit]
+    return {
+        "source_element_id": source.element_id,
+        "source": _serialize_revision(source, document_name=document.original_name),
+        "items": items,
+        "matches": items,
+        "shared_spans": [
+            span
+            for item in items
+            for span in item["difference_spans"]
+            if span["kind"] == "equal"
+        ],
+    }
+
+
+def _upsert_decision(
+    session: Session,
+    *,
+    document_set_id: str,
+    source: DocumentBlockRevision,
+    candidate: DocumentBlockRevision,
+    decision: str,
+) -> MatchDecision:
+    score = similarity_score(
+        source,
+        candidate,
+        maximum_ordinal=max(source.ordinal, candidate.ordinal, 1),
+        session=session,
+    )
+    spans = difference_spans(source.text, candidate.text)
+    row = session.scalar(
+        select(MatchDecision).where(
+            MatchDecision.source_version_id == source.version_id,
+            MatchDecision.source_element_id == source.element_id,
+            MatchDecision.candidate_version_id == candidate.version_id,
+            MatchDecision.candidate_element_id == candidate.element_id,
+        )
+    )
+    if row is None:
+        row = MatchDecision(
+            id=new_id(),
+            document_set_id=document_set_id,
+            source_element_id=source.element_id,
+            candidate_element_id=candidate.element_id,
+            source_version_id=source.version_id,
+            candidate_version_id=candidate.version_id,
+            decision=decision,
+            similarity_score=score,
+            algorithm_version=MATCH_ALGORITHM_VERSION,
+            difference_json=spans,
+        )
+        session.add(row)
+    else:
+        row.decision = decision
+        row.similarity_score = score
+        row.algorithm_version = MATCH_ALGORITHM_VERSION
+        row.difference_json = spans
+        row.updated_at = utc_now()
+    return row
+
+
+def save_match_decisions(
+    session: Session,
+    element_id: str,
+    request: MatchDecisionBatchRequest,
+) -> dict:
+    source, document, _head = _get_current_revision_or_404(session, element_id)
+    rows: list[MatchDecision] = []
+    for item in request.decisions:
+        candidate, candidate_document, _candidate_head = _get_current_revision_or_404(
+            session,
+            item.candidate_element_id,
+        )
+        if candidate_document.document_set_id != document.document_set_id:
+            raise HTTPException(
+                status_code=422,
+                detail="Match decisions must stay within one document set.",
+            )
+        if candidate.element_type != source.element_type:
+            raise HTTPException(
+                status_code=422,
+                detail="Match decisions require compatible block types.",
+            )
+        candidate_score = similarity_score(
+            source,
+            candidate,
+            maximum_ordinal=max(source.ordinal, candidate.ordinal, 1),
+            session=session,
+        )
+        if (
+            item.status == "confirmed"
+            and candidate.exact_match_hash != source.exact_match_hash
+            and candidate_score < settings.near_match_threshold
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "This candidate is below the configured near-match review "
+                    "threshold and cannot be confirmed."
+                ),
+            )
+        rows.append(
+            _upsert_decision(
+                session,
+                document_set_id=document.document_set_id,
+                source=source,
+                candidate=candidate,
+                decision=item.status,
+            )
+        )
+    session.commit()
+    return {
+        "saved": True,
+        "source_element_id": source.element_id,
+        "decisions": [
+            {
+                "candidate_element_id": row.candidate_element_id,
+                "element_id": row.candidate_element_id,
+                "status": row.decision,
+                "decision": row.decision,
+                "similarity_score": row.similarity_score,
+            }
+            for row in rows
+        ],
+    }
+
+
+def _delta_visible_text(delta: QuillDelta) -> str:
+    operations = delta.ops
+    for operation in operations:
+        if operation.retain is not None or operation.delete is not None:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Structural Delta retain/delete operations are unsupported. "
+                    "Submit the complete contents of one existing block."
+                ),
+            )
+    inserted = "".join(operation.insert or "" for operation in operations)
+    normalized = inserted.replace("\r\n", "\n").replace("\r", "\n")
+    if normalized.endswith("\n"):
+        normalized = normalized[:-1]
+    if "\n" in normalized:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Splitting, merging, inserting, deleting, or reordering blocks is "
+                "unsupported in this release."
+            ),
+        )
+    return normalized
+
+
+def _validate_delta(target: EditorTarget) -> dict | None:
+    if target.delta is None:
+        return None
+    visible = _delta_visible_text(target.delta)
+    if visible != target.replacement_text:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Delta text must match replacement_text for the targeted block."
+            ),
+        )
+    operations = target.delta.model_dump(exclude_none=True)["ops"]
+    for index, operation in enumerate(operations):
+        attributes = set((operation.get("attributes") or {}).keys())
+        allowed = (
+            ALLOWED_BLOCK_ATTRIBUTES
+            if operation.get("insert") == "\n" and index == len(operations) - 1
+            else ALLOWED_INLINE_ATTRIBUTES
+        )
+        unsupported = attributes - allowed
+        if unsupported:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Unsupported Delta formatting attribute(s): "
+                    + ", ".join(sorted(unsupported))
+                    + "."
+                ),
+            )
+    return {"ops": operations}
+
+
+def _delta_with_replacement(
+    revision: DocumentBlockRevision,
+    replacement_text: str,
+) -> dict:
+    current = revision.delta_json or {"ops": [{"insert": revision.text}, {"insert": "\n"}]}
+    operations = [dict(item) for item in current.get("ops", [])]
+    newline = (
+        operations[-1]
+        if operations and operations[-1].get("insert") == "\n"
+        else {"insert": "\n"}
+    )
+    first_attributes = None
+    for operation in operations:
+        if operation.get("insert") != "\n":
+            first_attributes = operation.get("attributes")
+            break
+    first: dict[str, object] = {"insert": replacement_text}
+    if first_attributes:
+        first["attributes"] = first_attributes
+    return {"ops": [first, newline]}
+
+
+def _stored_confirmation(
+    session: Session,
+    source: DocumentBlockRevision,
+    candidate: DocumentBlockRevision,
+) -> bool:
+    decision = session.scalar(
+        select(MatchDecision.decision).where(
+            MatchDecision.source_version_id == source.version_id,
+            MatchDecision.source_element_id == source.element_id,
+            MatchDecision.candidate_version_id == candidate.version_id,
+            MatchDecision.candidate_element_id == candidate.element_id,
+        )
+    )
+    return decision == "confirmed"
+
+
+def _validate_editor_request(
+    session: Session,
+    document_set_id: str,
+    request: EditorEditRequest,
+) -> tuple[
+    DocumentBlockRevision,
+    DocumentRecord,
+    dict[str, tuple[DocumentRecord, DocumentHead, DocumentVersion]],
+    list[tuple[EditorTarget, DocumentBlockRevision, DocumentRecord, dict]],
+]:
+    document_set = session.get(DocumentSet, document_set_id)
+    if document_set is None:
+        raise HTTPException(status_code=404, detail="Document set not found.")
+
+    base_context: dict[
+        str, tuple[DocumentRecord, DocumentHead, DocumentVersion]
+    ] = {}
+    for document_id, expected_version_id in request.base_versions.items():
+        document = session.get(DocumentRecord, document_id)
+        if document is None or document.document_set_id != document_set_id:
+            raise HTTPException(
+                status_code=422,
+                detail="Every base version must belong to the selected document set.",
+            )
+        head = session.get(DocumentHead, document.id)
+        if head is None:
+            initialise_original_version(session, document)
+            session.flush()
+            head = session.get(DocumentHead, document.id)
+        if head.current_version_id != expected_version_id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"{document.original_name} changed after this edit was opened. "
+                    "Reload the current version and review the edit again."
+                ),
+            )
+        base_context[document.id] = (
+            document,
+            head,
+            get_version_or_404(session, head.current_version_id),
+        )
+
+    source, source_document, _source_head = _get_current_revision_or_404(
+        session,
+        request.source_element_id,
+    )
+    if source_document.document_set_id != document_set_id:
+        raise HTTPException(
+            status_code=422,
+            detail="The source block does not belong to this document set.",
+        )
+    if source_document.id not in base_context:
+        raise HTTPException(
+            status_code=422,
+            detail="base_versions must include the source document.",
+        )
+    if not source.supported:
+        raise HTTPException(
+            status_code=422,
+            detail=source.unsupported_reason
+            or "The selected source block is read-only.",
+        )
+    if request.source_element_id not in {
+        target.element_id for target in request.targets
+    }:
+        raise HTTPException(
+            status_code=422,
+            detail="The source block must remain included in editor targets.",
+        )
+
+    request_decisions = {
+        decision.candidate_element_id: decision.status
+        for decision in request.match_decisions
+    }
+    validated_targets: list[
+        tuple[EditorTarget, DocumentBlockRevision, DocumentRecord, dict]
+    ] = []
+    for target in request.targets:
+        revision, document, _head = _get_current_revision_or_404(
+            session,
+            target.element_id,
+        )
+        if document.document_set_id != document_set_id:
+            raise HTTPException(
+                status_code=422,
+                detail="Every target must belong to the selected document set.",
+            )
+        if document.id not in base_context:
+            raise HTTPException(
+                status_code=422,
+                detail=f"base_versions is missing {document.original_name}.",
+            )
+        if revision.version_id != base_context[document.id][1].current_version_id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"{document.original_name} no longer contains this target version.",
+            )
+        if not revision.supported:
+            raise HTTPException(
+                status_code=422,
+                detail=revision.unsupported_reason
+                or f"{document.original_name} contains a read-only target.",
+            )
+        if revision.element_type != source.element_type:
+            raise HTTPException(
+                status_code=422,
+                detail="Editor targets must use a compatible block type.",
+            )
+        is_source = revision.element_id == source.element_id
+        is_exact = (
+            revision.exact_match_hash == source.exact_match_hash
+            and revision.shared_state == "shared"
+            and source.shared_state == "shared"
+        )
+        explicitly_confirmed = (
+            request_decisions.get(revision.element_id) == "confirmed"
+        )
+        persisted_confirmation = _stored_confirmation(session, source, revision)
+        near_score = (
+            similarity_score(
+                source,
+                revision,
+                maximum_ordinal=max(source.ordinal, revision.ordinal, 1),
+                session=session,
+            )
+            if not is_source and not is_exact
+            else 1.0
+        )
+        if (
+            (explicitly_confirmed or persisted_confirmation)
+            and not is_source
+            and not is_exact
+            and near_score < settings.near_match_threshold
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"{document.original_name}: the selected block is below the "
+                    "configured near-match threshold."
+                ),
+            )
+        if not (
+            is_source
+            or is_exact
+            or explicitly_confirmed
+            or persisted_confirmation
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"{document.original_name}: near-match targets must be explicitly "
+                    "confirmed before they can be edited."
+                ),
+            )
+        if request_decisions.get(revision.element_id) in {"ignored", "removed"}:
+            raise HTTPException(
+                status_code=422,
+                detail="Ignored or removed match candidates cannot be editor targets.",
+            )
+        delta = _validate_delta(target) or _delta_with_replacement(
+            revision,
+            target.replacement_text,
+        )
+        validated_targets.append((target, revision, document, delta))
+
+    return source, source_document, base_context, validated_targets
+
+
+def _clear_paragraph_runs(paragraph: Paragraph) -> list:
+    runs = list(paragraph.runs)
+    for run in runs:
+        run.text = ""
+    return runs
+
+
+def _apply_inline_delta(paragraph: Paragraph, delta: dict) -> dict:
+    operations = list(delta.get("ops") or [])
+    newline_attributes: dict = {}
+    if operations and operations[-1].get("insert") == "\n":
+        newline_attributes = dict(operations.pop().get("attributes") or {})
+    existing_runs = _clear_paragraph_runs(paragraph)
+    run_index = 0
+    for operation in operations:
+        text = operation.get("insert")
+        if not isinstance(text, str) or not text:
+            continue
+        run = (
+            existing_runs[run_index]
+            if run_index < len(existing_runs)
+            else paragraph.add_run()
+        )
+        run_index += 1
+        run.text = text
+        attributes = operation.get("attributes") or {}
+        run.bold = bool(attributes.get("bold", False))
+        run.italic = bool(attributes.get("italic", False))
+        run.underline = bool(attributes.get("underline", False))
+    return newline_attributes
+
+
+def _set_alignment(paragraph: Paragraph, value: object) -> None:
+    mapping = {
+        "left": WD_ALIGN_PARAGRAPH.LEFT,
+        "center": WD_ALIGN_PARAGRAPH.CENTER,
+        "right": WD_ALIGN_PARAGRAPH.RIGHT,
+        "justify": WD_ALIGN_PARAGRAPH.JUSTIFY,
+    }
+    if value in mapping:
+        paragraph.alignment = mapping[value]
+
+
+def _set_list_format(
+    document: DocxDocument,
+    paragraph: Paragraph,
+    list_type: object,
+    level: object,
+) -> None:
+    if list_type not in {"ordered", "bullet"}:
+        return
+    level_value = int(level or 0)
+    base_style = "List Number" if list_type == "ordered" else "List Bullet"
+    requested_style = f"{base_style} {level_value + 1}" if level_value else base_style
+    style_names = {style.name for style in document.styles}
+    paragraph.style = requested_style if requested_style in style_names else base_style
+    properties = paragraph._p.get_or_add_pPr()
+    num_properties = properties.numPr
+    if num_properties is not None:
+        level_node = num_properties.get_or_add_ilvl()
+        level_node.val = level_value
+
+
+def _clear_numbering(paragraph: Paragraph) -> None:
+    properties = paragraph._p.pPr
+    if properties is not None and properties.numPr is not None:
+        properties.remove(properties.numPr)
+
+
+def _apply_target_to_docx(
+    document: DocxDocument,
+    revision: DocumentBlockRevision,
+    target: EditorTarget,
+    delta: dict,
+) -> None:
+    location = revision.location_json or {}
+    paragraph: Paragraph
+    if location.get("kind") == "table_cell":
+        try:
+            cell = (
+                document.tables[int(location["table_index"])]
+                .rows[int(location["row_index"])]
+                .cells[int(location["column_index"])]
+            )
+        except (IndexError, KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="The target table-cell location is no longer valid.",
+            ) from exc
+        non_empty = [item for item in cell.paragraphs if item.text.strip()]
+        if len(non_empty) > 1 or cell.tables:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Table cells containing multiple paragraphs or nested tables "
+                    "are read-only."
+                ),
+            )
+        paragraph = non_empty[0] if non_empty else cell.paragraphs[0]
+    else:
+        try:
+            paragraph = document.paragraphs[int(location["paragraph_index"])]
+        except (IndexError, KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="The target paragraph location is no longer valid.",
+            ) from exc
+    existing_list_type, _existing_level = _numbering_type(document, paragraph)
+    newline_attributes = _apply_inline_delta(paragraph, delta)
+    if target.delta is not None:
+        # A submitted Quill document is authoritative for supported block
+        # formatting. Missing attributes therefore represent clear-format.
+        if "header" not in newline_attributes and revision.element_type == "heading":
+            if "Normal" in {style.name for style in document.styles}:
+                paragraph.style = "Normal"
+        if "list" not in newline_attributes and existing_list_type is not None:
+            _clear_numbering(paragraph)
+            if "Normal" in {style.name for style in document.styles}:
+                paragraph.style = "Normal"
+        if "align" not in newline_attributes:
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    if "header" in newline_attributes:
+        _clear_numbering(paragraph)
+        level = int(newline_attributes["header"])
+        style_name = f"Heading {min(max(level, 1), 9)}"
+        if style_name in {style.name for style in document.styles}:
+            paragraph.style = style_name
+    if "list" in newline_attributes:
+        if existing_list_type != newline_attributes.get("list"):
+            _clear_numbering(paragraph)
+        _set_list_format(
+            document,
+            paragraph,
+            newline_attributes.get("list"),
+            newline_attributes.get("indent", 0),
+        )
+    if "align" in newline_attributes:
+        _set_alignment(paragraph, newline_attributes["align"])
+
+
+def _apply_document_targets(
+    source_path: Path,
+    targets: list[tuple[EditorTarget, DocumentBlockRevision, DocumentRecord, dict]],
+) -> tuple[DocxDocument, bytes]:
+    document = _load_docx(source_path)
+    for target, revision, _record, delta in sorted(
+        targets,
+        key=lambda item: item[1].ordinal,
+    ):
+        _apply_target_to_docx(document, revision, target, delta)
+    output = BytesIO()
+    document.save(output)
+    payload = output.getvalue()
+    try:
+        Document(BytesIO(payload))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="The edited DOCX failed validation and was not saved.",
+        ) from exc
+    return document, payload
+
+
+def _preview_payload(
+    document_set_id: str,
+    request: EditorEditRequest,
+    validated_targets: list[
+        tuple[EditorTarget, DocumentBlockRevision, DocumentRecord, dict]
+    ],
+) -> dict:
+    documents: dict[str, dict] = {}
+    for target, revision, document, delta in validated_targets:
+        item = documents.setdefault(
+            document.id,
+            {
+                "document_id": document.id,
+                "document_name": document.original_name,
+                "base_version_id": revision.version_id,
+                "version_id": revision.version_id,
+                "changes": [],
+            },
+        )
+        item["changes"].append(
+            {
+                "element_id": revision.element_id,
+                "paragraph_index": (revision.location_json or {}).get(
+                    "paragraph_index", revision.ordinal
+                ),
+                "element_type": revision.element_type,
+                "location": revision.location_json,
+                "before": revision.text,
+                "after": target.replacement_text,
+                "before_delta": revision.delta_json,
+                "after_delta": delta,
+                "delta": delta,
+                "shared_state": (
+                    "detached" if request.edit_mode == "override" else revision.shared_state
+                ),
+            }
+        )
+    result_documents = sorted(
+        documents.values(),
+        key=lambda item: item["document_name"].casefold(),
+    )
+    return {
+        "operation_id": None,
+        "document_set_id": document_set_id,
+        "source_element_id": request.source_element_id,
+        "edit_mode": request.edit_mode,
+        "base_versions": dict(request.base_versions),
+        "affected_document_count": len(result_documents),
+        "affected_location_count": sum(
+            len(document["changes"]) for document in result_documents
+        ),
+        "documents": result_documents,
+        "status": "previewed",
+        "writes_performed": False,
+    }
+
+
+def preview_editor_edit(
+    session: Session,
+    document_set_id: str,
+    request: EditorEditRequest,
+) -> dict:
+    _source, _source_document, base_context, validated_targets = (
+        _validate_editor_request(session, document_set_id, request)
+    )
+    by_document: dict[
+        str, list[tuple[EditorTarget, DocumentBlockRevision, DocumentRecord, dict]]
+    ] = defaultdict(list)
+    for item in validated_targets:
+        by_document[item[2].id].append(item)
+    # Perform the full targeted OOXML round-trip in memory. Preview remains
+    # side-effect free while surfacing unsupported/write-back failures early.
+    for document_id, targets in by_document.items():
+        version = base_context[document_id][2]
+        _apply_document_targets(document_version_path(version), targets)
+    return _preview_payload(document_set_id, request, validated_targets)
+
+
+def _sha256(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _shared_states_by_location(
+    session: Session,
+    version_id: str,
+) -> dict[str, str]:
+    revisions = session.scalars(
+        select(DocumentBlockRevision).where(
+            DocumentBlockRevision.version_id == version_id
+        )
+    )
+    return {
+        _location_key(revision.location_json): revision.shared_state
+        for revision in revisions
+    }
+
+
+def _replace_current_elements_and_create_revisions(
+    session: Session,
+    *,
+    document: DocumentRecord,
+    version: DocumentVersion,
+    source_path: Path,
+    base_version_id: str,
+    override_locations: set[str] | None = None,
+    reconnect_locations: set[str] | None = None,
+) -> dict[str, str]:
+    from .document_service import _extract_paragraphs
+
+    payload = source_path.read_bytes()
+    extracted = _extract_paragraphs(payload)
+    previous_states = _shared_states_by_location(session, base_version_id)
+    override_locations = override_locations or set()
+    reconnect_locations = reconnect_locations or set()
+
+    current_elements = list(
+        session.scalars(
+            select(DocumentElement).where(DocumentElement.document_id == document.id)
+        )
+    )
+    for element in current_elements:
+        session.delete(element)
+    session.flush()
+
+    elements: list[DocumentElement] = []
+    for paragraph_index, text, style_name in extracted:
+        element = DocumentElement(
+            id=new_id(),
+            document_id=document.id,
+            paragraph_index=paragraph_index,
+            text=text,
+            normalized_text=normalise_editor_text(text),
+            style_name=style_name,
+        )
+        session.add(element)
+        elements.append(element)
+    session.flush()
+
+    docx = _load_docx(source_path)
+    location_to_element: dict[str, str] = {}
+    revisions: list[DocumentBlockRevision] = []
+    for element in elements:
+        _ordinal, location = _element_location(element)
+        key = _location_key(location)
+        shared_state = previous_states.get(key, "shared")
+        if key in override_locations:
+            shared_state = "detached"
+        elif key in reconnect_locations:
+            shared_state = "shared"
+        values = _revision_values(docx, element, shared_state=shared_state)
+        revision = DocumentBlockRevision(version_id=version.id, **values)
+        revisions.append(revision)
+        location_to_element[key] = element.id
+    session.add_all(revisions)
+    session.flush()
+    return location_to_element
+
+
+def _persist_request_decisions(
+    session: Session,
+    *,
+    document_set_id: str,
+    source: DocumentBlockRevision,
+    decisions: list[EditorMatchDecision],
+) -> None:
+    for item in decisions:
+        candidate, candidate_document, _head = _get_current_revision_or_404(
+            session,
+            item.candidate_element_id,
+        )
+        if candidate_document.document_set_id != document_set_id:
+            raise HTTPException(
+                status_code=422,
+                detail="Match decisions must stay within one document set.",
+            )
+        _upsert_decision(
+            session,
+            document_set_id=document_set_id,
+            source=source,
+            candidate=candidate,
+            decision=item.status,
+        )
+
+
+def generate_editor_versions(
+    session: Session,
+    document_set_id: str,
+    request: EditorEditRequest,
+) -> dict:
+    with EDITOR_GENERATION_LOCK:
+        committed = False
+        staging_directory: Path | None = None
+        final_directory: Path | None = None
+        try:
+            source, _source_document, base_context, validated_targets = (
+                _validate_editor_request(session, document_set_id, request)
+            )
+            preview = _preview_payload(
+                document_set_id,
+                request,
+                validated_targets,
+            )
+            operation_id = new_id()
+            generated_root = settings.data_dir / "generated" / document_set_id
+            generated_root.mkdir(parents=True, exist_ok=True)
+            staging_directory = generated_root / f".{operation_id}.staging"
+            final_directory = generated_root / operation_id
+            if staging_directory.exists() or final_directory.exists():
+                raise HTTPException(
+                    status_code=409,
+                    detail="An editor generation storage collision occurred. Try again.",
+                )
+            staging_directory.mkdir(parents=False, exist_ok=False)
+
+            by_document: dict[
+                str,
+                list[
+                    tuple[
+                        EditorTarget,
+                        DocumentBlockRevision,
+                        DocumentRecord,
+                        dict,
+                    ]
+                ],
+            ] = defaultdict(list)
+            for item in validated_targets:
+                by_document[item[2].id].append(item)
+
+            staged: dict[str, dict] = {}
+            from .document_service import safe_download_name
+
+            for document_id, targets in by_document.items():
+                document, head, base_version = base_context[document_id]
+                _docx, payload = _apply_document_targets(
+                    document_version_path(base_version),
+                    targets,
+                )
+                next_number = base_version.version_number + 1
+                output_name = safe_download_name(
+                    f"{Path(document.original_name).stem}-v{next_number}.docx"
+                )
+                output_path = staging_directory / output_name
+                output_path.write_bytes(payload)
+                # Validate the actual staged file, not only the memory buffer.
+                _load_docx(output_path)
+                staged[document_id] = {
+                    "document": document,
+                    "head": head,
+                    "base_version": base_version,
+                    "targets": targets,
+                    "version_id": new_id(),
+                    "version_number": next_number,
+                    "output_name": output_name,
+                    "staging_path": output_path,
+                    "checksum": _sha256(payload),
+                }
+
+            zip_path = staging_directory / "current-documents.zip"
+            with zipfile.ZipFile(
+                zip_path,
+                mode="w",
+                compression=zipfile.ZIP_DEFLATED,
+            ) as archive:
+                documents = list(
+                    session.scalars(
+                        select(DocumentRecord)
+                        .where(DocumentRecord.document_set_id == document_set_id)
+                        .order_by(DocumentRecord.original_name)
+                    )
+                )
+                for document in documents:
+                    staged_item = staged.get(document.id)
+                    if staged_item is not None:
+                        path = staged_item["staging_path"]
+                    else:
+                        path = document_version_path(
+                            current_version_for_document(session, document)
+                        )
+                    archive.write(
+                        path,
+                        arcname=safe_download_name(document.original_name),
+                    )
+
+            staging_directory.replace(final_directory)
+            staging_directory = None
+
+            operation = EditorOperation(
+                id=operation_id,
+                document_set_id=document_set_id,
+                operation_type=request.edit_mode,
+                status="completed",
+                source_element_id=request.source_element_id,
+                replacement_text=(
+                    validated_targets[0][0].replacement_text
+                    if len(validated_targets) == 1
+                    else None
+                ),
+                preview_json=preview,
+                completed_at=utc_now(),
+            )
+            session.add(operation)
+            session.flush()
+            _persist_request_decisions(
+                session,
+                document_set_id=document_set_id,
+                source=source,
+                decisions=request.match_decisions,
+            )
+
+            response_versions: list[dict] = []
+            for document_id, item in staged.items():
+                document: DocumentRecord = item["document"]
+                head: DocumentHead = item["head"]
+                base_version: DocumentVersion = item["base_version"]
+                version = DocumentVersion(
+                    id=item["version_id"],
+                    document_id=document.id,
+                    parent_version_id=base_version.id,
+                    generation_id=None,
+                    editor_operation_id=operation.id,
+                    version_number=item["version_number"],
+                    storage_area="generated",
+                    storage_name=(
+                        f"{document_set_id}/{operation_id}/{item['output_name']}"
+                    ),
+                    download_name=item["output_name"],
+                    checksum_sha256=item["checksum"],
+                )
+                session.add(version)
+                session.flush()
+
+                override_locations = {
+                    _location_key(revision.location_json)
+                    for _target, revision, _record, _delta in item["targets"]
+                    if request.edit_mode == "override"
+                }
+                reconnect_locations = {
+                    _location_key(revision.location_json)
+                    for _target, revision, _record, _delta in item["targets"]
+                    if request.edit_mode != "override"
+                    and revision.shared_state == "detached"
+                }
+                location_to_element = (
+                    _replace_current_elements_and_create_revisions(
+                        session,
+                        document=document,
+                        version=version,
+                        source_path=final_directory / item["output_name"],
+                        base_version_id=base_version.id,
+                        override_locations=override_locations,
+                        reconnect_locations=reconnect_locations,
+                    )
+                )
+
+                for ordinal, (
+                    target,
+                    revision,
+                    _target_document,
+                    delta,
+                ) in enumerate(item["targets"]):
+                    session.add(
+                        EditorOperationTarget(
+                            id=new_id(),
+                            operation_id=operation.id,
+                            document_id=document.id,
+                            element_id=revision.element_id,
+                            base_version_id=base_version.id,
+                            result_version_id=version.id,
+                            expected_head_revision=head.revision,
+                            ordinal=ordinal,
+                            before_text=revision.text,
+                            after_text=target.replacement_text,
+                            before_delta_json=revision.delta_json,
+                            after_delta_json=delta,
+                        )
+                    )
+
+                head.current_version_id = version.id
+                head.revision += 1
+                head.updated_at = utc_now()
+                response_versions.append(
+                    {
+                        "id": version.id,
+                        "document_id": document.id,
+                        "document_name": document.original_name,
+                        "version_id": version.id,
+                        "version_number": version.version_number,
+                        "parent_version_id": version.parent_version_id,
+                        "checksum_sha256": version.checksum_sha256,
+                        "created_at": utc_isoformat(version.created_at),
+                        "status": "completed",
+                        "is_current": True,
+                        "generation_id": operation.id,
+                        "download_url": (
+                            f"/api/document-versions/{version.id}/download"
+                        ),
+                        "editor_content_url": (
+                            f"/api/document-versions/{version.id}/editor-content"
+                        ),
+                        "element_ids_by_location": location_to_element,
+                    }
+                )
+
+            session.flush()
+            from .document_service import (
+                _rebuild_exact_link_groups,
+                get_document_set_or_404,
+                rendered_pdf_path,
+                serialize_document_set,
+            )
+
+            _rebuild_exact_link_groups(session, document_set_id)
+            for item in staged.values():
+                # Remove legacy document-ID render cache. True-version renders
+                # use their own cache name.
+                rendered_pdf_path(item["document"]).unlink(missing_ok=True)
+            session.commit()
+            committed = True
+
+            refreshed = serialize_document_set(
+                get_document_set_or_404(session, document_set_id)
+            )
+            return {
+                "operation_id": operation.id,
+                "generation_id": operation.id,
+                "status": "completed",
+                "edit_mode": request.edit_mode,
+                "versions": sorted(
+                    response_versions,
+                    key=lambda item: item["document_name"].casefold(),
+                ),
+                "files": [
+                    {
+                        "source_document_id": item["document_id"],
+                        "version_id": item["version_id"],
+                        "name": item["document_name"],
+                        "download_url": item["download_url"],
+                    }
+                    for item in response_versions
+                ],
+                "download_url": (
+                    f"/api/editor-operations/{operation.id}/download"
+                ),
+                "document_set": refreshed,
+            }
+        except Exception:
+            if not committed:
+                session.rollback()
+                if staging_directory is not None:
+                    shutil.rmtree(staging_directory, ignore_errors=True)
+                if final_directory is not None:
+                    shutil.rmtree(final_directory, ignore_errors=True)
+            raise
+
+
+def editor_operation_download_path(
+    session: Session,
+    operation_id: str,
+) -> Path:
+    operation = session.get(EditorOperation, operation_id)
+    if operation is None or operation.status != "completed":
+        raise HTTPException(status_code=404, detail="Editor generation not found.")
+    path = (
+        settings.data_dir
+        / "generated"
+        / operation.document_set_id
+        / operation.id
+        / "current-documents.zip"
+    )
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Generated ZIP file is missing.")
+    return path
+
+
+def register_legacy_generation_versions(
+    session: Session,
+    *,
+    generation_id: str,
+    generated_files: list[tuple[DocumentRecord, str, Path]],
+) -> None:
+    """Bridge the legacy exact-edit path into true version lineage immediately."""
+
+    generated_rows = {
+        row.source_document_id: row
+        for row in session.scalars(
+            select(GeneratedVersion).where(
+                GeneratedVersion.generation_id == generation_id
+            )
+        )
+    }
+    for document, _output_name, output_path in generated_files:
+        generated = generated_rows.get(document.id)
+        if generated is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Generated version metadata could not be registered.",
+            )
+        existing = session.get(DocumentVersion, generated.id)
+        if existing is not None:
+            continue
+        base_version = current_version_for_document(session, document)
+        version = DocumentVersion(
+            id=generated.id,
+            document_id=document.id,
+            parent_version_id=base_version.id,
+            generation_id=generation_id,
+            editor_operation_id=None,
+            version_number=base_version.version_number + 1,
+            storage_area="generated",
+            storage_name=generated.storage_name,
+            download_name=generated.download_name,
+            checksum_sha256=hashlib.sha256(output_path.read_bytes()).hexdigest(),
+        )
+        session.add(version)
+        session.flush()
+        _replace_current_elements_and_create_revisions(
+            session,
+            document=document,
+            version=version,
+            source_path=output_path,
+            base_version_id=base_version.id,
+        )
+        head = session.get(DocumentHead, document.id)
+        head.current_version_id = version.id
+        head.revision += 1
+        head.updated_at = utc_now()
+
+
+def serialize_editor_history(
+    session: Session,
+    document_set_id: str,
+) -> list[dict]:
+    operations = list(
+        session.scalars(
+            select(EditorOperation)
+            .where(EditorOperation.document_set_id == document_set_id)
+            .options(
+                selectinload(EditorOperation.targets),
+                selectinload(EditorOperation.versions),
+            )
+            .order_by(EditorOperation.created_at.desc())
+        )
+    )
+    return [
+        {
+            "operation_id": operation.id,
+            "generation_id": operation.id,
+            "event_type": "editor_edit",
+            "edit_mode": operation.operation_type,
+            "status": operation.status,
+            "created_at": utc_isoformat(operation.created_at),
+            "completed_at": (
+                utc_isoformat(operation.completed_at)
+                if operation.completed_at is not None
+                else None
+            ),
+            "target_count": len(operation.targets),
+            "version_count": len(operation.versions),
+            "versions": [
+                {
+                    "document_id": version.document_id,
+                    "version_id": version.id,
+                    "version_number": version.version_number,
+                    "parent_version_id": version.parent_version_id,
+                    "download_url": (
+                        f"/api/document-versions/{version.id}/download"
+                    ),
+                }
+                for version in sorted(
+                    operation.versions,
+                    key=lambda item: (item.document_id, item.version_number),
+                )
+            ],
+            "targets": [
+                {
+                    "element_id": target.element_id,
+                    "document_id": target.document_id,
+                    "base_version_id": target.base_version_id,
+                    "result_version_id": target.result_version_id,
+                    "before": target.before_text,
+                    "after": target.after_text,
+                }
+                for target in operation.targets
+            ],
+            "download_url": (
+                f"/api/editor-operations/{operation.id}/download"
+            ),
+        }
+        for operation in operations
+    ]

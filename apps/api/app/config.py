@@ -2,7 +2,46 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from math import isfinite
 from pathlib import Path
+
+
+def _bounded_float_env(
+    name: str,
+    default: float,
+    *,
+    minimum: float,
+    maximum: float,
+) -> float:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number.") from exc
+    if not isfinite(value) or not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be between {minimum} and {maximum}.")
+    return value
+
+
+def _bounded_int_env(
+    name: str,
+    default: int,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a whole number.") from exc
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be between {minimum} and {maximum}.")
+    return value
 
 
 @dataclass(frozen=True)
@@ -16,6 +55,8 @@ class Settings:
     web_dist_dir: Path
     render_script: Path
     session_token: str
+    near_match_threshold: float
+    near_match_candidate_limit: int
 
 
 def _build_settings() -> Settings:
@@ -61,6 +102,18 @@ def _build_settings() -> Settings:
         web_dist_dir=web_dist_dir,
         render_script=render_script,
         session_token=os.getenv("DOCUMENTSYNC_SESSION_TOKEN", ""),
+        near_match_threshold=_bounded_float_env(
+            "DOCUMENTSYNC_NEAR_MATCH_THRESHOLD",
+            0.82,
+            minimum=0.0,
+            maximum=1.0,
+        ),
+        near_match_candidate_limit=_bounded_int_env(
+            "DOCUMENTSYNC_NEAR_MATCH_CANDIDATE_LIMIT",
+            25,
+            minimum=1,
+            maximum=500,
+        ),
     )
 
 

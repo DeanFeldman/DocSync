@@ -20,7 +20,6 @@ from .document_service import (
     generation_download_path,
     get_document_or_404,
     get_document_set_or_404,
-    get_element_matches_or_404,
     get_generation_or_404,
     get_link_group_or_404,
     list_document_sets,
@@ -33,7 +32,28 @@ from .document_service import (
     serialize_document_set,
     serialize_document_view,
 )
-from .schemas import EditRequest
+from .editor_service import (
+    EDITOR_GENERATION_LOCK,
+    compare_elements,
+    document_version_path,
+    editor_operation_download_path,
+    generate_editor_versions,
+    get_editor_matches,
+    get_similar_matches,
+    get_version_or_404,
+    preview_editor_edit,
+    resolve_document_identifier,
+    save_match_decisions,
+    serialize_document_versions,
+    serialize_editor_content,
+    serialize_version_document_view,
+)
+from .schemas import (
+    CompareRequest,
+    EditRequest,
+    EditorEditRequest,
+    MatchDecisionBatchRequest,
+)
 
 
 @asynccontextmanager
@@ -158,7 +178,8 @@ def render_document(
     document_id: str,
     session: Session = Depends(get_session),
 ) -> dict:
-    return render_document_with_word(session, get_document_or_404(session, document_id))
+    document, version = resolve_document_identifier(session, document_id)
+    return render_document_with_word(session, document, version)
 
 
 @app.get("/api/document-versions/{version_id}/pages")
@@ -166,7 +187,7 @@ def read_document_pages(
     version_id: str,
     session: Session = Depends(get_session),
 ) -> dict:
-    return serialize_document_view(get_document_or_404(session, version_id))
+    return serialize_version_document_view(session, version_id)
 
 
 @app.get("/api/document-versions/{version_id}/rendered-file")
@@ -174,10 +195,10 @@ def read_rendered_document(
     version_id: str,
     session: Session = Depends(get_session),
 ) -> FileResponse:
-    document = get_document_or_404(session, version_id)
-    path = rendered_pdf_path(document)
+    document, version = resolve_document_identifier(session, version_id)
+    path = rendered_pdf_path(document, version.id)
     if not path.exists():
-        render_document_with_word(session, document)
+        render_document_with_word(session, document, version)
     return FileResponse(
         path,
         media_type="application/pdf",
@@ -206,7 +227,73 @@ def read_element_matches(
     element_id: str,
     session: Session = Depends(get_session),
 ) -> dict:
-    return get_element_matches_or_404(session, element_id)
+    return get_editor_matches(session, element_id)
+
+
+@app.get("/api/document-elements/{element_id}/similar-matches")
+def read_similar_element_matches(
+    element_id: str,
+    threshold: float | None = Query(default=None, ge=0.0, le=1.0),
+    limit: int | None = Query(default=None, ge=1, le=100),
+    session: Session = Depends(get_session),
+) -> dict:
+    return get_similar_matches(
+        session,
+        element_id,
+        threshold=threshold,
+        limit=limit,
+    )
+
+
+@app.post("/api/document-elements/{element_id}/compare")
+def compare_document_elements(
+    element_id: str,
+    request: CompareRequest,
+    session: Session = Depends(get_session),
+) -> dict:
+    return compare_elements(session, element_id, request)
+
+
+@app.post("/api/document-elements/{element_id}/match-decisions")
+def update_document_element_match_decisions(
+    element_id: str,
+    request: MatchDecisionBatchRequest,
+    session: Session = Depends(get_session),
+) -> dict:
+    return save_match_decisions(session, element_id, request)
+
+
+@app.get("/api/document-versions/{version_id}/editor-content")
+def read_document_editor_content(
+    version_id: str,
+    session: Session = Depends(get_session),
+) -> dict:
+    return serialize_editor_content(session, version_id)
+
+
+@app.get("/api/document-versions/{version_id}/download")
+def download_document_version(
+    version_id: str,
+    session: Session = Depends(get_session),
+) -> FileResponse:
+    version = get_version_or_404(session, version_id)
+    return FileResponse(
+        document_version_path(version),
+        media_type=(
+            "application/vnd.openxmlformats-officedocument."
+            "wordprocessingml.document"
+        ),
+        filename=version.download_name or version.document.original_name,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/documents/{document_id}/versions")
+def read_document_versions(
+    document_id: str,
+    session: Session = Depends(get_session),
+) -> dict:
+    return serialize_document_versions(session, document_id)
 
 
 @app.post("/api/document-sets/{document_set_id}/preview")
@@ -230,15 +317,16 @@ def generate_document_set_edit(
     request: EditRequest,
     session: Session = Depends(get_session),
 ) -> dict:
-    group = get_link_group_or_404(session, document_set_id, request.link_group_id)
-    job = generate_versions(
-        session,
-        document_set_id,
-        group,
-        request.replacement_text,
-        request.included_element_ids,
-        request.source_element_id,
-    )
+    with EDITOR_GENERATION_LOCK:
+        group = get_link_group_or_404(session, document_set_id, request.link_group_id)
+        job = generate_versions(
+            session,
+            document_set_id,
+            group,
+            request.replacement_text,
+            request.included_element_ids,
+            request.source_element_id,
+        )
     return {
         "generation_id": job.id,
         "status": job.status,
@@ -254,6 +342,27 @@ def generate_document_set_edit(
             get_document_set_or_404(session, document_set_id)
         ),
     }
+
+
+@app.post("/api/document-sets/{document_set_id}/editor-preview")
+def preview_document_set_editor_edit(
+    document_set_id: str,
+    request: EditorEditRequest,
+    session: Session = Depends(get_session),
+) -> dict:
+    return preview_editor_edit(session, document_set_id, request)
+
+
+@app.post(
+    "/api/document-sets/{document_set_id}/editor-generate",
+    status_code=201,
+)
+def generate_document_set_editor_edit(
+    document_set_id: str,
+    request: EditorEditRequest,
+    session: Session = Depends(get_session),
+) -> dict:
+    return generate_editor_versions(session, document_set_id, request)
 
 
 @app.get("/api/document-sets/{document_set_id}/history")
@@ -275,6 +384,18 @@ def download_generation(
         path,
         media_type="application/zip",
         filename=f"DocumentSync-{generation_id}.zip",
+    )
+
+
+@app.get("/api/editor-operations/{operation_id}/download")
+def download_editor_operation(
+    operation_id: str,
+    session: Session = Depends(get_session),
+) -> FileResponse:
+    return FileResponse(
+        editor_operation_download_path(session, operation_id),
+        media_type="application/zip",
+        filename=f"DocumentSync-editor-{operation_id}.zip",
     )
 
 

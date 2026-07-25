@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import threading
+import unicodedata
 import zipfile
 from collections import defaultdict
 from io import BytesIO
@@ -16,15 +17,19 @@ from docx import Document
 from docx.document import Document as DocxDocument
 from docx.text.paragraph import Paragraph
 from fastapi import HTTPException, UploadFile, status
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session, selectinload
 from datetime import datetime, timezone
 
 from .config import settings
 from .models import (
+    DocumentBlockRevision,
     DocumentElement,
+    DocumentHead,
     DocumentRecord,
     DocumentSet,
+    DocumentVersion,
+    EditorOperation,
     GeneratedVersion,
     GenerationJob,
     GenerationTarget,
@@ -59,7 +64,8 @@ def new_id() -> str:
 
 
 def normalise_text(text: str) -> str:
-    return WHITESPACE_PATTERN.sub(" ", text).strip().casefold()
+    canonical = unicodedata.normalize("NFKC", text)
+    return WHITESPACE_PATTERN.sub(" ", canonical).strip().casefold()
 
 
 def table_cell_location(style_name: str | None) -> tuple[int, int, int] | None:
@@ -343,6 +349,10 @@ async def create_document_set(
                 )
 
         session.flush()
+        from .editor_service import initialise_original_version
+
+        for record in document_set.documents:
+            initialise_original_version(session, record)
         _create_exact_link_groups(session, document_set.id)
         session.commit()
     except Exception:
@@ -375,6 +385,7 @@ async def add_documents_to_set(
 
     seen_names = {document.original_name.casefold() for document in document_set.documents}
     created_paths: list[Path] = []
+    created_records: list[DocumentRecord] = []
 
     try:
         for upload in files:
@@ -406,6 +417,7 @@ async def add_documents_to_set(
                 checksum_sha256=hashlib.sha256(payload).hexdigest(),
             )
             session.add(record)
+            created_records.append(record)
             for paragraph_index, text, style_name in extracted:
                 session.add(
                     DocumentElement(
@@ -419,6 +431,10 @@ async def add_documents_to_set(
                 )
 
         session.flush()
+        from .editor_service import initialise_original_version
+
+        for record in created_records:
+            initialise_original_version(session, record)
         _rebuild_exact_link_groups(session, document_set_id)
         session.commit()
         session.expire_all()
@@ -548,11 +564,32 @@ def _create_exact_link_groups(session: Session, document_set_id: str) -> None:
         .where(DocumentRecord.document_set_id == document_set_id)
     ).all()
 
+    detached_ids = set(
+        session.scalars(
+            select(DocumentBlockRevision.element_id)
+            .join(
+                DocumentHead,
+                DocumentHead.current_version_id == DocumentBlockRevision.version_id,
+            )
+            .join(
+                DocumentRecord,
+                DocumentRecord.id == DocumentBlockRevision.document_id,
+            )
+            .where(
+                DocumentRecord.document_set_id == document_set_id,
+                DocumentBlockRevision.shared_state == "detached",
+            )
+        )
+    )
     by_text: dict[tuple[str, str], list[DocumentElement]] = defaultdict(list)
     for element in elements:
-        if element.normalized_text:
+        if element.id in detached_ids:
+            continue
+        normalized_text = normalise_text(element.text)
+        element.normalized_text = normalized_text
+        if normalized_text:
             by_text[
-                (element.normalized_text, element_type_for_style(element.style_name))
+                (normalized_text, element_type_for_style(element.style_name))
             ].append(element)
 
     records: list[object] = []
@@ -581,11 +618,19 @@ def _create_exact_link_groups(session: Session, document_set_id: str) -> None:
 def _rebuild_exact_link_groups(session: Session, document_set_id: str) -> None:
     """Refresh exact-match groups after the working document versions change."""
 
-    groups = session.scalars(
-        select(LinkGroup).where(LinkGroup.document_set_id == document_set_id)
-    ).all()
-    for group in groups:
-        session.delete(group)
+    group_ids = select(LinkGroup.id).where(
+        LinkGroup.document_set_id == document_set_id
+    )
+    session.execute(
+        delete(LinkMember)
+        .where(LinkMember.link_group_id.in_(group_ids))
+        .execution_options(synchronize_session=False)
+    )
+    session.execute(
+        delete(LinkGroup)
+        .where(LinkGroup.document_set_id == document_set_id)
+        .execution_options(synchronize_session=False)
+    )
     session.flush()
     _create_exact_link_groups(session, document_set_id)
 
@@ -608,6 +653,15 @@ def list_document_sets(session: Session) -> dict:
         .correlate(DocumentSet)
         .scalar_subquery()
     )
+    editor_edit_count = (
+        select(func.count(EditorOperation.id))
+        .where(
+            EditorOperation.document_set_id == DocumentSet.id,
+            EditorOperation.status == "completed",
+        )
+        .correlate(DocumentSet)
+        .scalar_subquery()
+    )
 
     rows = session.execute(
         select(
@@ -615,7 +669,7 @@ def list_document_sets(session: Session) -> dict:
             DocumentSet.name.label("name"),
             DocumentSet.created_at.label("created_at"),
             document_count.label("document_count"),
-            edit_count.label("edit_count"),
+            (edit_count + editor_edit_count).label("edit_count"),
         ).order_by(DocumentSet.created_at.desc())
     ).mappings().all()
 
@@ -671,6 +725,27 @@ def get_document_set_or_404(session: Session, document_set_id: str) -> DocumentS
         document_id: int(element_count)
         for document_id, element_count in element_count_rows
     }
+    current_versions = session.execute(
+        select(DocumentHead, DocumentVersion)
+        .join(
+            DocumentVersion,
+            DocumentVersion.id == DocumentHead.current_version_id,
+        )
+        .join(
+            DocumentRecord,
+            DocumentRecord.id == DocumentHead.document_id,
+        )
+        .where(DocumentRecord.document_set_id == document_set_id)
+    ).all()
+    document_set._docsync_current_versions = {
+        head.document_id: {
+            "version_id": version.id,
+            "version_number": version.version_number,
+            "parent_version_id": version.parent_version_id,
+            "checksum_sha256": version.checksum_sha256,
+        }
+        for head, version in current_versions
+    }
     return document_set
 
 
@@ -693,6 +768,7 @@ def serialize_document_set(document_set: DocumentSet) -> dict:
     )
 
     element_counts = getattr(document_set, "_docsync_element_counts", None)
+    current_versions = getattr(document_set, "_docsync_current_versions", {})
 
     def element_count(document: DocumentRecord) -> int:
         if element_counts is not None:
@@ -706,11 +782,30 @@ def serialize_document_set(document_set: DocumentSet) -> dict:
         "documents": [
             {
                 "id": document.id,
-                "version_id": document.id,
+                "version_id": current_versions.get(document.id, {}).get(
+                    "version_id", document.id
+                ),
+                "current_version_id": current_versions.get(document.id, {}).get(
+                    "version_id", document.id
+                ),
+                "version_number": current_versions.get(document.id, {}).get(
+                    "version_number", 1
+                ),
+                "parent_version_id": current_versions.get(document.id, {}).get(
+                    "parent_version_id"
+                ),
                 "name": document.original_name,
                 "checksum_sha256": document.checksum_sha256,
+                "current_checksum_sha256": current_versions.get(document.id, {}).get(
+                    "checksum_sha256", document.checksum_sha256
+                ),
                 "element_count": element_count(document),
-                "view_url": f"/api/document-versions/{document.id}/pages",
+                "view_url": (
+                    "/api/document-versions/"
+                    f"{current_versions.get(document.id, {}).get('version_id', document.id)}"
+                    "/pages"
+                ),
+                "download_url": f"/api/documents/{document.id}/download",
             }
             for document in documents
         ],
@@ -750,12 +845,24 @@ def serialize_document_view(document: DocumentRecord) -> dict:
     }
 
 
-def rendered_pdf_path(document: DocumentRecord) -> Path:
-    return settings.data_dir / "renders" / document.document_set_id / f"{document.id}.pdf"
+def rendered_pdf_path(
+    document: DocumentRecord,
+    version_id: str | None = None,
+) -> Path:
+    cache_id = version_id or document.id
+    return settings.data_dir / "renders" / document.document_set_id / f"{cache_id}.pdf"
 
 
 def current_document_path(session: Session, document: DocumentRecord) -> Path:
     """Return the latest applied version, falling back to the immutable upload."""
+
+    head = session.get(DocumentHead, document.id)
+    if head is not None:
+        version = session.get(DocumentVersion, head.current_version_id)
+        if version is not None:
+            from .editor_service import document_version_path
+
+            return document_version_path(version)
 
     latest_version = session.scalar(
         select(GeneratedVersion)
@@ -776,12 +883,22 @@ def current_document_path(session: Session, document: DocumentRecord) -> Path:
     return path
 
 
-def render_document_with_word(session: Session, document: DocumentRecord) -> dict:
+def render_document_with_word(
+    session: Session,
+    document: DocumentRecord,
+    version: DocumentVersion | None = None,
+) -> dict:
     """Render the current DOCX version through Microsoft Word and cache the PDF."""
 
-    source_path = current_document_path(session, document)
+    if version is not None:
+        from .editor_service import document_version_path
 
-    output_path = rendered_pdf_path(document)
+        source_path = document_version_path(version)
+    else:
+        source_path = current_document_path(session, document)
+
+    cache_id = version.id if version is not None else document.id
+    output_path = rendered_pdf_path(document, cache_id)
     if not output_path.exists() or output_path.stat().st_size == 0:
         powershell = shutil.which("powershell.exe") or shutil.which("powershell")
         render_script = settings.render_script
@@ -792,7 +909,7 @@ def render_document_with_word(session: Session, document: DocumentRecord) -> dic
             )
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path = output_path.with_name(f"{document.id}-{new_id()}.tmp.pdf")
+        temporary_path = output_path.with_name(f"{cache_id}-{new_id()}.tmp.pdf")
         try:
             with WORD_RENDER_LOCK:
                 if output_path.exists() and output_path.stat().st_size > 0:
@@ -834,13 +951,18 @@ def render_document_with_word(session: Session, document: DocumentRecord) -> dic
         finally:
             temporary_path.unlink(missing_ok=True)
 
-    view = serialize_document_view(document)
+    if version is not None:
+        from .editor_service import serialize_version_document_view
+
+        view = serialize_version_document_view(session, version.id)
+    else:
+        view = serialize_document_view(document)
     view.update(
         {
             "render_mode": "word_pdf",
             "pagination": "word",
             "pdf_url": (
-                f"/api/document-versions/{document.id}/rendered-file"
+                f"/api/document-versions/{cache_id}/rendered-file"
                 f"?v={output_path.stat().st_mtime_ns}"
             ),
             "notice": (
@@ -1062,6 +1184,7 @@ def generate_versions(
         members_by_document[element.document_id].append(element)
 
     generated_files: list[tuple[DocumentRecord, str, Path]] = []
+    committed = False
     try:
         for document_id, elements in members_by_document.items():
             record = elements[0].document
@@ -1132,11 +1255,15 @@ def generate_versions(
             )
         session.flush()
 
-        # The in-workspace element model now follows the applied DOCX versions. Stable
-        # document IDs are retained, while exact-match groups are rebuilt from current text.
-        for element in selected_elements:
-            element.text = replacement_text
-            element.normalized_text = normalise_text(replacement_text)
+        # Bridge the legacy exact-edit workflow into the explicit immutable
+        # version/head/block-revision model before rebuilding current groups.
+        from .editor_service import register_legacy_generation_versions
+
+        register_legacy_generation_versions(
+            session,
+            generation_id=generation_id,
+            generated_files=generated_files,
+        )
         _rebuild_exact_link_groups(session, document_set_id)
 
         changed_paths = {record.id: path for record, _, path in generated_files}
@@ -1157,6 +1284,7 @@ def generate_versions(
             rendered_pdf_path(record).unlink(missing_ok=True)
 
         session.commit()
+        committed = True
         session.refresh(job)
         return session.scalar(
             select(GenerationJob)
@@ -1167,8 +1295,9 @@ def generate_versions(
             )
         )
     except Exception:
-        session.rollback()
-        shutil.rmtree(generation_dir, ignore_errors=True)
+        if not committed:
+            session.rollback()
+            shutil.rmtree(generation_dir, ignore_errors=True)
         raise
 
 
@@ -1197,37 +1326,42 @@ def serialize_document_set_history(session: Session, document_set_id: str) -> di
             selectinload(GenerationJob.targets),
         )
     ).all()
+    legacy_events = [
+        {
+            "generation_id": job.id,
+            "event_type": "synchronised_edit",
+            "status": job.status,
+            "created_at": utc_isoformat(job.created_at),
+            "replacement_text": job.replacement_text,
+            "target_count": len(job.targets),
+            "version_count": len(job.versions),
+            "targets": [
+                {
+                    "element_id": target.element_id,
+                    "document_id": target.document_id,
+                    "document_name": target.document_name,
+                    "paragraph_index": target.paragraph_index,
+                    "before": target.before_text,
+                    "after": target.after_text,
+                }
+                for target in sorted(
+                    job.targets,
+                    key=lambda item: (
+                        item.document_name.casefold(),
+                        item.paragraph_index,
+                    ),
+                )
+            ],
+        }
+        for job in jobs
+    ]
+    from .editor_service import serialize_editor_history
+
+    events = [*legacy_events, *serialize_editor_history(session, document_set_id)]
+    events.sort(key=lambda item: item["created_at"], reverse=True)
     return {
         "document_set_id": document_set_id,
-        "events": [
-            {
-                "generation_id": job.id,
-                "event_type": "synchronised_edit",
-                "status": job.status,
-                "created_at": utc_isoformat(job.created_at),
-                "replacement_text": job.replacement_text,
-                "target_count": len(job.targets),
-                "version_count": len(job.versions),
-                "targets": [
-                    {
-                        "element_id": target.element_id,
-                        "document_id": target.document_id,
-                        "document_name": target.document_name,
-                        "paragraph_index": target.paragraph_index,
-                        "before": target.before_text,
-                        "after": target.after_text,
-                    }
-                    for target in sorted(
-                        job.targets,
-                        key=lambda item: (
-                            item.document_name.casefold(),
-                            item.paragraph_index,
-                        ),
-                    )
-                ],
-            }
-            for job in jobs
-        ],
+        "events": events,
     }
 
 

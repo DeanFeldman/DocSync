@@ -27,6 +27,7 @@ import type {
   DocumentSetResponse,
   DocumentSummary,
   DocumentView,
+  EditorGenerationResponse,
   GenerationResponse,
   GlobalSearchResult,
   MatchDiscovery,
@@ -35,6 +36,7 @@ import type {
 } from "./types";
 
 import docSyncLogo from "./assets/Docsync LOGO.png";
+import DocumentExperience from "./DocumentExperience";
 
 type BusyAction =
   | "upload"
@@ -184,6 +186,7 @@ const [setNameTouched, setSetNameTouched] = useState(false);
   const [currentPage, setCurrentPage] = useState(1);
   const [visiblePageCount, setVisiblePageCount] = useState(INITIAL_VISIBLE_PAGES);
   const [viewMode, setViewMode] = useState<"visual" | "select">("visual");
+  const [editorDirty, setEditorDirty] = useState(false);
   const viewerScrollRef = useRef<HTMLDivElement>(null);
   const addDocumentsInputRef = useRef<HTMLInputElement>(null);
 
@@ -372,6 +375,14 @@ const [setNameTouched, setSetNameTouched] = useState(false);
   function resetWorkspace(updateHistory = true) {
     if (
       updateHistory &&
+      editorDirty &&
+      !window.confirm("Leave this workspace and discard the current editor draft?")
+    ) {
+      return;
+    }
+
+    if (
+      updateHistory &&
       documentSet &&
       window.history.state?.view === "workspace"
     ) {
@@ -384,6 +395,7 @@ const [setNameTouched, setSetNameTouched] = useState(false);
     setViewer(null);
     setFiles([]);
     setGeneration(null);
+    setEditorDirty(false);
     setError("");
     clearSelection();
   }
@@ -425,6 +437,7 @@ const [setNameTouched, setSetNameTouched] = useState(false);
     setGlobalSearchResults([]);
     setGlobalSearchOpen(false);
     setGeneration(null);
+    setEditorDirty(false);
     clearSelection();
   }
 
@@ -576,7 +589,10 @@ async function handleUpload(event: FormEvent) {
 
   async function openDocument(document: DocumentSummary, targetElementId = "") {
     const hasDraft = Boolean(
-      selectedElement && replacement.trim() !== selectedElement.text.trim() && !preview,
+      editorDirty ||
+        (selectedElement &&
+          replacement.trim() !== selectedElement.text.trim() &&
+          !preview),
     );
     if (
       hasDraft &&
@@ -585,6 +601,7 @@ async function handleUpload(event: FormEvent) {
       return;
     }
 
+    setEditorDirty(false);
     setError("");
     setBusyAction("view");
     setActiveDocumentId(document.id);
@@ -746,6 +763,28 @@ async function handleUpload(event: FormEvent) {
       setBusyAction(null);
     }
   }
+
+  function handleEditorGenerated(result: EditorGenerationResponse) {
+    const updated = result.document_set;
+    if (updated) {
+      setDocumentSet(updated);
+      setSavedSets((current) =>
+        current.map((item) =>
+          item.id === updated.id
+            ? {
+                ...item,
+                name: updated.name,
+                document_count: updated.documents.length,
+                edit_count: item.edit_count + 1,
+              }
+            : item,
+        ),
+      );
+    }
+    setGeneration(null);
+    setEditorDirty(false);
+  }
+
   function renderViewerElement(
     element: PositionedViewerElement,
     insideTable = false,
@@ -1156,6 +1195,16 @@ const canUpload = files.length >= 2 && !busyAction;
               </div>
             </aside>
 
+            <DocumentExperience
+              documentSet={documentSet}
+              document={activeDocument}
+              fallbackView={viewer}
+              onGenerated={handleEditorGenerated}
+              onDirtyChange={setEditorDirty}
+            />
+
+            {Boolean(0) && (
+              <>
             <section className="viewer-panel" aria-labelledby="viewer-title">
               <div className="viewer-toolbar">
                 <div className="viewer-title">
@@ -1347,6 +1396,8 @@ const canUpload = files.length >= 2 && !busyAction;
                 </div>
               )}
             </aside>
+              </>
+            )}
           </div>
 
           {generation && (
