@@ -505,56 +505,188 @@ def delete_document_set(session: Session, document_set_id: str) -> dict:
     return {"deleted_id": document_set_id, "deleted": True}
 
 
+def _normalised_search_text_with_offsets(
+    text: str,
+) -> tuple[str, list[int], list[int]]:
+    """Normalise searchable text while retaining source-string boundaries."""
+    characters: list[str] = []
+    starts: list[int] = []
+    ends: list[int] = []
+
+    for source_index, source_character in enumerate(text):
+        fragment = unicodedata.normalize("NFKC", source_character).casefold()
+        for character in fragment:
+            if character.isspace():
+                if not characters:
+                    continue
+                if characters[-1] == " ":
+                    ends[-1] = source_index + 1
+                    continue
+                character = " "
+            characters.append(character)
+            starts.append(source_index)
+            ends.append(source_index + 1)
+
+    if characters and characters[-1] == " ":
+        characters.pop()
+        starts.pop()
+        ends.pop()
+
+    return "".join(characters), starts, ends
+
+
+def _search_occurrences(
+    text: str,
+    normalised_query: str,
+) -> list[tuple[int, int]]:
+    normalised_text, starts, ends = _normalised_search_text_with_offsets(text)
+    if not normalised_query or not normalised_text:
+        return []
+
+    occurrences: list[tuple[int, int]] = []
+    cursor = 0
+    while True:
+        match_start = normalised_text.find(normalised_query, cursor)
+        if match_start < 0:
+            break
+        match_end = match_start + len(normalised_query)
+        occurrences.append((starts[match_start], ends[match_end - 1]))
+        cursor = match_end
+    return occurrences
+
+
+def _search_context(
+    text: str,
+    match_start: int,
+    match_end: int,
+    *,
+    radius: int = 72,
+) -> tuple[str, str, str]:
+    context_start = max(0, match_start - radius)
+    context_end = min(len(text), match_end + radius)
+
+    if context_start > 0:
+        next_space = text.find(" ", context_start, match_start)
+        if next_space >= 0:
+            context_start = next_space + 1
+    if context_end < len(text):
+        previous_space = text.rfind(" ", match_end, context_end)
+        if previous_space >= 0:
+            context_end = previous_space
+
+    before = text[context_start:match_start]
+    after = text[match_end:context_end]
+    if context_start > 0:
+        before = f"…{before}"
+    if context_end < len(text):
+        after = f"{after}…"
+    return before, text[match_start:match_end], after
+
+
 def search_document_set(
     session: Session,
     document_set_id: str,
     query: str,
-    limit: int = 50,
+    limit: int | None = None,
 ) -> dict:
-    # Search extracted text across every current document in one set.
+    # Search every occurrence in every current document version in one set.
     get_document_set_or_404(session, document_set_id)
     cleaned_query = WHITESPACE_PATTERN.sub(" ", query).strip()
+    normalised_query = normalise_text(cleaned_query)
     if len(cleaned_query) < 2:
         return {
             "query": cleaned_query,
             "results": [],
             "result_count": 0,
+            "returned_count": 0,
+            "document_count": 0,
+            "document_counts": [],
             "truncated": False,
         }
 
     rows = session.execute(
-        select(DocumentElement, DocumentRecord)
-        .join(DocumentRecord, DocumentElement.document_id == DocumentRecord.id)
+        select(DocumentBlockRevision, DocumentRecord)
+        .join(
+            DocumentHead,
+            DocumentHead.current_version_id == DocumentBlockRevision.version_id,
+        )
+        .join(
+            DocumentRecord,
+            DocumentRecord.id == DocumentBlockRevision.document_id,
+        )
         .where(
             DocumentRecord.document_set_id == document_set_id,
-            func.lower(DocumentElement.text).contains(cleaned_query.casefold()),
+            DocumentBlockRevision.normalized_text.contains(
+                normalised_query,
+                autoescape=True,
+            ),
         )
         .order_by(
-            DocumentRecord.original_name,
-            DocumentElement.paragraph_index,
+            func.lower(DocumentRecord.original_name),
+            DocumentBlockRevision.ordinal,
         )
-        .limit(limit + 1)
     ).all()
 
-    truncated = len(rows) > limit
-    rows = rows[:limit]
-    results = [
-        {
-            "element_id": element.id,
-            "document_id": document.id,
-            "document_name": document.original_name,
-            "paragraph_index": element.paragraph_index,
-            "element_type": element_type_for_style(element.style_name),
-            **element_location_payload(element.style_name),
-            "text": element.text,
-        }
-        for element, document in rows
-    ]
+    all_results: list[dict] = []
+    counts_by_document: dict[str, dict] = {}
+    for revision, document in rows:
+        location = dict(revision.location_json or {})
+        occurrences = _search_occurrences(revision.text, normalised_query)
+        for occurrence_index, (match_start, match_end) in enumerate(
+            occurrences,
+            start=1,
+        ):
+            context_before, matched_text, context_after = _search_context(
+                revision.text,
+                match_start,
+                match_end,
+            )
+            all_results.append(
+                {
+                    "result_id": f"{revision.element_id}:{occurrence_index}",
+                    "element_id": revision.element_id,
+                    "document_id": document.id,
+                    "document_name": document.original_name,
+                    "version_id": revision.version_id,
+                    "paragraph_index": location.get(
+                        "paragraph_index",
+                        revision.ordinal,
+                    ),
+                    "element_type": revision.element_type,
+                    **{
+                        key: location[key]
+                        for key in ("table_index", "row_index", "column_index")
+                        if key in location
+                    },
+                    "text": revision.text,
+                    "occurrence_index": occurrence_index,
+                    "match_start": match_start,
+                    "match_end": match_end,
+                    "context_before": context_before,
+                    "matched_text": matched_text,
+                    "context_after": context_after,
+                }
+            )
+            summary = counts_by_document.setdefault(
+                document.id,
+                {
+                    "document_id": document.id,
+                    "document_name": document.original_name,
+                    "result_count": 0,
+                },
+            )
+            summary["result_count"] += 1
+
+    result_count = len(all_results)
+    results = all_results if limit is None else all_results[:limit]
     return {
         "query": cleaned_query,
         "results": results,
-        "result_count": len(results),
-        "truncated": truncated,
+        "result_count": result_count,
+        "returned_count": len(results),
+        "document_count": len(counts_by_document),
+        "document_counts": list(counts_by_document.values()),
+        "truncated": len(results) < result_count,
     }
 
 def _create_exact_link_groups(session: Session, document_set_id: str) -> None:

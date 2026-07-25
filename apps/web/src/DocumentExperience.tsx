@@ -3,6 +3,7 @@ import {
   KeyboardEvent as ReactKeyboardEvent,
   ReactNode,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -38,6 +39,7 @@ import QuillBlockEditor, {
 } from "./QuillBlockEditor";
 import type {
   DifferenceSpan,
+  DocumentSearchTarget,
   DocumentSetResponse,
   DocumentSummary,
   DocumentVersion,
@@ -64,6 +66,7 @@ interface DocumentExperienceProps {
   documentSet: DocumentSetResponse;
   document: DocumentSummary | null;
   fallbackView: DocumentView | null;
+  searchTarget: DocumentSearchTarget | null;
   onGenerated: (result: EditorGenerationResponse) => void;
   onDirtyChange: (dirty: boolean) => void;
 }
@@ -140,7 +143,22 @@ function formatDate(value: string | undefined): string {
   });
 }
 
-function inlineDelta(delta: QuillDelta): ReactNode[] {
+function applyInlineFormatting(
+  text: string,
+  attributes: Record<string, unknown>,
+): ReactNode {
+  let content: ReactNode = text;
+  if (attributes.bold) content = <strong>{content}</strong>;
+  if (attributes.italic) content = <em>{content}</em>;
+  if (attributes.underline) content = <u>{content}</u>;
+  return content;
+}
+
+function inlineDelta(
+  delta: QuillDelta,
+  highlight?: { start: number; end: number },
+): ReactNode[] {
+  let textOffset = 0;
   return delta.ops.flatMap((operation, index) => {
     if (typeof operation.insert !== "string") {
       return [
@@ -152,21 +170,68 @@ function inlineDelta(delta: QuillDelta): ReactNode[] {
     const text = operation.insert.replace(/\n$/, "");
     if (!text) return [];
     const attributes = operation.attributes ?? {};
-    let content: ReactNode = text;
-    if (attributes.bold) content = <strong>{content}</strong>;
-    if (attributes.italic) content = <em>{content}</em>;
-    if (attributes.underline) content = <u>{content}</u>;
-    return [<Fragment key={`text-${index}`}>{content}</Fragment>];
+    const operationStart = textOffset;
+    const operationEnd = operationStart + text.length;
+    textOffset = operationEnd;
+
+    if (
+      !highlight ||
+      highlight.end <= operationStart ||
+      highlight.start >= operationEnd
+    ) {
+      return [
+        <Fragment key={`text-${index}`}>
+          {applyInlineFormatting(text, attributes)}
+        </Fragment>,
+      ];
+    }
+
+    const localStart = Math.max(0, highlight.start - operationStart);
+    const localEnd = Math.min(text.length, highlight.end - operationStart);
+    const pieces = [
+      { kind: "before", text: text.slice(0, localStart) },
+      { kind: "match", text: text.slice(localStart, localEnd) },
+      { kind: "after", text: text.slice(localEnd) },
+    ];
+    return pieces
+      .filter((piece) => piece.text)
+      .map((piece) => {
+        const content = applyInlineFormatting(piece.text, attributes);
+        return piece.kind === "match" ? (
+          <mark
+            className="editor-block-search-hit"
+            key={`text-${index}-${piece.kind}`}
+          >
+            {content}
+          </mark>
+        ) : (
+          <Fragment key={`text-${index}-${piece.kind}`}>
+            {content}
+          </Fragment>
+        );
+      });
   });
+}
+
+function findEditorBlockCard(elementId: string): HTMLElement | null {
+  return (
+    Array.from(
+      window.document.querySelectorAll<HTMLElement>(
+        ".editor-block-card[data-element-id]",
+      ),
+    ).find((card) => card.dataset.elementId === elementId) ?? null
+  );
 }
 
 function BlockCard({
   block,
   selected,
+  searchRange,
   onSelect,
 }: {
   block: EditorBlock;
   selected: boolean;
+  searchRange?: { start: number; end: number };
   onSelect: (block: EditorBlock) => void;
 }) {
   const alignment = block.alignment ?? "left";
@@ -182,7 +247,9 @@ function BlockCard({
     <div
       className={`editor-block-card ${block.element_type} ${
         selected ? "selected" : ""
-      } ${isUnsupported ? "read-only" : ""}`}
+      } ${isUnsupported ? "read-only" : ""} ${
+        searchRange ? "search-target" : ""
+      }`}
       role="button"
       tabIndex={0}
       aria-pressed={selected}
@@ -211,7 +278,7 @@ function BlockCard({
             {block.list_type === "ordered" ? "1." : "•"}
           </span>
         )}
-        <span>{inlineDelta(block.delta)}</span>
+        <span>{inlineDelta(block.delta, searchRange)}</span>
       </div>
       {block.unsupported_reason && (
         <p className="editor-block-reason">{block.unsupported_reason}</p>
@@ -488,6 +555,7 @@ export default function DocumentExperience({
   documentSet,
   document,
   fallbackView,
+  searchTarget,
   onGenerated,
   onDirtyChange,
 }: DocumentExperienceProps) {
@@ -645,6 +713,88 @@ export default function DocumentExperience({
     document?.current_version_id,
     fallbackView,
     refreshToken,
+  ]);
+
+  useEffect(() => {
+    if (
+      !searchTarget ||
+      !document ||
+      searchTarget.document_id !== document.id ||
+      contentStatus !== "ready" ||
+      !editorContent
+    ) {
+      return;
+    }
+
+    const block = editorContent.blocks.find(
+      (candidate) => candidate.element_id === searchTarget.element_id,
+    );
+    if (!block) {
+      setLocalError(
+        `${document.name}: the selected search result is no longer in the current document version. Run the search again.`,
+      );
+      return;
+    }
+
+    setMode("edit");
+    selectBlock(block, true);
+  }, [
+    contentStatus,
+    document?.id,
+    editorContent?.version_id,
+    searchTarget?.request_id,
+  ]);
+
+  useLayoutEffect(() => {
+    if (
+      !searchTarget ||
+      searchTarget.element_id !== selectedElementId ||
+      mode !== "edit"
+    ) {
+      return;
+    }
+
+    const frame = window.requestAnimationFrame(() => {
+      const card = findEditorBlockCard(searchTarget.element_id);
+      const scrollContainer = card?.closest<HTMLElement>(
+        ".editor-mode-scroll",
+      );
+      const stickyEditor = scrollContainer?.querySelector<HTMLElement>(
+        ".quill-block-editor",
+      );
+      if (!card) return;
+
+      if (scrollContainer) {
+        const cardTop =
+          scrollContainer.scrollTop +
+          card.getBoundingClientRect().top -
+          scrollContainer.getBoundingClientRect().top;
+        const top = Math.max(
+          0,
+          cardTop - (stickyEditor?.offsetHeight ?? 0) - 18,
+        );
+        if (typeof scrollContainer.scrollTo === "function") {
+          scrollContainer.scrollTo({ top, behavior: "auto" });
+        } else {
+          scrollContainer.scrollTop = top;
+        }
+      } else {
+        card.scrollIntoView({ behavior: "auto", block: "center" });
+      }
+
+      try {
+        card.focus({ preventScroll: true });
+      } catch {
+        card.focus();
+      }
+    });
+
+    return () => window.cancelAnimationFrame(frame);
+  }, [
+    editorContent?.version_id,
+    mode,
+    searchTarget?.request_id,
+    selectedElementId,
   ]);
 
   useEffect(() => {
@@ -968,8 +1118,12 @@ export default function DocumentExperience({
     setWorkspaceMode(WORKSPACE_MODES[nextIndex].id);
   }
 
-  function selectBlock(block: EditorBlock) {
+  function selectBlock(
+    block: EditorBlock,
+    skipDiscardConfirmation = false,
+  ) {
     if (
+      !skipDiscardConfirmation &&
       block.element_id !== selectedElementId &&
       (dirty || perDocumentDirty) &&
       !window.confirm("Discard the current unpreviewed editor draft?")
@@ -1015,11 +1169,7 @@ export default function DocumentExperience({
     setPreviewOpen(false);
     setPreviewSignature("");
     window.requestAnimationFrame(() => {
-      window.document
-        .querySelector<HTMLElement>(
-          `[data-element-id="${selectedBlock.element_id}"]`,
-        )
-        ?.focus();
+      findEditorBlockCard(selectedBlock.element_id)?.focus();
     });
   }
 
@@ -1596,6 +1746,15 @@ export default function DocumentExperience({
                 <BlockCard
                   block={block}
                   selected={block.element_id === selectedElementId}
+                  searchRange={
+                    searchTarget?.document_id === document.id &&
+                    searchTarget.element_id === block.element_id
+                      ? {
+                          start: searchTarget.match_start,
+                          end: searchTarget.match_end,
+                        }
+                      : undefined
+                  }
                   onSelect={selectBlock}
                   key={block.element_id}
                 />

@@ -53,6 +53,17 @@ def make_table_docx(title: str, shared_cell: str, unique_cell: str) -> bytes:
     document.save(stream)
     return stream.getvalue()
 
+
+def make_search_docx(title: str, paragraphs: list[str]) -> bytes:
+    stream = io.BytesIO()
+    document = Document()
+    document.add_heading(title, level=1)
+    for paragraph in paragraphs:
+        document.add_paragraph(paragraph)
+    document.save(stream)
+    return stream.getvalue()
+
+
 def make_multi_table_docx(title: str) -> bytes:
     stream = io.BytesIO()
     document = Document()
@@ -555,6 +566,108 @@ def test_set_management_and_global_search(tmp_path: Path) -> None:
         assert client.get("/api/document-sets").json() == {"document_sets": []}
         assert not (tmp_path / "data" / "originals" / workspace["id"]).exists()
 
+
+def test_global_search_returns_every_occurrence_across_all_current_documents(
+    tmp_path: Path,
+) -> None:
+    app = load_test_app(tmp_path)
+    repeated = " ".join(["Test"] * 21)
+    originals = {
+        "Alpha.docx": make_search_docx(
+            "Alpha search",
+            [
+                repeated,
+                "A compatibility TEST appears after irregular   spacing.",
+                "A literal %_ marker must not behave like a SQL wildcard.",
+            ],
+        ),
+        "Beta.docx": make_search_docx(
+            "Beta search",
+            [repeated, "test once more"],
+        ),
+        "Zulu.docx": make_search_docx(
+            "Zulu search",
+            [repeated, "The final document still contains test."],
+        ),
+    }
+
+    with TestClient(app) as client:
+        uploaded = client.post(
+            "/api/document-sets",
+            data={"name": "Complete search"},
+            files=[
+                (
+                    "files",
+                    (
+                        filename,
+                        io.BytesIO(payload),
+                        "application/vnd.openxmlformats-officedocument."
+                        "wordprocessingml.document",
+                    ),
+                )
+                for filename, payload in originals.items()
+            ],
+        )
+        assert uploaded.status_code == 201, uploaded.text
+        workspace = uploaded.json()
+
+        search = client.get(
+            f"/api/document-sets/{workspace['id']}/search",
+            params={"q": "test"},
+        )
+        assert search.status_code == 200, search.text
+        payload = search.json()
+        assert payload["result_count"] == 66
+        assert payload["returned_count"] == 66
+        assert payload["document_count"] == 3
+        assert payload["truncated"] is False
+        assert len(payload["results"]) == 66
+        assert {
+            item["document_name"]: item["result_count"]
+            for item in payload["document_counts"]
+        } == {
+            "Alpha.docx": 22,
+            "Beta.docx": 22,
+            "Zulu.docx": 22,
+        }
+        assert payload["results"][-1]["document_name"] == "Zulu.docx"
+        assert len({item["result_id"] for item in payload["results"]}) == 66
+        assert all(
+            result["text"][result["match_start"]:result["match_end"]].casefold()
+            == "test"
+            for result in payload["results"]
+        )
+        assert all(
+            result["matched_text"].casefold() == "test"
+            for result in payload["results"]
+        )
+
+        limited = client.get(
+            f"/api/document-sets/{workspace['id']}/search",
+            params={"q": "test", "limit": 50},
+        )
+        assert limited.status_code == 200, limited.text
+        assert limited.json()["result_count"] == 66
+        assert limited.json()["returned_count"] == 50
+        assert limited.json()["truncated"] is True
+
+        normalised = client.get(
+            f"/api/document-sets/{workspace['id']}/search",
+            params={"q": "irregular spacing"},
+        )
+        assert normalised.status_code == 200, normalised.text
+        assert normalised.json()["result_count"] == 1
+        assert normalised.json()["results"][0]["document_name"] == "Alpha.docx"
+
+        literal = client.get(
+            f"/api/document-sets/{workspace['id']}/search",
+            params={"q": "%_"},
+        )
+        assert literal.status_code == 200, literal.text
+        assert literal.json()["result_count"] == 1
+        assert literal.json()["results"][0]["matched_text"] == "%_"
+
+
 def test_table_cells_are_extracted_matched_and_edited(tmp_path: Path) -> None:
     shared = "Monthly compliance review"
     replacement = "Quarterly compliance review"
@@ -648,6 +761,27 @@ def test_table_cells_are_extracted_matched_and_edited(tmp_path: Path) -> None:
             },
         )
         assert generated.status_code == 201, generated.text
+
+        old_search = client.get(
+            f"/api/document-sets/{workspace['id']}/search",
+            params={"q": "monthly compliance"},
+        )
+        assert old_search.status_code == 200
+        assert old_search.json()["result_count"] == 0
+
+        current_search = client.get(
+            f"/api/document-sets/{workspace['id']}/search",
+            params={"q": "quarterly compliance"},
+        )
+        assert current_search.status_code == 200
+        assert current_search.json()["result_count"] == 2
+        assert {
+            result["version_id"]
+            for result in current_search.json()["results"]
+        } == {
+            document["version_id"]
+            for document in generated.json()["document_set"]["documents"]
+        }
 
         for document in generated.json()["document_set"]["documents"]:
             current = client.get(f"/api/documents/{document['id']}/download")

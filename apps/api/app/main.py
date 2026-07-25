@@ -159,7 +159,7 @@ def remove_document_set_document(
 def search_documents_in_set(
     document_set_id: str,
     q: str = Query(default="", max_length=500),
-    limit: int = Query(default=50, ge=1, le=100),
+    limit: int | None = Query(default=None, ge=1, le=5000),
     session: Session = Depends(get_session),
 ) -> dict:
     return search_document_set(session, document_set_id, q, limit)

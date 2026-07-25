@@ -1,6 +1,7 @@
 import {
   ChangeEvent,
   FormEvent,
+  KeyboardEvent as ReactKeyboardEvent,
   useEffect,
   useMemo,
   useRef,
@@ -25,10 +26,12 @@ import {
 import type {
   DocumentSetLibraryItem,
   DocumentSetResponse,
+  DocumentSearchTarget,
   DocumentSummary,
   DocumentView,
   EditorGenerationResponse,
   GenerationResponse,
+  GlobalSearchResponse,
   GlobalSearchResult,
   MatchDiscovery,
   PreviewResponse,
@@ -168,8 +171,17 @@ const [setNameTouched, setSetNameTouched] = useState(false);
   const [openingSetId, setOpeningSetId] = useState("");
   const [globalSearchQuery, setGlobalSearchQuery] = useState("");
   const [globalSearchResults, setGlobalSearchResults] = useState<GlobalSearchResult[]>([]);
+  const [globalSearchSummary, setGlobalSearchSummary] = useState<
+    Pick<GlobalSearchResponse, "result_count" | "document_count" | "truncated">
+  >({
+    result_count: 0,
+    document_count: 0,
+    truncated: false,
+  });
   const [globalSearchLoading, setGlobalSearchLoading] = useState(false);
   const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
+  const [documentSearchTarget, setDocumentSearchTarget] =
+    useState<DocumentSearchTarget | null>(null);
   const [activeDocumentId, setActiveDocumentId] = useState("");
   const [viewer, setViewer] = useState<DocumentView | null>(null);
   const [selectedElementId, setSelectedElementId] = useState("");
@@ -189,6 +201,9 @@ const [setNameTouched, setSetNameTouched] = useState(false);
   const [editorDirty, setEditorDirty] = useState(false);
   const viewerScrollRef = useRef<HTMLDivElement>(null);
   const addDocumentsInputRef = useRef<HTMLInputElement>(null);
+  const globalSearchInputRef = useRef<HTMLInputElement>(null);
+  const globalSearchContainerRef = useRef<HTMLDivElement>(null);
+  const documentSearchRequestRef = useRef(0);
 
   const filteredSavedSets = useMemo(() => {
     const query = savedSetQuery.trim().toLocaleLowerCase();
@@ -203,6 +218,38 @@ const [setNameTouched, setSetNameTouched] = useState(false);
     () => documentSet?.documents.find((document) => document.id === activeDocumentId) ?? null,
     [activeDocumentId, documentSet],
   );
+
+  const globalSearchScopeKey = useMemo(
+    () =>
+      documentSet?.documents
+        .map(
+          (document) =>
+            `${document.id}:${document.current_version_id ?? document.version_id}`,
+        )
+        .join("|") ?? "",
+    [documentSet],
+  );
+
+  const globalSearchGroups = useMemo(() => {
+    const groups = new Map<
+      string,
+      {
+        documentId: string;
+        documentName: string;
+        results: GlobalSearchResult[];
+      }
+    >();
+    for (const result of globalSearchResults) {
+      const group = groups.get(result.document_id) ?? {
+        documentId: result.document_id,
+        documentName: result.document_name,
+        results: [],
+      };
+      group.results.push(result);
+      groups.set(result.document_id, group);
+    }
+    return Array.from(groups.values());
+  }, [globalSearchResults]);
 
   const setNameError =
   setNameTouched && setName.trim() === ""
@@ -256,22 +303,50 @@ const [setNameTouched, setSetNameTouched] = useState(false);
     const query = globalSearchQuery.trim();
     if (!documentSet || query.length < 2) {
       setGlobalSearchResults([]);
+      setGlobalSearchSummary({
+        result_count: 0,
+        document_count: 0,
+        truncated: false,
+      });
       setGlobalSearchLoading(false);
+      setGlobalSearchOpen(false);
       return;
     }
 
     let cancelled = false;
+    const controller = new AbortController();
+    setGlobalSearchResults([]);
+    setGlobalSearchSummary({
+      result_count: 0,
+      document_count: 0,
+      truncated: false,
+    });
+    setGlobalSearchLoading(true);
     const timeout = window.setTimeout(async () => {
-      setGlobalSearchLoading(true);
       try {
-        const response = await searchDocumentSet(documentSet.id, query);
+        const response = await searchDocumentSet(
+          documentSet.id,
+          query,
+          controller.signal,
+        );
         if (!cancelled) {
           setGlobalSearchResults(response.results);
+          setGlobalSearchSummary({
+            result_count: response.result_count,
+            document_count: response.document_count,
+            truncated: response.truncated,
+          });
           setGlobalSearchOpen(true);
         }
       } catch (caught) {
+        if (controller.signal.aborted) return;
         if (!cancelled) {
           setGlobalSearchResults([]);
+          setGlobalSearchSummary({
+            result_count: 0,
+            document_count: 0,
+            truncated: false,
+          });
           setError(
             caught instanceof Error ? caught.message : "The document-set search failed.",
           );
@@ -283,9 +358,10 @@ const [setNameTouched, setSetNameTouched] = useState(false);
 
     return () => {
       cancelled = true;
+      controller.abort();
       window.clearTimeout(timeout);
     };
-  }, [documentSet?.id, globalSearchQuery]);
+  }, [documentSet?.id, globalSearchQuery, globalSearchScopeKey]);
 
   useEffect(() => {
     setSearchCursor(-1);
@@ -395,6 +471,15 @@ const [setNameTouched, setSetNameTouched] = useState(false);
     setViewer(null);
     setFiles([]);
     setGeneration(null);
+    setGlobalSearchQuery("");
+    setGlobalSearchResults([]);
+    setGlobalSearchSummary({
+      result_count: 0,
+      document_count: 0,
+      truncated: false,
+    });
+    setGlobalSearchOpen(false);
+    setDocumentSearchTarget(null);
     setEditorDirty(false);
     setError("");
     clearSelection();
@@ -414,7 +499,9 @@ const [setNameTouched, setSetNameTouched] = useState(false);
 
     const firstDocument = workspace.documents[0] ?? null;
     const rendered = firstDocument
-      ? await fetchDocumentView(firstDocument.version_id)
+      ? await fetchDocumentView(
+          firstDocument.current_version_id ?? firstDocument.version_id,
+        )
       : null;
 
     if (
@@ -435,7 +522,13 @@ const [setNameTouched, setSetNameTouched] = useState(false);
     setSearchQuery("");
     setGlobalSearchQuery("");
     setGlobalSearchResults([]);
+    setGlobalSearchSummary({
+      result_count: 0,
+      document_count: 0,
+      truncated: false,
+    });
     setGlobalSearchOpen(false);
+    setDocumentSearchTarget(null);
     setGeneration(null);
     setEditorDirty(false);
     clearSelection();
@@ -550,6 +643,7 @@ async function handleUpload(event: FormEvent) {
     try {
       const updated = await removeDocumentFromSet(documentSet.id, document.id);
       setDocumentSet(updated);
+      setDocumentSearchTarget(null);
       setSavedSets((current) =>
         current.map((item) =>
           item.id === updated.id
@@ -584,10 +678,48 @@ async function handleUpload(event: FormEvent) {
     if (!targetDocument) return;
 
     setGlobalSearchOpen(false);
-    await openDocument(targetDocument, result.element_id);
+    await openDocument(targetDocument, "", result);
   }
 
-  async function openDocument(document: DocumentSummary, targetElementId = "") {
+  function handleGlobalSearchResultKeyDown(
+    event: ReactKeyboardEvent<HTMLButtonElement>,
+  ) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      setGlobalSearchOpen(false);
+      globalSearchInputRef.current?.focus();
+      return;
+    }
+    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+      return;
+    }
+
+    const buttons = Array.from(
+      globalSearchContainerRef.current?.querySelectorAll<HTMLButtonElement>(
+        ".global-search-result",
+      ) ?? [],
+    );
+    if (buttons.length === 0) return;
+    event.preventDefault();
+    const currentIndex = buttons.indexOf(event.currentTarget);
+    let nextIndex = currentIndex;
+    if (event.key === "ArrowDown") {
+      nextIndex = (currentIndex + 1) % buttons.length;
+    } else if (event.key === "ArrowUp") {
+      nextIndex = (currentIndex - 1 + buttons.length) % buttons.length;
+    } else if (event.key === "Home") {
+      nextIndex = 0;
+    } else if (event.key === "End") {
+      nextIndex = buttons.length - 1;
+    }
+    buttons[nextIndex]?.focus();
+  }
+
+  async function openDocument(
+    document: DocumentSummary,
+    targetElementId = "",
+    searchResult: GlobalSearchResult | null = null,
+  ) {
     const hasDraft = Boolean(
       editorDirty ||
         (selectedElement &&
@@ -604,13 +736,28 @@ async function handleUpload(event: FormEvent) {
     setEditorDirty(false);
     setError("");
     setBusyAction("view");
+    setDocumentSearchTarget(
+      searchResult
+        ? {
+            request_id: ++documentSearchRequestRef.current,
+            document_id: searchResult.document_id,
+            element_id: searchResult.element_id,
+            query: globalSearchQuery.trim(),
+            occurrence_index: searchResult.occurrence_index,
+            match_start: searchResult.match_start,
+            match_end: searchResult.match_end,
+          }
+        : null,
+    );
     setActiveDocumentId(document.id);
     setViewer(null);
     setCurrentPage(1);
     setSearchQuery("");
     clearSelection();
     try {
-      const rendered = await fetchDocumentView(document.version_id);
+      const rendered = await fetchDocumentView(
+        document.current_version_id ?? document.version_id,
+      );
       setViewer(rendered);
       setViewMode(targetElementId ? "select" : rendered.pdf_url ? "visual" : "select");
 
@@ -720,6 +867,7 @@ async function handleUpload(event: FormEvent) {
         includedElementIds,
       );
       setDocumentSet(result.document_set);
+      setDocumentSearchTarget(null);
       setGeneration(result);
       setSavedSets((current) =>
         current.map((item) =>
@@ -766,6 +914,7 @@ async function handleUpload(event: FormEvent) {
 
   function handleEditorGenerated(result: EditorGenerationResponse) {
     const updated = result.document_set;
+    setDocumentSearchTarget(null);
     if (updated) {
       setDocumentSet(updated);
       setSavedSets((current) =>
@@ -1064,38 +1213,125 @@ const canUpload = files.length >= 2 && !busyAction;
             </div>
 
             <div className="workspace-heading-actions">
-              <div className="global-set-search" role="search">
+              <div
+                className="global-set-search"
+                role="search"
+                ref={globalSearchContainerRef}
+                onBlur={(event) => {
+                  if (
+                    !event.currentTarget.contains(
+                      event.relatedTarget as Node | null,
+                    )
+                  ) {
+                    setGlobalSearchOpen(false);
+                  }
+                }}
+              >
                 <label htmlFor="global-document-search" className="sr-only">
                   Search all documents in this set
                 </label>
                 <input
                   id="global-document-search"
                   type="search"
+                  ref={globalSearchInputRef}
                   value={globalSearchQuery}
                   onChange={(event) => setGlobalSearchQuery(event.target.value)}
                   onFocus={() => setGlobalSearchOpen(true)}
                   onKeyDown={(event) => {
-                    if (event.key === "Escape") setGlobalSearchOpen(false);
+                    if (event.key === "Escape") {
+                      setGlobalSearchOpen(false);
+                    } else if (event.key === "ArrowDown") {
+                      const firstResult =
+                        globalSearchContainerRef.current?.querySelector<HTMLButtonElement>(
+                          ".global-search-result",
+                        );
+                      if (firstResult) {
+                        event.preventDefault();
+                        firstResult.focus();
+                      }
+                    }
                   }}
                   placeholder="Search all documents"
+                  aria-expanded={globalSearchOpen}
+                  aria-controls="global-search-results"
                 />
                 {globalSearchLoading && <span className="global-search-status">Searching…</span>}
                 {globalSearchOpen && globalSearchQuery.trim().length >= 2 && (
-                  <div className="global-search-results">
-                    {!globalSearchLoading && globalSearchResults.length === 0 ? (
-                      <div className="global-search-empty">No matches in this document set.</div>
+                  <div
+                    id="global-search-results"
+                    className="global-search-results"
+                    aria-live="polite"
+                    aria-label="Search results across all documents"
+                  >
+                    {globalSearchLoading ? (
+                      <div className="global-search-empty">
+                        Searching every current document…
+                      </div>
+                    ) : globalSearchResults.length === 0 ? (
+                      <div className="global-search-empty">
+                        No occurrences in this document set.
+                      </div>
                     ) : (
-                      globalSearchResults.map((result) => (
-                        <button
-                          type="button"
-                          key={result.element_id}
-                          onClick={() => void openGlobalSearchResult(result)}
-                        >
-                          <strong>{result.document_name}</strong>
-                          <span>{result.text}</span>
-                          <small>{elementLocation(result)}</small>
-                        </button>
-                      ))
+                      <>
+                        <header className="global-search-summary">
+                          <div>
+                            <strong>
+                              {globalSearchSummary.result_count}{" "}
+                              {globalSearchSummary.result_count === 1
+                                ? "occurrence"
+                                : "occurrences"}
+                            </strong>
+                            <span>
+                              across {globalSearchSummary.document_count}{" "}
+                              {globalSearchSummary.document_count === 1
+                                ? "document"
+                                : "documents"}
+                            </span>
+                          </div>
+                          <small>All current versions</small>
+                        </header>
+                        {globalSearchGroups.map((group) => (
+                          <section
+                            className="global-search-document-group"
+                            key={group.documentId}
+                            aria-label={`${group.documentName}: ${group.results.length} occurrences`}
+                          >
+                            <header>
+                              <strong>{group.documentName}</strong>
+                              <span>{group.results.length}</span>
+                            </header>
+                            <div>
+                              {group.results.map((result) => (
+                                <button
+                                  type="button"
+                                  className="global-search-result"
+                                  key={result.result_id}
+                                  onClick={() =>
+                                    void openGlobalSearchResult(result)
+                                  }
+                                  onKeyDown={
+                                    handleGlobalSearchResultKeyDown
+                                  }
+                                  aria-label={`Open occurrence ${result.occurrence_index} in ${result.document_name}, ${elementLocation(result)}`}
+                                >
+                                  <span className="global-search-snippet">
+                                    {result.context_before}
+                                    <mark>{result.matched_text}</mark>
+                                    {result.context_after}
+                                  </span>
+                                  <small>{elementLocation(result)}</small>
+                                </button>
+                              ))}
+                            </div>
+                          </section>
+                        ))}
+                        {globalSearchSummary.truncated && (
+                          <div className="global-search-warning">
+                            Some results were not returned by the document
+                            service. Refine the search to see them.
+                          </div>
+                        )}
+                      </>
                     )}
                   </div>
                 )}
@@ -1199,6 +1435,7 @@ const canUpload = files.length >= 2 && !busyAction;
               documentSet={documentSet}
               document={activeDocument}
               fallbackView={viewer}
+              searchTarget={documentSearchTarget}
               onGenerated={handleEditorGenerated}
               onDirtyChange={setEditorDirty}
             />

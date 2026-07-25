@@ -105,22 +105,49 @@ export interface DocumentSetResponse {
 }
 
 export interface GlobalSearchResult {
+  result_id: string;
   element_id: string;
   document_id: string;
   document_name: string;
+  version_id: string;
   paragraph_index: number;
   element_type: "paragraph" | "heading" | "list_item" | "table_cell";
   table_index?: number;
   row_index?: number;
   column_index?: number;
   text: string;
+  occurrence_index: number;
+  match_start: number;
+  match_end: number;
+  context_before: string;
+  matched_text: string;
+  context_after: string;
+}
+
+export interface GlobalSearchDocumentCount {
+  document_id: string;
+  document_name: string;
+  result_count: number;
 }
 
 export interface GlobalSearchResponse {
   query: string;
   results: GlobalSearchResult[];
   result_count: number;
+  returned_count: number;
+  document_count: number;
+  document_counts: GlobalSearchDocumentCount[];
   truncated: boolean;
+}
+
+export interface DocumentSearchTarget {
+  request_id: number;
+  document_id: string;
+  element_id: string;
+  query: string;
+  occurrence_index: number;
+  match_start: number;
+  match_end: number;
 }
 
 export interface PreviewChange {
