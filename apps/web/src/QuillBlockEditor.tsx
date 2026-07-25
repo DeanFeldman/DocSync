@@ -91,7 +91,7 @@ export default function QuillBlockEditor({
 
     const initial = initialDeltaRef.current ?? block.delta;
     quill.setContents(initial as never, "silent");
-    quill.root.dataset.elementId = block.element_id;
+    quill.root.dataset.editorElementId = block.element_id;
     quill.root.setAttribute(
       "aria-label",
       `Edit ${block.element_type.replaceAll("_", " ")} ${block.paragraph_index + 1}`,
@@ -224,14 +224,15 @@ export default function QuillBlockEditor({
         </span>
       </div>
 
-      <div ref={hostRef} className="quill-editor-host">
-        {!block && (
-          <div className="quill-editor-placeholder" role="status">
-            Choose a supported paragraph, heading, list item, or table cell
-            from the document.
-          </div>
-        )}
-      </div>
+      {/* Quill owns every child of its host; React must never render into it. */}
+      {block ? (
+        <div ref={hostRef} className="quill-editor-host" />
+      ) : (
+        <div className="quill-editor-placeholder" role="status">
+          Choose a supported paragraph, heading, list item, or table cell from
+          the document.
+        </div>
+      )}
 
       <p className="structure-safety-note">
         One stable Word block is edited at a time. Splitting, merging,
@@ -246,4 +247,3 @@ export default function QuillBlockEditor({
     </section>
   );
 }
-

@@ -55,7 +55,8 @@ DocSync `v1.2.1` is a maintenance release focused on making large documents and 
 - Reopen saved document sets from the local workspace library.
 - Add documents to an existing set.
 - Remove individual documents or delete a complete set.
-- Search extracted text across every document in the current set.
+- Search every occurrence across the current version of every document, grouped
+  by file with highlighted context and exact-result navigation.
 
 ### Layout, Edit, and Compare
 

@@ -124,10 +124,12 @@ export async function deleteDocumentSet(
 export async function searchDocumentSet(
   documentSetId: string,
   query: string,
+  signal?: AbortSignal,
 ): Promise<GlobalSearchResponse> {
-  const params = new URLSearchParams({ q: query, limit: "50" });
+  const params = new URLSearchParams({ q: query });
   const response = await fetch(
     `${API_URL}/document-sets/${documentSetId}/search?${params.toString()}`,
+    { signal },
   );
   return parseResponse<GlobalSearchResponse>(response);
 }
