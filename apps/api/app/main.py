@@ -47,12 +47,14 @@ from .editor_service import (
     serialize_document_versions,
     serialize_editor_content,
     serialize_version_document_view,
+    restore_document_version,
 )
 from .schemas import (
     CompareRequest,
     EditRequest,
     EditorEditRequest,
     MatchDecisionBatchRequest,
+    VersionRestoreRequest,
 )
 
 
@@ -294,6 +296,24 @@ def read_document_versions(
     session: Session = Depends(get_session),
 ) -> dict:
     return serialize_document_versions(session, document_id)
+
+
+@app.post(
+    "/api/documents/{document_id}/versions/{target_version_id}/restore",
+    status_code=201,
+)
+def restore_historical_document_version(
+    document_id: str,
+    target_version_id: str,
+    request: VersionRestoreRequest,
+    session: Session = Depends(get_session),
+) -> dict:
+    return restore_document_version(
+        session,
+        document_id,
+        target_version_id,
+        request,
+    )
 
 
 @app.post("/api/document-sets/{document_set_id}/preview")

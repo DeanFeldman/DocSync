@@ -42,6 +42,23 @@ function toolbarControls(
     });
 }
 
+function historyControls(
+  undo: HTMLButtonElement | null,
+  redo: HTMLButtonElement | null,
+  quill: Quill,
+  readOnly: boolean,
+) {
+  const states = [
+    [undo, readOnly || quill.history.stack.undo.length === 0],
+    [redo, readOnly || quill.history.stack.redo.length === 0],
+  ] as const;
+  states.forEach(([button, disabled]) => {
+    if (!button) return;
+    button.disabled = disabled;
+    button.setAttribute("aria-disabled", String(disabled));
+  });
+}
+
 export default function QuillBlockEditor({
   block,
   value,
@@ -50,6 +67,8 @@ export default function QuillBlockEditor({
 }: QuillBlockEditorProps) {
   const hostRef = useRef<HTMLDivElement>(null);
   const toolbarRef = useRef<HTMLDivElement>(null);
+  const undoRef = useRef<HTMLButtonElement>(null);
+  const redoRef = useRef<HTMLButtonElement>(null);
   const quillRef = useRef<Quill | null>(null);
   const onChangeRef = useRef(onChange);
   const initialDeltaRef = useRef<QuillDelta | null>(value);
@@ -60,6 +79,8 @@ export default function QuillBlockEditor({
   useEffect(() => {
     const host = hostRef.current;
     const toolbar = toolbarRef.current;
+    const undoButton = undoRef.current;
+    const redoButton = redoRef.current;
     if (!host || !toolbar || !block) {
       toolbarControls(toolbar, true);
       return;
@@ -74,6 +95,11 @@ export default function QuillBlockEditor({
       placeholder: "Edit this block",
       modules: {
         toolbar,
+        history: {
+          delay: 500,
+          maxStack: 100,
+          userOnly: true,
+        },
         keyboard: {
           bindings: {
             docsyncEnter: {
@@ -91,6 +117,7 @@ export default function QuillBlockEditor({
 
     const initial = initialDeltaRef.current ?? block.delta;
     quill.setContents(initial as never, "silent");
+    quill.history.clear();
     quill.root.dataset.editorElementId = block.element_id;
     quill.root.setAttribute(
       "aria-label",
@@ -98,6 +125,7 @@ export default function QuillBlockEditor({
     );
     quill.root.setAttribute("aria-multiline", "false");
     if (readOnly) quill.root.setAttribute("aria-readonly", "true");
+    historyControls(undoButton, redoButton, quill, readOnly);
 
     function handleTextChange(
       _delta: unknown,
@@ -110,6 +138,17 @@ export default function QuillBlockEditor({
         delta,
         text: plainText(delta),
       });
+      historyControls(undoButton, redoButton, quill, readOnly);
+    }
+
+    function handleUndo() {
+      quill.history.undo();
+      historyControls(undoButton, redoButton, quill, readOnly);
+    }
+
+    function handleRedo() {
+      quill.history.redo();
+      historyControls(undoButton, redoButton, quill, readOnly);
     }
 
     function handlePaste(event: ClipboardEvent) {
@@ -131,10 +170,14 @@ export default function QuillBlockEditor({
     }
 
     quill.on("text-change", handleTextChange);
+    undoButton?.addEventListener("click", handleUndo);
+    redoButton?.addEventListener("click", handleRedo);
     quill.root.addEventListener("paste", handlePaste, true);
 
     return () => {
       quill.off("text-change", handleTextChange);
+      undoButton?.removeEventListener("click", handleUndo);
+      redoButton?.removeEventListener("click", handleRedo);
       quill.root.removeEventListener("paste", handlePaste, true);
       quill.disable();
       if (quillRef.current === quill) quillRef.current = null;
@@ -168,7 +211,7 @@ export default function QuillBlockEditor({
         ref={toolbarRef}
         className="docsync-quill-toolbar"
         role="toolbar"
-        aria-label="Text formatting"
+        aria-label="Text editing and formatting"
       >
         <span className="ql-formats">
           <select className="ql-header" defaultValue="" aria-label="Heading level">
@@ -221,6 +264,28 @@ export default function QuillBlockEditor({
             className="ql-clean"
             aria-label="Clear formatting"
           />
+        </span>
+        <span className="ql-formats docsync-history-actions">
+          <button
+            ref={undoRef}
+            type="button"
+            className="editor-history-button"
+            aria-label="Undo last text change"
+            aria-keyshortcuts="Control+Z Meta+Z"
+            title="Undo (Ctrl+Z)"
+          >
+            Undo
+          </button>
+          <button
+            ref={redoRef}
+            type="button"
+            className="editor-history-button"
+            aria-label="Redo last text change"
+            aria-keyshortcuts="Control+Y Control+Shift+Z Meta+Shift+Z"
+            title="Redo (Ctrl+Y)"
+          >
+            Redo
+          </button>
         </span>
       </div>
 

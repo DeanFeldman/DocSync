@@ -1003,6 +1003,16 @@ const canUpload = files.length >= 2 && !busyAction;
           />
         </a>
 
+        {/* <p className="hero-text">
+                View uploaded Word documents in the browser, choose an exact shared element,
+                review every target, and create new versions without touching the originals.
+              </p> */}
+{/*
+              <p className="hero-copy">
+                <h1> DocSync</h1>
+
+              </p> */}
+
         <div className="topbar-actions">
           {/* <span className="release-pill">Desktop v1</span> */}
           {documentSet && (
@@ -1015,21 +1025,21 @@ const canUpload = files.length >= 2 && !busyAction;
 
       {!documentSet ? (
         <main id="top">
-          <section className="hero">
-            <div className="hero-copy">
-              <p className="eyebrow">Open. Select. Synchronise safely.</p>
-              <h1>Edit shared content in the documents you already use.</h1>
-              <p className="hero-text">
+          {/* <section className="hero"> */}
+            {/* <div className="hero-copy"> */}
+              {/* <p className="eyebrow">Open. Select. Synchronise safely.</p> */}
+              {/* <h1>Edit shared content in the documents you already use.</h1> */}
+              {/* <p className="hero-text">
                 View uploaded Word documents in the browser, choose an exact shared element,
                 review every target, and create new versions without touching the originals.
-              </p>
-            </div>
+              </p> */}
+            {/* </div>
             <div className="workflow-card" aria-label="Document editing workflow">
               <div><span>1</span><p><strong>Open</strong><small>Scroll through each document</small></p></div>
               <div><span>2</span><p><strong>Select</strong><small>Choose recognised content</small></p></div>
               <div><span>3</span><p><strong>Review</strong><small>Confirm every exact match</small></p></div>
-            </div>
-          </section>
+            </div> */}
+          {/* </section> */}
 
           <section className="upload-workspace" aria-labelledby="upload-title">
             <div className="section-heading">

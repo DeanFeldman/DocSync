@@ -1,6 +1,7 @@
 import type {
   CompareResponse,
   DocumentVersionsResponse,
+  DocumentVersionRestoreResponse,
   DocumentView,
   DocumentSetLibraryResponse,
   DocumentSetResponse,
@@ -293,6 +294,26 @@ export async function fetchDocumentVersions(
     signal,
   });
   return parseResponse<DocumentVersionsResponse>(response);
+}
+
+export async function restoreDocumentVersion(
+  documentId: string,
+  versionId: string,
+  expectedCurrentVersionId: string,
+  signal?: AbortSignal,
+): Promise<DocumentVersionRestoreResponse> {
+  const response = await fetch(
+    `${API_URL}/documents/${documentId}/versions/${versionId}/restore`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        expected_current_version_id: expectedCurrentVersionId,
+      }),
+      signal,
+    },
+  );
+  return parseResponse<DocumentVersionRestoreResponse>(response);
 }
 
 export async function saveMatchDecisions(

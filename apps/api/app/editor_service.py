@@ -45,6 +45,7 @@ from .schemas import (
     EditorTarget,
     MatchDecisionBatchRequest,
     QuillDelta,
+    VersionRestoreRequest,
 )
 
 
@@ -769,6 +770,7 @@ def serialize_document_versions(session: Session, document_id: str) -> dict:
         session.scalars(
             select(DocumentVersion)
             .where(DocumentVersion.document_id == document.id)
+            .options(selectinload(DocumentVersion.editor_operation))
             .order_by(DocumentVersion.version_number.desc())
         )
     )
@@ -789,6 +791,29 @@ def serialize_document_versions(session: Session, document_id: str) -> dict:
                 "is_current": bool(head and head.current_version_id == version.id),
                 "generation_id": version.generation_id
                 or version.editor_operation_id,
+                "operation_type": (
+                    version.editor_operation.operation_type
+                    if version.editor_operation is not None
+                    else None
+                ),
+                "restored_from_version_id": (
+                    (version.editor_operation.preview_json or {}).get(
+                        "restored_from_version_id"
+                    )
+                    if version.editor_operation is not None
+                    and version.editor_operation.operation_type == "version_restore"
+                    and isinstance(version.editor_operation.preview_json, dict)
+                    else None
+                ),
+                "restored_from_version_number": (
+                    (version.editor_operation.preview_json or {}).get(
+                        "restored_from_version_number"
+                    )
+                    if version.editor_operation is not None
+                    and version.editor_operation.operation_type == "version_restore"
+                    and isinstance(version.editor_operation.preview_json, dict)
+                    else None
+                ),
                 "download_url": f"/api/document-versions/{version.id}/download",
                 "editor_content_url": (
                     f"/api/document-versions/{version.id}/editor-content"
@@ -2194,6 +2219,240 @@ def generate_editor_versions(
             raise
 
 
+def restore_document_version(
+    session: Session,
+    document_id: str,
+    target_version_id: str,
+    request: VersionRestoreRequest,
+) -> dict:
+    """Copy a historical immutable version into a new current version."""
+
+    with EDITOR_GENERATION_LOCK:
+        committed = False
+        staging_directory: Path | None = None
+        final_directory: Path | None = None
+        try:
+            document = session.get(DocumentRecord, document_id)
+            if document is None:
+                raise HTTPException(status_code=404, detail="Document not found.")
+
+            target_version = get_version_or_404(session, target_version_id)
+            if target_version.document_id != document.id:
+                raise HTTPException(
+                    status_code=422,
+                    detail="The version to restore does not belong to this document.",
+                )
+
+            current_version = current_version_for_document(session, document)
+            head = session.get(DocumentHead, document.id)
+            if head is None:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Document version head is missing.",
+                )
+            if head.current_version_id != request.expected_current_version_id:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        f"{document.original_name} changed after version history was "
+                        "opened. Reload the current version and try again."
+                    ),
+                )
+            if target_version.id == current_version.id:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="The selected version is already current.",
+                )
+
+            source_path = document_version_path(target_version)
+            operation_id = new_id()
+            generated_root = (
+                settings.data_dir / "generated" / document.document_set_id
+            )
+            generated_root.mkdir(parents=True, exist_ok=True)
+            candidate_staging_directory = (
+                generated_root / f".{operation_id}.staging"
+            )
+            candidate_final_directory = generated_root / operation_id
+            if (
+                candidate_staging_directory.exists()
+                or candidate_final_directory.exists()
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="A version restoration storage collision occurred. Try again.",
+                )
+            candidate_staging_directory.mkdir(parents=False, exist_ok=False)
+            staging_directory = candidate_staging_directory
+
+            highest_version_number = int(
+                session.scalar(
+                    select(func.max(DocumentVersion.version_number)).where(
+                        DocumentVersion.document_id == document.id
+                    )
+                )
+                or 0
+            )
+            next_version_number = highest_version_number + 1
+
+            from .document_service import safe_download_name
+
+            output_name = safe_download_name(
+                f"{Path(document.original_name).stem}-v{next_version_number}.docx"
+            )
+            staging_path = staging_directory / output_name
+            shutil.copyfile(source_path, staging_path)
+            _load_docx(staging_path)
+            checksum = _sha256(staging_path.read_bytes())
+            result_version_id = new_id()
+
+            zip_path = staging_directory / "current-documents.zip"
+            with zipfile.ZipFile(
+                zip_path,
+                mode="w",
+                compression=zipfile.ZIP_DEFLATED,
+            ) as archive:
+                documents = list(
+                    session.scalars(
+                        select(DocumentRecord)
+                        .where(
+                            DocumentRecord.document_set_id
+                            == document.document_set_id
+                        )
+                        .order_by(DocumentRecord.original_name)
+                    )
+                )
+                for current_document in documents:
+                    archive_path = (
+                        staging_path
+                        if current_document.id == document.id
+                        else document_version_path(
+                            current_version_for_document(session, current_document)
+                        )
+                    )
+                    archive.write(
+                        archive_path,
+                        arcname=safe_download_name(current_document.original_name),
+                    )
+
+            staging_directory.replace(candidate_final_directory)
+            staging_directory = None
+            final_directory = candidate_final_directory
+
+            operation = EditorOperation(
+                id=operation_id,
+                document_set_id=document.document_set_id,
+                operation_type="version_restore",
+                status="completed",
+                expected_head_revision=head.revision,
+                preview_json={
+                    "document_id": document.id,
+                    "document_name": document.original_name,
+                    "restored_from_version_id": target_version.id,
+                    "restored_from_version_number": target_version.version_number,
+                    "previous_current_version_id": current_version.id,
+                    "result_version_id": result_version_id,
+                    "expected_current_version_id": request.expected_current_version_id,
+                    "writes_performed": True,
+                    "status": "completed",
+                },
+                completed_at=utc_now(),
+            )
+            session.add(operation)
+            session.flush()
+
+            version = DocumentVersion(
+                id=result_version_id,
+                document_id=document.id,
+                parent_version_id=current_version.id,
+                generation_id=None,
+                editor_operation_id=operation.id,
+                version_number=next_version_number,
+                storage_area="generated",
+                storage_name=(
+                    f"{document.document_set_id}/{operation.id}/{output_name}"
+                ),
+                download_name=output_name,
+                checksum_sha256=checksum,
+            )
+            session.add(version)
+            session.flush()
+
+            location_to_element = _replace_current_elements_and_create_revisions(
+                session,
+                document=document,
+                version=version,
+                source_path=final_directory / output_name,
+                base_version_id=target_version.id,
+            )
+
+            head.current_version_id = version.id
+            head.revision += 1
+            head.updated_at = utc_now()
+            session.flush()
+
+            from .document_service import (
+                _rebuild_exact_link_groups,
+                get_document_set_or_404,
+                rendered_pdf_path,
+                serialize_document_set,
+            )
+
+            _rebuild_exact_link_groups(session, document.document_set_id)
+            session.flush()
+            refreshed = serialize_document_set(
+                get_document_set_or_404(session, document.document_set_id)
+            )
+            rendered_pdf_path(document).unlink(missing_ok=True)
+            session.commit()
+            committed = True
+
+            return {
+                "operation_id": operation.id,
+                "generation_id": operation.id,
+                "operation_type": operation.operation_type,
+                "status": operation.status,
+                "document_id": document.id,
+                "document_name": document.original_name,
+                "restored_from_version_id": target_version.id,
+                "restored_from_version_number": target_version.version_number,
+                "previous_current_version_id": current_version.id,
+                "version": {
+                    "id": version.id,
+                    "document_id": document.id,
+                    "document_name": document.original_name,
+                    "version_id": version.id,
+                    "version_number": version.version_number,
+                    "parent_version_id": version.parent_version_id,
+                    "restored_from_version_id": target_version.id,
+                    "restored_from_version_number": target_version.version_number,
+                    "checksum_sha256": version.checksum_sha256,
+                    "created_at": utc_isoformat(version.created_at),
+                    "status": "completed",
+                    "is_current": True,
+                    "generation_id": operation.id,
+                    "operation_type": operation.operation_type,
+                    "download_url": (
+                        f"/api/document-versions/{version.id}/download"
+                    ),
+                    "editor_content_url": (
+                        f"/api/document-versions/{version.id}/editor-content"
+                    ),
+                    "element_ids_by_location": location_to_element,
+                },
+                "download_url": f"/api/editor-operations/{operation.id}/download",
+                "document_set": refreshed,
+            }
+        except Exception:
+            if not committed:
+                session.rollback()
+                if staging_directory is not None:
+                    shutil.rmtree(staging_directory, ignore_errors=True)
+                if final_directory is not None:
+                    shutil.rmtree(final_directory, ignore_errors=True)
+            raise
+
+
 def editor_operation_download_path(
     session: Session,
     operation_id: str,
@@ -2286,8 +2545,32 @@ def serialize_editor_history(
         {
             "operation_id": operation.id,
             "generation_id": operation.id,
-            "event_type": "editor_edit",
-            "edit_mode": operation.operation_type,
+            "event_type": (
+                "version_restore"
+                if operation.operation_type == "version_restore"
+                else "editor_edit"
+            ),
+            "edit_mode": (
+                None
+                if operation.operation_type == "version_restore"
+                else operation.operation_type
+            ),
+            "operation_type": operation.operation_type,
+            "restored_from_version_id": (
+                (operation.preview_json or {}).get("restored_from_version_id")
+                if isinstance(operation.preview_json, dict)
+                else None
+            ),
+            "previous_current_version_id": (
+                (operation.preview_json or {}).get("previous_current_version_id")
+                if isinstance(operation.preview_json, dict)
+                else None
+            ),
+            "restored_from_version_number": (
+                (operation.preview_json or {}).get("restored_from_version_number")
+                if isinstance(operation.preview_json, dict)
+                else None
+            ),
             "status": operation.status,
             "created_at": utc_isoformat(operation.created_at),
             "completed_at": (

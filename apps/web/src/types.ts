@@ -349,17 +349,36 @@ export interface DocumentVersion {
   id: string;
   document_id: string;
   version_number: number;
+  parent_version_id?: string | null;
   created_at: string;
   status: string;
   is_current: boolean;
   download_url?: string;
   generation_id?: string | null;
+  operation_type?: string | null;
+  restored_from_version_id?: string | null;
+  restored_from_version_number?: number | null;
 }
 
 export interface DocumentVersionsResponse {
   document_id: string;
   current_version_id: string;
   versions: DocumentVersion[];
+}
+
+export interface DocumentVersionRestoreResponse {
+  operation_id: string;
+  generation_id?: string;
+  operation_type: string;
+  status: string;
+  document_id: string;
+  document_name: string;
+  restored_from_version_id: string;
+  restored_from_version_number: number;
+  previous_current_version_id: string;
+  version: DocumentVersion;
+  download_url?: string;
+  document_set: DocumentSetResponse;
 }
 
 export interface EditorGenerationResponse {

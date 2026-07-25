@@ -68,6 +68,11 @@ DocSync `v1.2.1` is a maintenance release focused on making large documents and 
   difference spans.
 - The Quill 2 editor preserves supported bold, italic, underline, heading, list,
   indentation, and alignment metadata.
+- Visible **Undo** and **Redo** controls apply to the active block's uncommitted
+  draft. Use `Ctrl+Z` to undo and `Ctrl+Y` or `Ctrl+Shift+Z` to redo
+  (`Command+Z` or `Command+Shift+Z` on macOS).
+- Draft history resets when another block or version opens. Undo and redo never
+  rewrite a generated document version.
 - One mapped Word block is edited at a time. The editor stays pinned at the top
   while the document block list scrolls on desktop-sized screens.
 
@@ -91,6 +96,9 @@ DocSync `v1.2.1` is a maintenance release focused on making large documents and 
 - Download the output of an editor operation as a ZIP archive.
 - Inspect version lineage and the edit history for a document set.
 - Continue editing from newly generated current versions.
+- Restore any earlier version by copying its content into a new immutable current
+  version. The restored source, previously current version, and all other history
+  remain available.
 
 ## How it works
 
@@ -104,6 +112,8 @@ DocSync `v1.2.1` is a maintenance release focused on making large documents and 
 7. Preview the resolved output for every affected document.
 8. Generate new versions from the same base versions used by the preview.
 9. Download a version, the operation ZIP, or the current document set.
+10. When needed, restore an earlier version as a new current version without
+    deleting or relabelling existing history.
 
 DocSync always keeps the original uploaded files unchanged.
 
@@ -392,6 +402,7 @@ POST   /api/document-elements/{element_id}/match-decisions
 POST   /api/document-sets/{document_set_id}/editor-preview
 POST   /api/document-sets/{document_set_id}/editor-generate
 GET    /api/documents/{document_id}/versions
+POST   /api/documents/{document_id}/versions/{target_version_id}/restore
 GET    /api/document-versions/{version_id}/download
 GET    /api/editor-operations/{operation_id}/download
 ```
@@ -433,7 +444,6 @@ For the version model, editor contract, and supported-content boundary, see
 
 Planned future improvements for DocSync include:
 
-- Add undo functionality and version restoration.
 - Add direct element selection within the Microsoft Word layout preview.
 - Expand safe editing support to more complex Word structures.
 - Improve application security, file validation, error handling, and protection
@@ -457,6 +467,12 @@ DocSync is designed around explicit confirmation:
 - Users choose every target and review the resolved output before generation.
 - Generation requires the same base version IDs used for preview and returns
   `409 Conflict` if a document head is stale.
+- Undo and redo are limited to the active block's uncommitted editor history.
+  Reversing a committed document state uses version restoration instead.
+- Restoration requires the expected current version ID and returns `409 Conflict`
+  without creating anything if the document head is stale. A successful restore
+  creates a new version and an auditable `version_restore` operation linking the
+  restored-from version, the previously current version, and the new result.
 - DOCX files are staged and validated before the database transaction advances any
   document heads. A failed batch is rolled back and staged output is removed.
 - Every successful edit creates new document versions with parent lineage and an
