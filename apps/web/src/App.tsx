@@ -40,6 +40,12 @@ import type {
 
 import docSyncLogo from "./assets/Docsync LOGO.png";
 import DocumentExperience from "./DocumentExperience";
+import {
+  applyTheme,
+  initialTheme,
+  persistTheme,
+  type AppTheme,
+} from "./theme";
 
 type BusyAction =
   | "upload"
@@ -160,6 +166,7 @@ function readableDate(value: string): string {
 }
 
 function App() {
+  const [theme, setTheme] = useState<AppTheme>(() => initialTheme());
 const [setName, setSetName] = useState("");
 const [setNameTouched, setSetNameTouched] = useState(false);
   const [files, setFiles] = useState<File[]>([]);
@@ -204,6 +211,17 @@ const [setNameTouched, setSetNameTouched] = useState(false);
   const globalSearchInputRef = useRef<HTMLInputElement>(null);
   const globalSearchContainerRef = useRef<HTMLDivElement>(null);
   const documentSearchRequestRef = useRef(0);
+
+  useEffect(() => {
+    applyTheme(theme);
+  }, [theme]);
+
+  function toggleTheme() {
+    const nextTheme: AppTheme = theme === "dark" ? "light" : "dark";
+    applyTheme(nextTheme);
+    persistTheme(nextTheme);
+    setTheme(nextTheme);
+  }
 
   const filteredSavedSets = useMemo(() => {
     const query = savedSetQuery.trim().toLocaleLowerCase();
@@ -1015,6 +1033,19 @@ const canUpload = files.length >= 2 && !busyAction;
 
         <div className="topbar-actions">
           {/* <span className="release-pill">Desktop v1</span> */}
+          <button
+            type="button"
+            className="theme-toggle"
+            onClick={toggleTheme}
+            aria-pressed={theme === "dark"}
+            aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
+            title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
+          >
+            <span className="theme-toggle-icon" aria-hidden="true">
+              {theme === "dark" ? "☀" : "☾"}
+            </span>
+            <span>{theme === "dark" ? "Light" : "Dark"}</span>
+          </button>
           {documentSet && (
             <button type="button" className="quiet-button" onClick={() => resetWorkspace()}>
               Home

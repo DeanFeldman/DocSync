@@ -41,6 +41,19 @@ export interface ViewerPage {
   elements: ViewerElement[];
 }
 
+export interface LayoutElementRegion {
+  element_id: string;
+  document_id: string;
+  version_id: string;
+  page_number: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  editable: boolean;
+  confidence?: number;
+}
+
 export interface DocumentView {
   document_id: string;
   version_id: string;
@@ -53,6 +66,7 @@ export interface DocumentView {
   notice: string;
   pdf_url?: string;
   pages: ViewerPage[];
+  layout_regions?: LayoutElementRegion[];
 }
 
 export interface MatchDiscovery {

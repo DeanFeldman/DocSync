@@ -288,6 +288,84 @@ function BlockCard({
   );
 }
 
+function LayoutFallbackBlock({
+  block,
+  selected,
+  onSelect,
+}: {
+  block: EditorBlock;
+  selected: boolean;
+  onSelect: (block: EditorBlock) => void;
+}) {
+  const editable = block.supported && !block.read_only;
+  const alignment = block.alignment ?? "left";
+  const className = `layout-fallback-block ${block.element_type} ${
+    selected ? "selected" : ""
+  } ${editable ? "editable" : "read-only"}`;
+  const content = (
+    <>
+      <span className="layout-fallback-meta">
+        <span>{locationLabel(block)}</span>
+        <span>
+          {editable
+            ? selected
+              ? "Selected"
+              : "Open in editor"
+            : "Read-only"}
+        </span>
+      </span>
+      <span
+        className={`layout-fallback-content align-${alignment} indent-${Math.min(
+          8,
+          Math.max(0, block.indent ?? 0),
+        )}`}
+      >
+        {block.element_type === "list_item" && (
+          <span className="editor-list-marker" aria-hidden="true">
+            {block.list_type === "ordered" ? "1." : "•"}
+          </span>
+        )}
+        <span>{inlineDelta(block.delta)}</span>
+      </span>
+      {!editable && block.unsupported_reason && (
+        <span className="layout-fallback-reason">
+          {block.unsupported_reason}
+        </span>
+      )}
+    </>
+  );
+
+  if (!editable) {
+    return (
+      <div
+        className={className}
+        aria-label={`Read-only ${block.element_type}: ${block.text}${
+          block.unsupported_reason ? `. ${block.unsupported_reason}` : ""
+        }`}
+        data-element-id={block.element_id}
+      >
+        {content}
+      </div>
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      className={className}
+      aria-pressed={selected}
+      aria-label={`Open ${block.element_type.replaceAll("_", " ")} in editor: ${
+        block.text
+      }`}
+      title="Open in editor"
+      data-element-id={block.element_id}
+      onClick={() => onSelect(block)}
+    >
+      {content}
+    </button>
+  );
+}
+
 function DifferenceText({ spans }: { spans: DifferenceSpan[] }) {
   return (
     <span className="difference-text">
@@ -669,6 +747,7 @@ export default function DocumentExperience({
   const [layoutStatus, setLayoutStatus] =
     useState<LoadingStatus>("idle");
   const [layoutRefresh, setLayoutRefresh] = useState(0);
+  const [showLayoutStructure, setShowLayoutStructure] = useState(false);
   const [selectedElementId, setSelectedElementId] = useState("");
   const [draft, setDraft] = useState<QuillDraft | null>(null);
   const [editorResetToken, setEditorResetToken] = useState(0);
@@ -775,6 +854,7 @@ export default function DocumentExperience({
     setRestoringVersionId("");
     setLocalError("");
     setPendingBlockSelection(null);
+    setShowLayoutStructure(false);
   }, [document?.id]);
 
   useEffect(() => {
@@ -789,6 +869,7 @@ export default function DocumentExperience({
     setContentStatus("loading");
     setLayoutView(null);
     setLayoutStatus("idle");
+    setShowLayoutStructure(false);
     setSelectedElementId("");
     setDraft(null);
     setMatches([]);
@@ -878,18 +959,10 @@ export default function DocumentExperience({
       return;
     }
 
-    const block = editorContent.blocks.find(
-      (candidate) => candidate.element_id === searchTarget.element_id,
-    );
-    if (!block) {
-      setLocalError(
-        `${document.name}: the selected search result is no longer in the current document version. Run the search again.`,
-      );
-      return;
-    }
-
-    setMode("edit");
-    selectBlock(block, true);
+    selectElementById(searchTarget.element_id, {
+      skipDiscardConfirmation: true,
+      sourceLabel: "search result",
+    });
   }, [
     contentStatus,
     document?.id,
@@ -1029,7 +1102,7 @@ export default function DocumentExperience({
           setLayoutView(fallback);
           loaded = true;
           setLocalError(
-            `${document!.name}: Word layout was unavailable, so a structured read-only fallback is shown.`,
+            `${document!.name}: Word layout was unavailable, so the selectable structured document is shown.`,
           );
         } catch (fallbackError) {
           if (controller.signal.aborted) return;
@@ -1385,6 +1458,68 @@ export default function DocumentExperience({
     }, 0);
   }
 
+  function selectElementById(
+    elementId: string,
+    options: {
+      sourceVersionId?: string;
+      sourceLabel?: string;
+      skipDiscardConfirmation?: boolean;
+    } = {},
+  ) {
+    const sourceLabel = options.sourceLabel ?? "Layout element";
+    if (!document || !editorContent) {
+      setLocalError(
+        `${sourceLabel} could not be opened because the current document structure is not ready. Refresh the document and try again.`,
+      );
+      return;
+    }
+
+    if (
+      options.sourceVersionId &&
+      options.sourceVersionId !== editorContent.version_id
+    ) {
+      setLocalError(
+        `${document.name}: this ${sourceLabel.toLocaleLowerCase()} belongs to an older document version. The latest layout is being reloaded.`,
+      );
+      setLayoutView(null);
+      setShowLayoutStructure(false);
+      setLayoutRefresh((current) => current + 1);
+      return;
+    }
+
+    const block = editorContent.blocks.find(
+      (candidate) => candidate.element_id === elementId,
+    );
+    if (!block) {
+      setLocalError(
+        `${document.name}: the selected ${sourceLabel.toLocaleLowerCase()} is no longer mapped in the current document version. Refresh the document and try again.`,
+      );
+      return;
+    }
+
+    if (
+      block.document_id !== document.id ||
+      block.version_id !== editorContent.version_id
+    ) {
+      setLocalError(
+        `${document.name}: the selected ${sourceLabel.toLocaleLowerCase()} did not match the active document version, so it was not opened.`,
+      );
+      return;
+    }
+
+    if (!block.supported || block.read_only) {
+      setLocalError(
+        `${document.name} · ${locationLabel(block)}: ${
+          block.unsupported_reason ??
+          "This Word element is preserved as read-only and cannot be opened in the structured editor."
+        }`,
+      );
+      return;
+    }
+
+    selectBlock(block, options.skipDiscardConfirmation ?? false);
+  }
+
   function activateSelectedBlock(block: EditorBlock) {
     matchRequestRef.current += 1;
     editorActionRequestRef.current += 1;
@@ -1404,8 +1539,6 @@ export default function DocumentExperience({
     setPreviewOpen(false);
     setPreviewSignature("");
     setAction(null);
-    setLocalError("");
-    setRestoreError("");
     setEditorResetToken((current) => current + 1);
 
     if (block.supported && !block.read_only) {
@@ -1454,8 +1587,6 @@ export default function DocumentExperience({
 
     setPendingBlockSelection(null);
     setAction(null);
-    setLocalError("");
-    setRestoreError("");
 
     if (!currentElementId) {
       return;
@@ -1465,6 +1596,7 @@ export default function DocumentExperience({
      * Cancel keeps the current draft, but forces a fresh Quill instance so the
      * editor is immediately clickable after the confirmation dialog closes.
      */
+    setMode("edit");
     setEditorResetToken((current) => current + 1);
     focusEditorForElement(currentElementId);
   }
@@ -2145,31 +2277,54 @@ export default function DocumentExperience({
             <div className="mode-panel-heading">
               <div>
                 <p className="eyebrow">Authoritative layout</p>
-                <h2>Read-only Word preview</h2>
+                <h2>
+                  {showLayoutStructure || !layoutView?.pdf_url
+                    ? "Select from document structure"
+                    : "Read-only Word preview"}
+                </h2>
                 <p>
-                  This view is rendered from the current DOCX. Switch to Edit
-                  for supported structured content.
+                  {showLayoutStructure || !layoutView?.pdf_url
+                    ? "Choose a supported heading, paragraph, list item, or table cell to open its exact mapped block in Edit."
+                    : "This view is rendered from the current DOCX. Choose Select from structure when you want to open a mapped element in the editor."}
                 </p>
               </div>
-              <button
-                type="button"
-                className="quiet-button"
-                disabled={layoutStatus === "loading"}
-                onClick={() => {
-                  setLayoutView(null);
-                  setLayoutRefresh((current) => current + 1);
-                }}
-              >
-                Refresh layout
-              </button>
+              <div className="layout-heading-actions">
+                {editorContent &&
+                  (layoutStatus === "loading" || layoutView?.pdf_url) && (
+                  <button
+                    type="button"
+                    className="primary-button layout-selection-toggle"
+                    onClick={() =>
+                      setShowLayoutStructure((current) => !current)
+                    }
+                    aria-pressed={showLayoutStructure}
+                  >
+                    {showLayoutStructure
+                      ? "Show Word preview"
+                      : "Select from structure"}
+                  </button>
+                  )}
+                <button
+                  type="button"
+                  className="quiet-button"
+                  disabled={layoutStatus === "loading"}
+                  onClick={() => {
+                    setLayoutView(null);
+                    setShowLayoutStructure(false);
+                    setLayoutRefresh((current) => current + 1);
+                  }}
+                >
+                  Refresh layout
+                </button>
+              </div>
             </div>
-            {layoutStatus === "loading" && (
+            {layoutStatus === "loading" && !showLayoutStructure && (
               <div className="editor-loading-state" role="status">
                 <span className="spinner" aria-hidden="true" />
                 Microsoft Word is preparing the layout preview…
               </div>
             )}
-            {layoutStatus === "error" && (
+            {layoutStatus === "error" && !editorContent && (
               <div className="editor-empty-state">
                 <strong>Layout preview unavailable</strong>
                 <p>
@@ -2178,11 +2333,17 @@ export default function DocumentExperience({
                 </p>
               </div>
             )}
-            {layoutStatus === "ready" && layoutView?.pdf_url && (
+            {layoutStatus === "ready" &&
+              layoutView?.pdf_url &&
+              !showLayoutStructure && (
               <div className="layout-iframe-shell">
                 <div className="render-notice">
                   <strong>Word layout</strong>
-                  <span>{layoutView.notice}</span>
+                  <span>
+                    {layoutView.notice} This PDF remains read-only because no
+                    reliable element-coordinate map is available. Use Select
+                    from structure for safe direct selection.
+                  </span>
                 </div>
                 <iframe
                   src={absoluteApiUrl(layoutView.pdf_url)}
@@ -2190,21 +2351,35 @@ export default function DocumentExperience({
                 />
               </div>
             )}
-            {layoutStatus === "ready" &&
-              layoutView &&
-              !layoutView.pdf_url && (
+            {editorContent &&
+              (showLayoutStructure ||
+                (layoutStatus === "ready" &&
+                  layoutView &&
+                  !layoutView.pdf_url) ||
+                layoutStatus === "error") && (
                 <div className="layout-structured-fallback">
                   <div className="render-notice">
-                    <strong>Structured fallback</strong>
-                    <span>{layoutView.notice}</span>
+                    <strong>Selectable structure</strong>
+                    <span>
+                      {layoutStatus === "error"
+                        ? "The rendered layout could not be loaded. Supported elements below still open their current mapped block safely in Edit."
+                        : "Supported elements open the same stable block used by Edit and search. Read-only Word structures remain protected."}
+                    </span>
                   </div>
-                  {editorContent?.blocks.map((block) => (
-                    <div
-                      className="layout-fallback-block"
+                  {editorContent.blocks.map((block) => (
+                    <LayoutFallbackBlock
+                      block={block}
+                      selected={block.element_id === selectedElementId}
+                      onSelect={(selectedBlock) =>
+                        selectElementById(selectedBlock.element_id, {
+                          sourceVersionId:
+                            layoutView?.version_id ??
+                            editorContent.version_id,
+                          sourceLabel: "Layout element",
+                        })
+                      }
                       key={block.element_id}
-                    >
-                      {inlineDelta(block.delta)}
-                    </div>
+                    />
                   ))}
                 </div>
               )}

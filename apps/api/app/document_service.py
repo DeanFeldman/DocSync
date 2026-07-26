@@ -947,6 +947,10 @@ def serialize_document_view(document: DocumentRecord) -> dict:
             "DOCX remains the source of truth."
         ),
         "pages": pages,
+        # Coordinate overlays are optional. The current renderer does not emit
+        # sufficiently reliable Word/PDF bounds, so clients must use the
+        # structured selection fallback until populated by a future renderer.
+        "layout_regions": [],
     }
 
 
