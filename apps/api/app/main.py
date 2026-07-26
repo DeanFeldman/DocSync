@@ -58,9 +58,17 @@ from .schemas import (
 )
 
 
+from .audit_logger import AuditLogger
+from .backup_service import DocumentBackupService
+from .error_mapper import DocuSyncError, ErrorMapper
+from .storage_service import DocumentStorageService
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
+    DocumentStorageService.init_storage()
+    DocumentStorageService.cleanup_stale_temp_files()
     yield
 
 
@@ -104,6 +112,29 @@ async def secure_local_application(request: Request, call_next):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "SAMEORIGIN"
     return response
+
+
+@app.exception_handler(DocuSyncError)
+async def docusync_error_handler(request: Request, exc: DocuSyncError):
+    AuditLogger.log_event(
+        operation="api_error",
+        error_code=exc.code,
+        reference_id=exc.reference_id,
+        details=exc.message,
+    )
+    return ErrorMapper.create_response(exc)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    mapped = ErrorMapper.map_exception(exc)
+    AuditLogger.log_event(
+        operation="unhandled_exception",
+        error_code=mapped.code,
+        reference_id=mapped.reference_id,
+        details=str(exc),
+    )
+    return ErrorMapper.create_response(mapped)
 
 
 @app.get("/api/health")
@@ -417,6 +448,32 @@ def download_editor_operation(
         media_type="application/zip",
         filename=f"DocumentSync-editor-{operation_id}.zip",
     )
+
+
+@app.get("/api/documents/{document_id}/backups")
+def get_document_backups(
+    document_id: str,
+    session: Session = Depends(get_session),
+) -> dict:
+    document = get_document_or_404(session, document_id)
+    backups = DocumentBackupService.list_backups(document.id)
+    return {"document_id": document.id, "backups": backups}
+
+
+@app.post("/api/documents/{document_id}/backups/restore")
+def restore_document_backup(
+    document_id: str,
+    session: Session = Depends(get_session),
+) -> dict:
+    document = get_document_or_404(session, document_id)
+    working_path = current_document_path(session, document)
+    restored_path = DocumentBackupService.restore_latest_backup(working_path, document.id)
+    return {
+        "status": "success",
+        "message": f"Restored previous valid version for {document.original_name}",
+        "document_id": document.id,
+        "restored_file": restored_path.name,
+    }
 
 
 if settings.web_dist_dir.is_dir():

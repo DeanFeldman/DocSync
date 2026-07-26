@@ -22,6 +22,13 @@ from sqlalchemy.orm import Session, selectinload
 from datetime import datetime, timezone
 
 from .config import settings
+from .audit_logger import AuditLogger
+from .backup_service import DocumentBackupService
+from .error_mapper import ErrorMapper, DocuSyncError
+from .path_service import SafePathService
+from .storage_service import DocumentStorageService
+from .validation_service import DocumentValidationService
+from .atomic_save_service import AtomicSaveService
 from .models import (
     DocumentBlockRevision,
     DocumentElement,
@@ -165,51 +172,11 @@ def _layout_pages(elements: list[DocumentElement]) -> list[dict]:
 
 
 def safe_download_name(name: str) -> str:
-    cleaned = SAFE_NAME_PATTERN.sub("_", Path(name).name).strip(" .")
-    return cleaned or "document.docx"
+    return SafePathService.normalise_filename(name)
 
 
 def _validate_docx_payload(filename: str, payload: bytes) -> None:
-    if not filename.lower().endswith(".docx"):
-        raise HTTPException(
-            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-            detail=f"{filename}: only DOCX files are supported.",
-        )
-    if len(payload) > settings.max_file_bytes:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"{filename}: file exceeds the configured size limit.",
-        )
-    if not zipfile.is_zipfile(BytesIO(payload)):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"{filename}: the file is not a valid DOCX archive.",
-        )
-
-    with zipfile.ZipFile(BytesIO(payload)) as archive:
-        entries = archive.infolist()
-        names = {entry.filename for entry in entries}
-        if "[Content_Types].xml" not in names or "word/document.xml" not in names:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"{filename}: required DOCX parts are missing.",
-            )
-        if len(entries) > 1_000:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"{filename}: the DOCX archive contains too many parts.",
-            )
-        if any(entry.flag_bits & 0x1 for entry in entries):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"{filename}: password-protected DOCX files are not supported.",
-            )
-        total_uncompressed = sum(entry.file_size for entry in entries)
-        if total_uncompressed > 100 * 1024 * 1024:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"{filename}: the expanded DOCX archive is too large.",
-            )
+    DocumentValidationService.validate_file(payload, filename=filename)
 
 
 def _extract_paragraphs(payload: bytes) -> list[tuple[int, str, str | None]]:
@@ -286,6 +253,22 @@ def _extract_paragraphs(payload: bytes) -> list[tuple[int, str, str | None]]:
 
     return elements
 
+
+def _unique_set_filename(existing_names: set[str], filename: str) -> str:
+    safe_name = SafePathService.normalise_filename(filename)
+    if safe_name.casefold() not in existing_names:
+        return safe_name
+
+    stem = Path(safe_name).stem
+    ext = Path(safe_name).suffix
+    counter = 1
+    while True:
+        candidate = f"{stem} ({counter}){ext}"
+        if candidate.casefold() not in existing_names:
+            return candidate
+        counter += 1
+
+
 async def create_document_set(
     session: Session,
     name: str,
@@ -310,14 +293,9 @@ async def create_document_set(
     seen_names: set[str] = set()
     try:
         for upload in files:
-            original_name = safe_download_name(upload.filename or "document.docx")
-            name_key = original_name.casefold()
-            if name_key in seen_names:
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"Duplicate file name in document set: {original_name}.",
-                )
-            seen_names.add(name_key)
+            raw_name = upload.filename or "document.docx"
+            original_name = _unique_set_filename(seen_names, raw_name)
+            seen_names.add(original_name.casefold())
             payload = await upload.read()
             _validate_docx_payload(original_name, payload)
             extracted = _extract_paragraphs(payload)
@@ -389,14 +367,9 @@ async def add_documents_to_set(
 
     try:
         for upload in files:
-            original_name = safe_download_name(upload.filename or "document.docx")
-            name_key = original_name.casefold()
-            if name_key in seen_names:
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"A document named {original_name} already exists in this set.",
-                )
-            seen_names.add(name_key)
+            raw_name = upload.filename or "document.docx"
+            original_name = _unique_set_filename(seen_names, raw_name)
+            seen_names.add(original_name.casefold())
 
             payload = await upload.read()
             _validate_docx_payload(original_name, payload)
