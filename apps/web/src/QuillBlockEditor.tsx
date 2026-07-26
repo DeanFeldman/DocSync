@@ -42,6 +42,28 @@ function toolbarControls(
     });
 }
 
+function clearGeneratedQuillToolbar(
+  toolbar: HTMLDivElement | null,
+) {
+  if (!toolbar) return;
+
+  // Quill creates a .ql-picker element for every <select>.
+  // Remove these before creating another Quill instance.
+  toolbar
+    .querySelectorAll<HTMLElement>(".ql-picker")
+    .forEach((picker) => picker.remove());
+
+  // Quill hides the original selects when it creates its pickers.
+  // Restore them so the next Quill instance can initialise correctly.
+  toolbar
+    .querySelectorAll<HTMLSelectElement>("select")
+    .forEach((select) => {
+      select.style.removeProperty("display");
+      select.removeAttribute("tabindex");
+      select.removeAttribute("aria-hidden");
+    });
+}
+
 function historyControls(
   undo: HTMLButtonElement | null,
   redo: HTMLButtonElement | null,
@@ -86,7 +108,9 @@ export default function QuillBlockEditor({
       return;
     }
 
+    clearGeneratedQuillToolbar(toolbar);
     host.replaceChildren();
+
     const editor = document.createElement("div");
     host.appendChild(editor);
 
@@ -182,6 +206,7 @@ export default function QuillBlockEditor({
       quill.disable();
       if (quillRef.current === quill) quillRef.current = null;
       host.replaceChildren();
+        clearGeneratedQuillToolbar(toolbar);
       toolbarControls(toolbar, true);
     };
   }, [block?.element_id, resetToken]);
