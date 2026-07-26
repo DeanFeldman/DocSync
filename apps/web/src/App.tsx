@@ -1078,7 +1078,7 @@ const canUpload = files.length >= 2 && !busyAction;
                 <p className="eyebrow">Start a workspace</p>
                 <h2 id="upload-title">Upload a related document set</h2>
               </div>
-              <p>Choose 2–20 DOCX files. Exact repeated paragraphs are linked automatically.</p>
+              <p>Choose 2–20 DOCX files.</p>
             </div>
 
             {error && (
