@@ -31,22 +31,34 @@ DocSync-Setup-latest.exe
 
 ---
 
-## Version 1.3.0
+## Version 1.4.0
 
-DocSync `v1.3.0` is an editor-stability and usability release.
+DocSync `v1.4.0` adds direct structured Layout selection and a persistent
+application-wide dark theme.
 
 ### Improvements
 
-- Makes the document workspace more compact so more document content remains visible.
-- Improves structured-editor recovery after API failures and failed document operations.
-- Keeps the editor usable after choosing **OK** or **Cancel** when changing blocks with an unpreviewed draft.
-- Adds dismissible error messages that do not block the rest of the workspace.
-- Adds visible **Undo** and **Redo** controls for the active block.
-- Prevents Quill toolbar controls from being duplicated after editor remounts.
-- Improves document-set search and result navigation.
-- Improves performance for large documents and table-heavy previews.
-- Supports editing of mapped top-level table cells.
-- Preserves safe versioning, preview-before-generation, and immutable document history.
+- Lets users select supported headings, paragraphs, list items, and mapped
+  top-level table cells directly from the structured **Layout** view.
+- Opens the selected Layout block in **Edit**, loads its Delta into Quill, and
+  restores keyboard focus without requiring a page or tab change.
+- Uses the same draft confirmation, document-version validation, and error
+  recovery path for Layout, search, and Edit selections.
+- Clearly labels unsupported Word structures as read-only and explains why they
+  cannot be edited.
+- Keeps the high-fidelity Word/PDF preview read-only when reliable
+  page-coordinate metadata is unavailable, with an explicit switch to the
+  selectable structured document.
+- Adds a keyboard-accessible light/dark theme control in the application header.
+- Persists an explicit theme in local storage and otherwise follows the Windows
+  system preference without a light-theme startup flash.
+- Keeps the active document, mode, block, draft, comparison, preview, scroll
+  position, and Quill instance intact when the theme changes.
+- Retains the v1.3 editor recovery, dismissible errors, Undo/Redo, global search,
+  immutable versioning, and version restoration improvements.
+
+See [the v1.4.0 release notes](docs/v1.4.0-release-notes.md) for the complete
+behavior and verification summary.
 
 ---
 
@@ -62,6 +74,7 @@ DocSync `v1.3.0` is an editor-stability and usability release.
 - Search all current document versions from one search field.
 - Navigate directly to a matching document block.
 - View the number of files, elements, and exact-match groups.
+- Switch between light and dark mode without losing the current workspace state.
 
 ### Layout, Edit, and Compare
 
@@ -70,7 +83,11 @@ DocSync provides three document workspace modes.
 #### Layout
 
 - Displays a read-only Microsoft Word-rendered preview when Microsoft Word is available.
-- Uses a structured fallback when Word rendering is unavailable.
+- Offers a selectable structured document beside the rendered preview.
+- Opens supported structured Layout blocks directly in the editor.
+- Shows unsupported or preserved Word structures as read-only with a reason.
+- Uses the selectable structured view as the safe fallback when reliable
+  rendered-page coordinates are unavailable.
 - Preserves the original document as the authoritative layout reference.
 
 #### Edit
@@ -154,14 +171,16 @@ DocSync is designed around controlled document editing.
 1. Create a document set.
 2. Upload related Microsoft Word documents.
 3. Open a document in **Layout** or **Edit**.
-4. Select one supported block.
-5. Edit the block in the structured editor.
-6. Review exact and near matches in **Compare**.
-7. Choose the editing mode.
-8. Select the intended targets.
-9. Preview the complete result.
-10. Generate new immutable versions.
-11. Download or restore versions when needed.
+4. In **Layout**, choose **Select from document structure** when a Word-rendered
+   preview is shown.
+5. Select one supported block; DocSync opens and focuses it in **Edit**.
+6. Edit the block in the structured editor.
+7. Review exact and near matches in **Compare**.
+8. Choose the editing mode.
+9. Select the intended targets.
+10. Preview the complete result.
+11. Generate new immutable versions.
+12. Download or restore versions when needed.
 
 ---
 
@@ -357,7 +376,7 @@ The workflow reads the application version from the Git tag, so the source `pack
 From the repository root:
 
 ```powershell
-$version = "1.3.0"
+$version = "1.4.0"
 
 git switch main
 git pull origin main
@@ -464,7 +483,9 @@ http://localhost:8001/docs
 - The packaged desktop release currently targets Windows.
 - High-fidelity layout rendering works best when Microsoft Word desktop is installed.
 - Some Word structures remain read-only.
-- Direct selection of text from the rendered Word layout is not yet available.
+- Direct selection is available in the structured Layout view. The
+  high-fidelity Word/PDF preview remains read-only until the renderer can
+  provide reliable page-relative element coordinates.
 - Authentication, PostgreSQL, hosted cloud storage, and multi-device synchronisation are not yet part of the local desktop release.
 - The Windows installer is not yet commercially code-signed.
 
@@ -474,7 +495,7 @@ http://localhost:8001/docs
 
 Planned work includes:
 
-- Direct element selection from the Word layout preview
+- Reliable element-coordinate overlays for the high-fidelity Word/PDF preview
 - Broader editing support for complex Word structures
 - Stronger file validation and local document protection
 - Linux and macOS support

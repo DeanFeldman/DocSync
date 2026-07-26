@@ -755,6 +755,7 @@ def serialize_version_document_view(session: Session, version_id: str) -> dict:
             "Unsupported Word objects remain available in Layout mode and are read-only."
         ),
         "pages": pages,
+        "layout_regions": [],
         "unsupported": content["unsupported"],
     }
 

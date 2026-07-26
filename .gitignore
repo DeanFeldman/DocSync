@@ -37,3 +37,5 @@ pytest-cache-files-*/
 .DS_Store
 Thumbs.db
 
+.tmp-browser-*/
+.artifacts/

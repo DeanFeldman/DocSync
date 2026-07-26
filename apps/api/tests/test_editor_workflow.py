@@ -131,6 +131,39 @@ def version_count(client: TestClient, document_id: str) -> int:
     return len(response.json()["versions"])
 
 
+def test_document_view_exposes_safe_optional_layout_region_contract(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    app = load_test_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        workspace = upload_set(
+            client,
+            {
+                "Layout.docx": make_paragraph_docx(
+                    "Selectable layout",
+                    ["Choose this paragraph from the structured layout."],
+                ),
+                "Companion.docx": make_paragraph_docx(
+                    "Companion layout",
+                    ["A second document keeps this a valid document set."],
+                ),
+            },
+        )
+        document = documents_by_name(workspace)["Layout.docx"]
+
+        response = client.get(
+            f"/api/document-versions/{document['version_id']}/pages"
+        )
+
+        assert response.status_code == 200, response.text
+        payload = response.json()
+        assert payload["document_id"] == document["id"]
+        assert payload["version_id"] == document["version_id"]
+        assert payload["layout_regions"] == []
+        assert payload["pages"][0]["elements"]
+
+
 def test_editor_content_preserves_delta_structure_and_normalized_matching(
     tmp_path: Path,
     monkeypatch,
