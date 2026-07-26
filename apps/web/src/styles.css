@@ -323,7 +323,37 @@ textarea:focus-visible {
 
 .alert { display: grid; gap: 4px; border-radius: 12px; padding: 13px 15px; margin: 16px max(22px, calc((100vw - 1500px) / 2)); }
 .upload-workspace > .alert { margin: 0 0 18px; }
-.error-alert { color: var(--danger); background: var(--danger-soft); border: 1px solid #efcaca; }
+.error-alert {
+  position: relative;
+  grid-template-columns: minmax(0, 1fr) auto;
+  color: var(--danger);
+  background: var(--danger-soft);
+  border: 1px solid #efcaca;
+  pointer-events: auto;
+}
+.error-alert > strong,
+.error-alert > span {
+  grid-column: 1;
+}
+.error-alert > button {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  align-self: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  color: currentColor;
+  background: transparent;
+  cursor: pointer;
+  font-size: 1.15rem;
+  line-height: 1;
+  pointer-events: auto;
+}
+.error-alert > button:hover {
+  background: rgba(141, 31, 31, 0.09);
+}
 
 /* Document workspace */
 .phase-two-main { padding: 12px max(16px, calc((100vw - 1500px) / 2)) 16px; }
@@ -1535,19 +1565,57 @@ textarea:focus-visible {
 }
 
 .editor-inline-error {
+  position: relative;
+  z-index: auto;
   flex: 0 0 auto;
+  min-height: 0;
+  max-height: none;
   padding: 9px 12px;
   display: flex;
+  align-items: flex-start;
   gap: 8px;
+  overflow: visible;
   border-bottom: 1px solid #efcaca;
   color: var(--danger);
   background: var(--danger-soft);
   font-size: 0.65rem;
   line-height: 1.4;
+  pointer-events: auto;
 }
 
 .editor-inline-error strong {
   flex: 0 0 auto;
+}
+
+.editor-inline-error span {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.editor-inline-error button {
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  margin: -3px -4px -3px 0;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  color: currentColor;
+  background: transparent;
+  cursor: pointer;
+  font-size: 1rem;
+  line-height: 1;
+  pointer-events: auto;
+}
+
+.editor-inline-error button:hover {
+  background: rgba(141, 31, 31, 0.09);
+}
+
+.error-alert > button:focus-visible,
+.editor-inline-error button:focus-visible {
+  outline: 3px solid rgba(141, 31, 31, 0.22);
+  outline-offset: 1px;
 }
 
 .editor-restore-notice {

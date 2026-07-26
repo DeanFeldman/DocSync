@@ -42,6 +42,31 @@ function toolbarControls(
     });
 }
 
+/* DOCSYNC_QUILL_INTERACTIVE_RESET_V4 */
+function setQuillInteractiveState(
+  quill: Quill,
+  toolbar: HTMLDivElement | null,
+  readOnly: boolean,
+) {
+  const editable = !readOnly;
+
+  quill.enable(editable);
+  toolbarControls(toolbar, readOnly);
+  quill.container.classList.toggle("ql-disabled", readOnly);
+  quill.root.setAttribute("contenteditable", String(editable));
+  quill.root.toggleAttribute("aria-readonly", readOnly);
+  quill.root.removeAttribute("inert");
+  quill.root.style.pointerEvents = "auto";
+
+  if (editable) {
+    quill.root.removeAttribute("aria-disabled");
+    quill.root.tabIndex = 0;
+  } else {
+    quill.root.setAttribute("aria-disabled", "true");
+    quill.root.tabIndex = -1;
+  }
+}
+
 function clearGeneratedQuillToolbar(
   toolbar: HTMLDivElement | null,
 ) {
@@ -136,11 +161,11 @@ export default function QuillBlockEditor({
     });
     quillRef.current = quill;
     const readOnly = block.read_only || !block.supported;
-    quill.enable(!readOnly);
-    toolbarControls(toolbar, readOnly);
+    setQuillInteractiveState(quill, toolbar, readOnly);
 
     const initial = initialDeltaRef.current ?? block.delta;
     quill.setContents(initial as never, "silent");
+    setQuillInteractiveState(quill, toolbar, readOnly);
     quill.history.clear();
     quill.root.dataset.editorElementId = block.element_id;
     quill.root.setAttribute(
@@ -198,7 +223,16 @@ export default function QuillBlockEditor({
     redoButton?.addEventListener("click", handleRedo);
     quill.root.addEventListener("paste", handlePaste, true);
 
+    const focusFrame = readOnly
+      ? null
+      : window.requestAnimationFrame(() => {
+          if (quillRef.current !== quill || !quill.root.isConnected) return;
+          setQuillInteractiveState(quill, toolbarRef.current, false);
+          quill.focus();
+        });
+
     return () => {
+      if (focusFrame !== null) window.cancelAnimationFrame(focusFrame);
       quill.off("text-change", handleTextChange);
       undoButton?.removeEventListener("click", handleUndo);
       redoButton?.removeEventListener("click", handleRedo);
@@ -206,9 +240,54 @@ export default function QuillBlockEditor({
       quill.disable();
       if (quillRef.current === quill) quillRef.current = null;
       host.replaceChildren();
-        clearGeneratedQuillToolbar(toolbar);
+      clearGeneratedQuillToolbar(toolbar);
       toolbarControls(toolbar, true);
     };
+  }, [
+    block?.element_id,
+    block?.read_only,
+    block?.supported,
+    resetToken,
+  ]);
+
+  /*
+   * DOCSYNC_QUILL_RECOVERY_V2
+   *
+   * Reassert the active Quill instance after a surrounding request failure or
+   * React re-render. This prevents a stale disabled editor from remaining on
+   * screen until the user changes workspace tabs.
+   */
+  useEffect(() => {
+    const quill = quillRef.current;
+    const toolbar = toolbarRef.current;
+
+    if (!quill || !block) {
+      toolbarControls(toolbar, true);
+      return;
+    }
+
+    const readOnly = block.read_only || !block.supported;
+    setQuillInteractiveState(quill, toolbar, readOnly);
+
+    if (readOnly) {
+      return;
+    }
+
+    const frame = window.requestAnimationFrame(() => {
+      if (quillRef.current !== quill || !quill.root.isConnected) {
+        return;
+      }
+
+      setQuillInteractiveState(quill, toolbarRef.current, false);
+
+      try {
+        quill.root.focus({ preventScroll: true });
+      } catch {
+        quill.root.focus();
+      }
+    });
+
+    return () => window.cancelAnimationFrame(frame);
   }, [block?.element_id, resetToken]);
 
   return (

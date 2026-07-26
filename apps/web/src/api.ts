@@ -141,6 +141,7 @@ export async function previewEdit(
   replacementText: string,
   sourceElementId?: string,
   includedElementIds?: string[],
+  signal?: AbortSignal,
 ): Promise<PreviewResponse> {
   const response = await fetch(`${API_URL}/document-sets/${documentSetId}/preview`, {
     method: "POST",
@@ -151,6 +152,7 @@ export async function previewEdit(
       source_element_id: sourceElementId,
       included_element_ids: includedElementIds,
     }),
+    signal,
   });
   return parseResponse<PreviewResponse>(response);
 }
@@ -161,6 +163,7 @@ export async function generateEdit(
   replacementText: string,
   sourceElementId?: string,
   includedElementIds?: string[],
+  signal?: AbortSignal,
 ): Promise<GenerationResponse> {
   const response = await fetch(`${API_URL}/document-sets/${documentSetId}/generate`, {
     method: "POST",
@@ -171,6 +174,7 @@ export async function generateEdit(
       source_element_id: sourceElementId,
       included_element_ids: includedElementIds,
     }),
+    signal,
   });
   return parseResponse<GenerationResponse>(response);
 }
