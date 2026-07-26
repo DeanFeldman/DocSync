@@ -5,22 +5,21 @@
 [![Latest release](https://img.shields.io/github/v/release/DeanFeldman/DocSync)](https://github.com/DeanFeldman/DocSync/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-Windows-0078D4)](#requirements)
 
-DocSync is a local-first Windows desktop application for safely coordinating edits
-across related Microsoft Word documents.
+DocSync is a local-first Windows desktop application for safely coordinating edits across related Microsoft Word documents.
 
-Upload a set of `.docx` files, work with supported content in a structured rich-text
-editor, compare exact and near matches, preview every target, and generate immutable
-new document versions. Original uploads are never overwritten.
+Upload a set of `.docx` files, inspect their Word layout, edit supported content in a structured rich-text editor, compare repeated wording across documents, preview every change, and generate new immutable document versions. Original uploads are never overwritten.
+
+---
 
 ## Download
 
 Download the latest Windows installer from the [GitHub Releases page](https://github.com/DeanFeldman/DocSync/releases/latest).
 
-Each release contains:
+A completed release contains:
 
-- `DocSync-Setup-<version>.exe` — the installer for a specific version.
-- `DocSync-Setup-latest.exe` — a copy of the newest installer.
-- `SHA256SUMS.txt` — SHA-256 checksums for verifying the downloads.
+- `DocSync-Setup-<version>.exe` — version-specific Windows installer
+- `DocSync-Setup-latest.exe` — copy of the newest installer
+- `SHA256SUMS.txt` — SHA-256 checksums for release verification
 
 For most users, download:
 
@@ -30,92 +29,141 @@ DocSync-Setup-latest.exe
 
 > The installer is not commercially code-signed yet, so Windows SmartScreen may display a warning.
 
-> The editable-document workspace described below is currently available in the
-> source build. The latest published installer remains `v1.2.1` until the next
-> release is tagged.
+---
 
-## Version 1.2.1
+## Version 1.3.0
 
-DocSync `v1.2.1` is a maintenance release focused on making large documents and table-heavy previews faster and more reliable.
+DocSync `v1.3.0` is an editor-stability and usability release.
 
 ### Improvements
 
-- Loads document preview pages progressively instead of rendering every page immediately.
-- Reduces database work when opening document sets containing many exact-match groups.
-- Keeps the total exact-match group count visible without loading every group into the initial response.
-- Improves table rendering when source tables use sparse row or column positions.
-- Uses browser content visibility to reduce the rendering cost of off-screen pages.
-- Preserves search navigation by loading the required page before scrolling to a result.
+- Makes the document workspace more compact so more document content remains visible.
+- Improves structured-editor recovery after API failures and failed document operations.
+- Keeps the editor usable after choosing **OK** or **Cancel** when changing blocks with an unpreviewed draft.
+- Adds dismissible error messages that do not block the rest of the workspace.
+- Adds visible **Undo** and **Redo** controls for the active block.
+- Prevents Quill toolbar controls from being duplicated after editor remounts.
+- Improves document-set search and result navigation.
+- Improves performance for large documents and table-heavy previews.
+- Supports editing of mapped top-level table cells.
+- Preserves safe versioning, preview-before-generation, and immutable document history.
+
+---
 
 ## Main features
 
 ### Document sets
 
-- Upload between 2 and 20 related `.docx` files as a document set.
+- Upload between 2 and 20 related `.docx` files.
 - Reopen saved document sets from the local workspace library.
 - Add documents to an existing set.
-- Remove individual documents or delete a complete set.
-- Search every occurrence across the current version of every document, grouped
-  by file with highlighted context and exact-result navigation.
+- Remove individual documents.
+- Delete a complete document set.
+- Search all current document versions from one search field.
+- Navigate directly to a matching document block.
+- View the number of files, elements, and exact-match groups.
 
 ### Layout, Edit, and Compare
 
-- **Layout** shows a read-only Microsoft Word-rendered preview when Word is
-  installed, with a structured fallback when rendering is unavailable.
-- **Edit** exposes supported headings, paragraphs, list items, and top-level table
-  cells as stable, version-scoped blocks.
-- **Compare** shows exact and near matches with similarity scores and word-level
-  difference spans.
-- The Quill 2 editor preserves supported bold, italic, underline, heading, list,
-  indentation, and alignment metadata.
-- Visible **Undo** and **Redo** controls apply to the active block's uncommitted
-  draft. Use `Ctrl+Z` to undo and `Ctrl+Y` or `Ctrl+Shift+Z` to redo
-  (`Command+Z` or `Command+Shift+Z` on macOS).
-- Draft history resets when another block or version opens. Undo and redo never
-  rewrite a generated document version.
-- One mapped Word block is edited at a time. The editor stays pinned at the top
-  while the document block list scrolls on desktop-sized screens.
+DocSync provides three document workspace modes.
 
-### Coordinated editing
+#### Layout
 
-- Find exact matches using Unicode NFKC normalisation, case folding, trimming,
-  whitespace collapsing, and element type.
-- Review bounded near-match candidates and explicitly confirm or ignore them.
-- Apply shared wording to exact matches, provide a distinct value for each selected
-  document, or override and detach only the source paragraph.
-- Include or exclude every eligible target before generation.
-- Preview the resolved result for every affected document without writing files or
-  database records.
-- Reject stale generation requests when a document changed after preview.
-- Write a confirmed batch atomically as new immutable document versions.
+- Displays a read-only Microsoft Word-rendered preview when Microsoft Word is available.
+- Uses a structured fallback when Word rendering is unavailable.
+- Preserves the original document as the authoritative layout reference.
 
-### Downloads and history
+#### Edit
 
-- Download the current document or any recorded version.
+- Exposes supported headings, paragraphs, list items, and top-level table cells as stable blocks.
+- Uses Quill 2 for structured rich-text editing.
+- Supports selected formatting metadata, including:
+  - bold
+  - italic
+  - underline
+  - heading levels
+  - ordered and unordered lists
+  - indentation
+  - alignment
+- Keeps one mapped Word block active at a time.
+- Provides visible Undo and Redo controls.
+- Prevents multiline paste, splitting, merging, and reordering where these operations could break document mapping.
+
+#### Compare
+
+- Finds exact wording matches across documents.
+- Finds bounded near-match candidates.
+- Shows similarity scores.
+- Displays word-level differences.
+- Requires explicit confirmation before near matches can be edited.
+- Lets the user include or exclude eligible targets.
+
+### Editing modes
+
+DocSync supports three controlled editing modes:
+
+1. **Shared wording**  
+   Apply the active draft to selected exact matches. Near matches remain protected unless explicitly confirmed.
+
+2. **Per-document values**  
+   Provide a different replacement value for each selected document target.
+
+3. **Whole-paragraph override**  
+   Change only the selected source block and detach it from shared updates.
+
+### Preview and generation
+
+- Preview the resolved result before writing any files.
+- Show every affected document and location.
+- Reject stale operations when a document changed after the editor was opened.
+- Generate changes atomically.
+- Create new immutable document versions.
+- Keep original uploads unchanged.
+- Continue editing from the newly generated current versions.
+
+### Downloads and version history
+
+- Download the current document.
+- Download any recorded document version.
 - Download the complete document set as a ZIP archive.
-- Download the output of an editor operation as a ZIP archive.
-- Inspect version lineage and the edit history for a document set.
-- Continue editing from newly generated current versions.
-- Restore any earlier version by copying its content into a new immutable current
-  version. The restored source, previously current version, and all other history
-  remain available.
+- Download generated operation output.
+- Inspect document version lineage.
+- Restore an earlier version by copying it into a new current version.
+- Keep the restored source version and all later history available.
+
+---
+
+## Safety model
+
+DocSync is designed around controlled document editing.
+
+- Original uploaded files are never overwritten.
+- Every supported editor block is mapped to a stored Word element.
+- Preview operations do not write new files or database records.
+- Confirmed edits create new versions rather than replacing history.
+- Generation requests use the same source versions that were previewed.
+- Stale edits are rejected when a document changes before generation.
+- Failed generation operations are rolled back.
+- Unsupported Word structures are preserved and shown as read-only.
+- Local error messages can be dismissed without disabling the editor.
+
+---
 
 ## How it works
 
-1. Create a document set and upload related Word files.
-2. Use **Layout** to inspect the Word document or **Edit** to select a supported
-   block.
-3. Edit that block with the pinned rich-text editor.
-4. Open **Compare** to review exact and near matches and their differences.
-5. Choose shared wording, per-document values, or a whole-paragraph override.
-6. Select every intended target and explicitly confirm any near matches.
-7. Preview the resolved output for every affected document.
-8. Generate new versions from the same base versions used by the preview.
-9. Download a version, the operation ZIP, or the current document set.
-10. When needed, restore an earlier version as a new current version without
-    deleting or relabelling existing history.
+1. Create a document set.
+2. Upload related Microsoft Word documents.
+3. Open a document in **Layout** or **Edit**.
+4. Select one supported block.
+5. Edit the block in the structured editor.
+6. Review exact and near matches in **Compare**.
+7. Choose the editing mode.
+8. Select the intended targets.
+9. Preview the complete result.
+10. Generate new immutable versions.
+11. Download or restore versions when needed.
 
-DocSync always keeps the original uploaded files unchanged.
+---
 
 ## Technology
 
@@ -130,12 +178,14 @@ DocSync always keeps the original uploaded files unchanged.
 
 The packaged Windows application includes the Electron runtime and the frozen Python backend. Installed users do not need Node.js, npm, Python, or developer tools.
 
+---
+
 ## Requirements
 
 ### Installed application
 
 - Windows 10 or Windows 11
-- Microsoft Word desktop is recommended for the high-fidelity layout preview
+- Microsoft Word desktop is recommended for high-fidelity layout preview
 
 Microsoft Word is not required for the structured fallback preview.
 
@@ -145,11 +195,13 @@ Microsoft Word is not required for the structured fallback preview.
 - Node.js 22 or newer
 - Python 3.11 or newer
 - npm
-- Microsoft Word desktop for the high-fidelity layout preview
+- Microsoft Word desktop for high-fidelity layout rendering
+
+---
 
 ## Configuration and local data
 
-The backend reads configuration from environment variables:
+The backend reads configuration from environment variables.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -161,9 +213,11 @@ The backend reads configuration from environment variables:
 | `DOCUMENTSYNC_NEAR_MATCH_CANDIDATE_LIMIT` | `25` | Maximum near-match candidates inspected |
 | `DOCUMENTSYNC_CORS_ORIGINS` | Local Vite origins | Allowed browser-development origins |
 
-See [`.env.example`](.env.example) for a local development template. Existing
-workspaces are upgraded and backfilled on backend startup; no manual migration
-command is required.
+See [`.env.example`](.env.example) for a local development template.
+
+Existing workspaces are upgraded and backfilled when the backend starts. No manual migration command is normally required.
+
+---
 
 ## Run locally
 
@@ -172,17 +226,18 @@ Run these commands from the repository root in Windows PowerShell:
 ```powershell
 cd "C:\path\to\DocSync"
 
-npm install
+npm.cmd install
 python -m pip install -r apps/api/requirements.txt
-npm test
-npm start
+
+npm.cmd test
+npm.cmd start
 ```
 
-`npm start` builds the React frontend, starts the local FastAPI service, and opens DocSync in an Electron window.
+`npm.cmd start` builds the React frontend, starts the local FastAPI service, and opens DocSync in an Electron window.
 
 ### PowerShell execution-policy error
 
-If PowerShell blocks `npm.ps1`, use `npm.cmd`:
+When PowerShell blocks `npm.ps1`, use `npm.cmd`:
 
 ```powershell
 npm.cmd install
@@ -196,19 +251,23 @@ Alternatively, allow scripts only for the current PowerShell session:
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 ```
 
+---
+
 ## Run the frontend and backend separately
 
 ### Backend
 
 ```powershell
 cd apps/api
+
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
+
 python -m pip install -r requirements.txt
 python -m uvicorn app.main:app --reload --port 8001
 ```
 
-FastAPI documentation is then available at:
+FastAPI documentation is available at:
 
 ```text
 http://localhost:8001/docs
@@ -220,8 +279,9 @@ Open another terminal:
 
 ```powershell
 cd apps/web
-npm install
-npm run dev
+
+npm.cmd install
+npm.cmd run dev
 ```
 
 Then open:
@@ -230,15 +290,17 @@ Then open:
 http://localhost:5173
 ```
 
-## Tests
+---
+
+## Testing
 
 Run all tests from the repository root:
 
 ```powershell
-npm test
+npm.cmd test
 ```
 
-Run the backend tests directly:
+Run backend tests directly:
 
 ```powershell
 python -m pip install -r apps/api/requirements.txt
@@ -248,27 +310,24 @@ python -m pytest apps/api
 Build-check the frontend:
 
 ```powershell
-npm run build:web
+npm.cmd run build:web
 ```
 
-The editor acceptance suite covers rich Delta extraction, exact and near matching,
-persisted decisions, preview side-effect safety, immutable version lineage,
-per-document generation, full-override detachment, stale-version conflicts, and
-generation rollback.
+---
 
 ## Build the Windows installer
 
-Install the build requirements:
+Install build requirements:
 
 ```powershell
 python -m pip install -r apps/api/requirements-build.txt
-npm install
+npm.cmd install
 ```
 
 Build the installer:
 
 ```powershell
-npm run dist:win
+npm.cmd run dist:win
 ```
 
 The installer is written to:
@@ -285,41 +344,46 @@ release/v1/win-unpacked/
 
 Do not commit the `release/` directory. Installer files belong on the GitHub Releases page.
 
+---
+
 ## Release process
 
-The release workflow runs whenever a tag beginning with `v` is pushed. It reads the application version from the tag, so the source `package.json` version does not need to be changed manually before every release.
+The release workflow runs whenever a tag beginning with `v` is pushed.
+
+The workflow reads the application version from the Git tag, so the source `package.json` version does not need to be changed manually for each release.
 
 ### Create a release
 
 From the repository root:
 
 ```powershell
-$version = "1.3.0" # Choose the next unused semantic version.
+$version = "1.3.0"
 
 git switch main
 git pull origin main
 git status
 
-npm ci
+npm.cmd ci
 python -m pip install -r apps/api/requirements-build.txt
-npm test
+npm.cmd test
 
 git tag -a "v$version" -m "DocSync v$version"
 git push origin "v$version"
 ```
 
-After the tag is pushed, open the repository's **Actions** tab and follow the **DocSync release** workflow.
+After pushing the tag, open the repository **Actions** tab and follow the **DocSync release** workflow.
 
 The workflow will:
 
-1. Check out the tagged source code.
-2. Install the Node.js and Python dependencies.
+1. Check out the tagged source.
+2. Install Node.js and Python dependencies.
 3. Set the package version from the Git tag.
-4. Run the automated tests.
+4. Run automated tests.
 5. Build the Windows installer.
-6. Create the `DocSync-Setup-latest.exe` copy.
+6. Create `DocSync-Setup-latest.exe`.
 7. Generate `SHA256SUMS.txt`.
-8. Create the GitHub Release and upload all release files.
+8. Create the GitHub Release.
+9. Upload the installer and checksum files.
 
 Before announcing the release, confirm that it contains:
 
@@ -329,22 +393,18 @@ DocSync-Setup-latest.exe
 SHA256SUMS.txt
 ```
 
-The workflow is defined in:
-
-```text
-.github/workflows/release.yml
-```
-
 Use semantic version tags:
 
 ```text
 v1.0.0  Initial stable release
-v1.1.0  Backwards-compatible features
-v1.1.1  Backwards-compatible fixes
-v2.0.0  Breaking changes
+v1.1.0  Backwards-compatible feature release
+v1.1.1  Backwards-compatible fix release
+v2.0.0  Breaking release
 ```
 
-Do not reuse or move a published version tag. Create a new tag for every release.
+Do not reuse or move a published release tag.
+
+---
 
 ## Project structure
 
@@ -352,132 +412,126 @@ Do not reuse or move a published version tag. Create a new tag for every release
 DocSync/
 ├── .github/
 │   └── workflows/
-│       ├── phase3-desktop.yml     Test and installer build workflow
-│       └── release.yml            Tag-triggered GitHub Release workflow
+│       ├── phase3-desktop.yml
+│       └── release.yml
 ├── apps/
-│   ├── api/                       FastAPI, version model, matching, and DOCX engine
-│   ├── desktop/                   Electron application lifecycle
-│   ├── web/                       React, TypeScript, and Quill editor
-│   ├── desktop-ui/                Retained architecture prototype
-│   └── template-api/              Retained template-engine prototype
+│   ├── api/
+│   ├── desktop/
+│   ├── web/
+│   ├── desktop-ui/
+│   └── template-api/
 ├── build/
-│   ├── icon.ico                   Windows installer and application icon
-│   └── icon.png                   Development-window icon
+│   ├── icon.ico
+│   └── icon.png
 ├── docs/
-│   ├── adr/                       Architecture decision records
+│   ├── adr/
 │   └── editable-document-editor.md
 ├── package.json
 ├── package-lock.json
 └── README.md
 ```
 
-## Core API endpoints
+---
 
-Workspace and rendering:
+## Core API areas
 
-```text
-GET    /api/health
-GET    /api/document-sets
-POST   /api/document-sets
-GET    /api/document-sets/{document_set_id}
-DELETE /api/document-sets/{document_set_id}
-POST   /api/document-sets/{document_set_id}/documents
-DELETE /api/document-sets/{document_set_id}/documents/{document_id}
-GET    /api/document-sets/{document_set_id}/search
-POST   /api/documents/{document_id}/render
-GET    /api/document-versions/{version_id}/pages
-GET    /api/document-versions/{version_id}/rendered-file
-GET    /api/documents/{document_id}/download
-GET    /api/document-sets/{document_set_id}/history
-```
+The local backend provides endpoints for:
 
-Structured editor, matching, and versioning:
+- health checks
+- document-set management
+- document upload and deletion
+- document rendering
+- structured editor content
+- exact and near matching
+- comparison decisions
+- preview operations
+- version generation
+- downloads
+- version history
+- version restoration
+- global search
 
-```text
-GET    /api/document-versions/{version_id}/editor-content
-GET    /api/document-elements/{element_id}/matches
-GET    /api/document-elements/{element_id}/similar-matches
-POST   /api/document-elements/{element_id}/compare
-POST   /api/document-elements/{element_id}/match-decisions
-POST   /api/document-sets/{document_set_id}/editor-preview
-POST   /api/document-sets/{document_set_id}/editor-generate
-GET    /api/documents/{document_id}/versions
-POST   /api/documents/{document_id}/versions/{target_version_id}/restore
-GET    /api/document-versions/{version_id}/download
-GET    /api/editor-operations/{operation_id}/download
-```
-
-Compatibility endpoints retained for the original exact-match client:
+Open the local FastAPI documentation during development for the complete current endpoint list:
 
 ```text
-POST   /api/document-sets/{document_set_id}/preview
-POST   /api/document-sets/{document_set_id}/generate
-GET    /api/generations/{generation_id}/download
+http://localhost:8001/docs
 ```
 
-For the version model, editor contract, and supported-content boundary, see
-[Editable document editor](docs/editable-document-editor.md).
+---
 
-## Current limitations
+## Known limitations
 
-- Layout is read-only, and direct block selection happens in Edit rather than over
-  the Word-rendered page.
-- Microsoft Word must be installed for high-fidelity layout rendering.
-- Exactly one stable block is edited at a time. Insertion, deletion, split, merge,
-  reorder, Enter-created blocks, and multi-line paste are intentionally disabled.
-- Editable content is limited to supported paragraphs, headings, list items, and
-  non-empty top-level table cells with a stable write-back location.
-- Nested or complex merged tables, headers, footers, comments, tracked changes,
-  text boxes, fields, footnotes, endnotes, shapes, and similar advanced Word
-  structures are read-only or diagnostic-only.
-- Supported Quill formatting is limited to headings, ordered and unordered lists,
-  indentation, alignment, bold, italic, and underline. Other mixed or advanced
-  formatting is preserved only where the block is not rewritten.
-- Shared wording applies to exact matches. A confirmed near match must use
-  per-document mode so branch-specific wording is not erased accidentally.
-- The application is local-only and does not include organisation authentication
-  or cloud storage.
-- The Windows installer is not commercially code-signed and may trigger a
-  Microsoft SmartScreen warning.
+- The packaged desktop release currently targets Windows.
+- High-fidelity layout rendering works best when Microsoft Word desktop is installed.
+- Some Word structures remain read-only.
+- Direct selection of text from the rendered Word layout is not yet available.
+- Authentication, PostgreSQL, hosted cloud storage, and multi-device synchronisation are not yet part of the local desktop release.
+- The Windows installer is not yet commercially code-signed.
+
+---
 
 ## Roadmap
 
-Planned future improvements for DocSync include:
+Planned work includes:
 
-- Add direct element selection within the Microsoft Word layout preview.
-- Expand safe editing support to more complex Word structures.
-- Improve application security, file validation, error handling, and protection
-  of locally stored documents.
-- Add support for Linux and macOS where technically possible.
-- Add user authentication for a future hosted version.
-- Migrate from SQLite to PostgreSQL for hosted deployments.
-- Add secure cloud storage and document synchronisation for a future hosted
-  version.
-- Establish an update channel for maintained online distribution.
+- Direct element selection from the Word layout preview
+- Broader editing support for complex Word structures
+- Stronger file validation and local document protection
+- Linux and macOS support
+- Hosted authentication
+- PostgreSQL support for hosted deployments
+- Secure cloud storage and synchronisation
+- Automatic desktop update channels
 
-## Safety model
+---
 
-DocSync is designed around explicit confirmation:
+## Contributing
 
-- Original uploads are immutable.
-- Layout remains the visual source of truth for unsupported Word content.
-- Exact matches are reviewable; near matches are never automatic targets and their
-  decisions are persisted against version-specific element pairs.
-- Preview is side-effect free: it creates no files, versions, or operation records.
-- Users choose every target and review the resolved output before generation.
-- Generation requires the same base version IDs used for preview and returns
-  `409 Conflict` if a document head is stale.
-- Undo and redo are limited to the active block's uncommitted editor history.
-  Reversing a committed document state uses version restoration instead.
-- Restoration requires the expected current version ID and returns `409 Conflict`
-  without creating anything if the document head is stale. A successful restore
-  creates a new version and an auditable `version_restore` operation linking the
-  restored-from version, the previously current version, and the new result.
-- DOCX files are staged and validated before the database transaction advances any
-  document heads. A failed batch is rolled back and staged output is removed.
-- Every successful edit creates new document versions with parent lineage and an
-  auditable editor operation.
+1. Create a branch from `main`.
+2. Make one focused change.
+3. Run the full test suite.
+4. Build-check the frontend.
+5. Open a pull request.
+6. Do not commit generated installers, local databases, uploads, or secrets.
 
-## Licence
+Example:
 
-The project is currently marked as `UNLICENSED`. No permission is granted to copy, modify, or distribute the source code unless a licence is added later.
+```powershell
+git switch main
+git pull origin main
+git switch -c fix/example-change
+
+npm.cmd test
+npm.cmd run build:web
+
+git add .
+git commit -m "fix: describe the change"
+git push -u origin fix/example-change
+```
+
+---
+
+## Security
+
+Do not commit:
+
+- API keys
+- passwords
+- tokens
+- private certificates
+- production environment files
+- user documents
+- local databases
+- generated release installers
+
+Use environment variables and `.env.example` for local configuration templates.
+
+Report suspected exposed credentials immediately and rotate any real secret that entered Git history.
+
+---
+
+## License
+
+This repository is currently marked as `UNLICENSED`.
+
+Copyright © Dean Feldman.
