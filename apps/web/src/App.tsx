@@ -1050,7 +1050,9 @@ const canUpload = files.length >= 2 && !busyAction;
               <p>Choose 2–20 DOCX files. Exact repeated paragraphs are linked automatically.</p>
             </div>
 
-            {error && <ErrorAlert message={error} />}
+            {error && (
+              <ErrorAlert message={error} onDismiss={() => setError("")} />
+            )}
 
 <form
   className="upload-panel"
@@ -1372,7 +1374,9 @@ const canUpload = files.length >= 2 && !busyAction;
             </div>
           </section>
 
-          {error && <ErrorAlert message={error} />}
+          {error && (
+            <ErrorAlert message={error} onDismiss={() => setError("")} />
+          )}
 
           <div className="document-workspace">
             <aside className="file-rail" aria-labelledby="files-title">
@@ -1697,8 +1701,27 @@ const canUpload = files.length >= 2 && !busyAction;
   );
 }
 
-function ErrorAlert({ message }: { message: string }) {
-  return <div className="alert error-alert" role="alert"><strong>Something went wrong.</strong><span>{message}</span></div>;
+function ErrorAlert({
+  message,
+  onDismiss,
+}: {
+  message: string;
+  onDismiss: () => void;
+}) {
+  return (
+    <div className="alert error-alert" role="alert">
+      <strong>Something went wrong.</strong>
+      <span>{message}</span>
+      <button
+        type="button"
+        onClick={onDismiss}
+        aria-label="Dismiss error message"
+        title="Dismiss"
+      >
+        ×
+      </button>
+    </div>
+  );
 }
 
 function LoadingState({ label, compact = false }: { label: string; compact?: boolean }) {

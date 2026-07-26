@@ -418,6 +418,90 @@ function normaliseVersions(
   };
 }
 
+function DiscardDraftDialog({
+  onConfirm,
+  onCancel,
+}: {
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const cancelRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    const focusFrame = window.requestAnimationFrame(() => {
+      cancelRef.current?.focus();
+    });
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onCancel();
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.cancelAnimationFrame(focusFrame);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [onCancel]);
+
+  return (
+    <div
+      className="modal-backdrop"
+      role="presentation"
+      onMouseDown={(event) => {
+        if (event.currentTarget === event.target) {
+          onCancel();
+        }
+      }}
+    >
+      <section
+        className="preview-dialog discard-draft-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="discard-draft-title"
+        aria-describedby="discard-draft-description"
+      >
+        <header className="preview-dialog-header">
+          <div>
+            <p className="eyebrow">Unsaved editor draft</p>
+            <h2 id="discard-draft-title">Discard the current draft?</h2>
+            <p id="discard-draft-description">
+              Choose OK to open the selected block and discard the current
+              unpreviewed draft. Choose Cancel to keep editing the current
+              block.
+            </p>
+          </div>
+        </header>
+        <footer className="preview-dialog-footer">
+          <div>
+            <strong>No files have been changed</strong>
+            <span>This only affects the draft currently shown in the editor.</span>
+          </div>
+          <div>
+            <button
+              ref={cancelRef}
+              type="button"
+              className="quiet-button"
+              onClick={onCancel}
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              className="primary-button"
+              onClick={onConfirm}
+            >
+              OK
+            </button>
+          </div>
+        </footer>
+      </section>
+    </div>
+  );
+}
+
 function PreviewDialog({
   preview,
   onClose,
@@ -588,6 +672,8 @@ export default function DocumentExperience({
   const [selectedElementId, setSelectedElementId] = useState("");
   const [draft, setDraft] = useState<QuillDraft | null>(null);
   const [editorResetToken, setEditorResetToken] = useState(0);
+  const [pendingBlockSelection, setPendingBlockSelection] =
+    useState<EditorBlock | null>(null);
   const [matches, setMatches] = useState<EditorMatch[]>([]);
   const [matchStatus, setMatchStatus] =
     useState<LoadingStatus>("idle");
@@ -627,6 +713,8 @@ export default function DocumentExperience({
   const contentRequestRef = useRef(0);
   const layoutRequestRef = useRef(0);
   const matchRequestRef = useRef(0);
+  const editorActionRequestRef = useRef(0);
+  const editorActionAbortRef = useRef<AbortController | null>(null);
 
   activeDocumentIdRef.current = document?.id ?? "";
   if (documentContextRef.current.documentId !== activeDocumentIdRef.current) {
@@ -641,6 +729,9 @@ export default function DocumentExperience({
     return () => {
       mountedRef.current = false;
       documentContextRef.current.token += 1;
+      editorActionRequestRef.current += 1;
+      editorActionAbortRef.current?.abort();
+      editorActionAbortRef.current = null;
     };
   }, []);
 
@@ -682,6 +773,8 @@ export default function DocumentExperience({
     setRestoreNotice("");
     setRestoreError("");
     setRestoringVersionId("");
+    setLocalError("");
+    setPendingBlockSelection(null);
   }, [document?.id]);
 
   useEffect(() => {
@@ -694,7 +787,6 @@ export default function DocumentExperience({
     const requestId = ++contentRequestRef.current;
     const controller = new AbortController();
     setContentStatus("loading");
-    setLocalError("");
     setLayoutView(null);
     setLayoutStatus("idle");
     setSelectedElementId("");
@@ -706,6 +798,7 @@ export default function DocumentExperience({
     setLastGeneration(null);
 
     async function loadContent() {
+      let loaded = false;
       const requestedVersionId =
         versions?.document_id === document!.id
           ? versions.current_version_id
@@ -717,43 +810,47 @@ export default function DocumentExperience({
         );
         if (requestId !== contentRequestRef.current) return;
         setEditorContent(normaliseEditorContent(response, document!));
-        setContentStatus("ready");
+        loaded = true;
       } catch (error) {
         if (controller.signal.aborted) return;
         if (!isUnavailable(error)) {
           if (requestId !== contentRequestRef.current) return;
-          setContentStatus("error");
           setLocalError(
             `${document!.name}: ${errorMessage(
               error,
               "Editor content could not be loaded.",
             )}`,
           );
-          return;
+        } else {
+          try {
+            const compatibleView =
+              refreshToken === 0 &&
+              fallbackView?.document_id === document!.id
+                ? fallbackView
+                : await fetchDocumentView(
+                    requestedVersionId,
+                    controller.signal,
+                  );
+            if (requestId !== contentRequestRef.current) return;
+            setEditorContent(editorContentFromView(compatibleView, document!));
+            loaded = true;
+          } catch (fallbackError) {
+            if (controller.signal.aborted) return;
+            if (requestId !== contentRequestRef.current) return;
+            setLocalError(
+              `${document!.name}: ${errorMessage(
+                fallbackError,
+                "The structured editor could not open.",
+              )}`,
+            );
+          }
         }
-
-        try {
-          const compatibleView =
-            refreshToken === 0 &&
-            fallbackView?.document_id === document!.id
-              ? fallbackView
-              : await fetchDocumentView(
-                  requestedVersionId,
-                  controller.signal,
-                );
-          if (requestId !== contentRequestRef.current) return;
-          setEditorContent(editorContentFromView(compatibleView, document!));
-          setContentStatus("ready");
-        } catch (fallbackError) {
-          if (controller.signal.aborted) return;
-          if (requestId !== contentRequestRef.current) return;
-          setContentStatus("error");
-          setLocalError(
-            `${document!.name}: ${errorMessage(
-              fallbackError,
-              "The structured editor could not open.",
-            )}`,
-          );
+      } finally {
+        if (
+          !controller.signal.aborted &&
+          requestId === contentRequestRef.current
+        ) {
+          setContentStatus(loaded ? "ready" : "error");
         }
       }
     }
@@ -862,6 +959,7 @@ export default function DocumentExperience({
     setVersionStatus("loading");
 
     async function loadVersions() {
+      let finalStatus: LoadingStatus = "ready";
       try {
         const response = await fetchDocumentVersions(
           document!.id,
@@ -870,12 +968,15 @@ export default function DocumentExperience({
         if (controller.signal.aborted) return;
         setVersions(normaliseVersions(response, document!));
         setVersionApiAvailable(true);
-        setVersionStatus("ready");
       } catch (error) {
         if (controller.signal.aborted) return;
         setVersions(fallbackVersions(document!, editorContent));
         setVersionApiAvailable(false);
-        setVersionStatus(isMissingFeature(error) ? "ready" : "error");
+        finalStatus = isMissingFeature(error) ? "ready" : "error";
+      } finally {
+        if (!controller.signal.aborted) {
+          setVersionStatus(finalStatus);
+        }
       }
     }
 
@@ -904,9 +1005,9 @@ export default function DocumentExperience({
     const requestId = ++layoutRequestRef.current;
     const controller = new AbortController();
     setLayoutStatus("loading");
-    setLocalError("");
 
     async function loadLayout() {
+      let loaded = false;
       try {
         const response = await renderDocumentView(
           document!.id,
@@ -915,7 +1016,7 @@ export default function DocumentExperience({
         );
         if (requestId !== layoutRequestRef.current) return;
         setLayoutView(response);
-        setLayoutStatus("ready");
+        loaded = true;
       } catch (error) {
         if (controller.signal.aborted) return;
         if (requestId !== layoutRequestRef.current) return;
@@ -926,19 +1027,26 @@ export default function DocumentExperience({
           );
           if (requestId !== layoutRequestRef.current) return;
           setLayoutView(fallback);
-          setLayoutStatus("ready");
+          loaded = true;
           setLocalError(
             `${document!.name}: Word layout was unavailable, so a structured read-only fallback is shown.`,
           );
         } catch (fallbackError) {
           if (controller.signal.aborted) return;
-          setLayoutStatus("error");
+          if (requestId !== layoutRequestRef.current) return;
           setLocalError(
             `${document!.name}: ${errorMessage(
               fallbackError,
               "The layout preview could not open.",
             )}`,
           );
+        }
+      } finally {
+        if (
+          !controller.signal.aborted &&
+          requestId === layoutRequestRef.current
+        ) {
+          setLayoutStatus(loaded ? "ready" : "error");
         }
       }
     }
@@ -964,44 +1072,44 @@ export default function DocumentExperience({
     const requestId = ++matchRequestRef.current;
     const controller = new AbortController();
     setMatchStatus("loading");
-    setLocalError("");
     setMatches([]);
     setLegacyDiscovery(null);
 
     async function loadMatches() {
-      const [exactResult, similarResult] = await Promise.allSettled([
-        fetchElementMatches(selectedBlock!.element_id, controller.signal),
-        fetchSimilarMatches(selectedBlock!.element_id, controller.signal),
-      ]);
-      if (
-        controller.signal.aborted ||
-        requestId !== matchRequestRef.current
-      ) {
-        return;
-      }
+      try {
+        const [exactResult, similarResult] = await Promise.allSettled([
+          fetchElementMatches(selectedBlock!.element_id, controller.signal),
+          fetchSimilarMatches(selectedBlock!.element_id, controller.signal),
+        ]);
+        if (
+          controller.signal.aborted ||
+          requestId !== matchRequestRef.current
+        ) {
+          return;
+        }
 
-      const source: EditorMatch = {
-        element_id: selectedBlock!.element_id,
-        document_id: selectedBlock!.document_id,
-        document_name: document?.name ?? "Current document",
-        version_id: selectedBlock!.version_id,
-        paragraph_index: selectedBlock!.paragraph_index,
-        element_type: selectedBlock!.element_type,
-        text: selectedBlock!.text,
-        style_name: selectedBlock!.style_name,
-        match_type: "source",
-        similarity_score: 1,
-        decision: "confirmed",
-        difference_spans: [
-          { text: selectedBlock!.text, kind: "shared" },
-        ],
-        table_index: selectedBlock!.table_index,
-        row_index: selectedBlock!.row_index,
-        column_index: selectedBlock!.column_index,
-      };
-      const byId = new Map<string, EditorMatch>([
-        [source.element_id, source],
-      ]);
+        const source: EditorMatch = {
+          element_id: selectedBlock!.element_id,
+          document_id: selectedBlock!.document_id,
+          document_name: document?.name ?? "Current document",
+          version_id: selectedBlock!.version_id,
+          paragraph_index: selectedBlock!.paragraph_index,
+          element_type: selectedBlock!.element_type,
+          text: selectedBlock!.text,
+          style_name: selectedBlock!.style_name,
+          match_type: "source",
+          similarity_score: 1,
+          decision: "confirmed",
+          difference_spans: [
+            { text: selectedBlock!.text, kind: "shared" },
+          ],
+          table_index: selectedBlock!.table_index,
+          row_index: selectedBlock!.row_index,
+          column_index: selectedBlock!.column_index,
+        };
+        const byId = new Map<string, EditorMatch>([
+          [source.element_id, source],
+        ]);
 
       if (exactResult.status === "fulfilled") {
         setLegacyDiscovery(exactResult.value);
@@ -1135,10 +1243,62 @@ export default function DocumentExperience({
           nextMatches.map((match) => [match.element_id, match.text]),
         ),
       );
-      setMatchStatus("ready");
+      } catch (error) {
+        if (
+          !controller.signal.aborted &&
+          requestId === matchRequestRef.current
+        ) {
+          setLocalError(
+            `${document?.name ?? "Document"} · ${locationLabel(
+              selectedBlock!,
+            )}: ${errorMessage(
+              error,
+              "Related blocks could not be loaded.",
+            )}`,
+          );
+        }
+      } finally {
+        if (
+          !controller.signal.aborted &&
+          requestId === matchRequestRef.current
+        ) {
+          setMatchStatus("ready");
+        }
+      }
     }
 
-    void loadMatches();
+    // DOCSYNC_MATCH_REQUEST_FINALLY_V2
+    void loadMatches()
+      .catch((error) => {
+        if (
+          controller.signal.aborted ||
+          requestId !== matchRequestRef.current
+        ) {
+          return;
+        }
+
+        setMatchStatus("error");
+        setLocalError(
+          `${document?.name ?? "Document"} · ${locationLabel(
+            selectedBlock!,
+          )}: ${errorMessage(
+            error,
+            "Related blocks could not be loaded.",
+          )}`,
+        );
+      })
+      .finally(() => {
+        if (
+          controller.signal.aborted ||
+          requestId !== matchRequestRef.current
+        ) {
+          return;
+        }
+
+        setMatchStatus((current) =>
+          current === "loading" ? "ready" : current,
+        );
+      });
     return () => controller.abort();
   }, [document?.name, selectedBlock?.element_id]);
 
@@ -1173,27 +1333,140 @@ export default function DocumentExperience({
     setWorkspaceMode(WORKSPACE_MODES[nextIndex].id);
   }
 
-  function selectBlock(
-    block: EditorBlock,
-    skipDiscardConfirmation = false,
-  ) {
-    if (
-      !skipDiscardConfirmation &&
-      block.element_id !== selectedElementId &&
-      (dirty || perDocumentDirty) &&
-      !window.confirm("Discard the current unpreviewed editor draft?")
-    ) {
-      return;
-    }
+  function focusEditorForElement(elementId: string) {
+    const attemptFocus = () => {
+      const editor = Array.from(
+        window.document.querySelectorAll<HTMLElement>(
+          ".quill-editor-host .ql-editor[data-editor-element-id]",
+        ),
+      ).find(
+        (candidate) => candidate.dataset.editorElementId === elementId,
+      );
+
+      if (!editor) {
+        return false;
+      }
+
+      editor.closest(".ql-container")?.classList.remove("ql-disabled");
+      editor.classList.remove("ql-disabled");
+      editor.setAttribute("contenteditable", "true");
+      editor.removeAttribute("aria-disabled");
+      editor.removeAttribute("aria-readonly");
+      editor.removeAttribute("inert");
+      editor.style.pointerEvents = "auto";
+
+      try {
+        editor.focus({ preventScroll: true });
+      } catch {
+        editor.focus();
+      }
+
+      return true;
+    };
+
+    /*
+     * DOCSYNC_DIALOG_EDITOR_RECOVERY_V5
+     *
+     * The former native window.confirm blocked Electron's renderer and could
+     * leave Quill's selection manager stale. The in-app dialog no longer
+     * blocks the renderer, but the editor is still remounted and recovered
+     * after either OK or Cancel.
+     */
+    window.setTimeout(() => {
+      window.requestAnimationFrame(() => {
+        if (attemptFocus()) {
+          return;
+        }
+
+        window.requestAnimationFrame(() => {
+          attemptFocus();
+        });
+      });
+    }, 0);
+  }
+
+  function activateSelectedBlock(block: EditorBlock) {
+    matchRequestRef.current += 1;
+    editorActionRequestRef.current += 1;
+    editorActionAbortRef.current?.abort();
+    editorActionAbortRef.current = null;
+
+    setPendingBlockSelection(null);
     setSelectedElementId(block.element_id);
     setDraft({ delta: block.delta, text: block.text });
-    setEditorResetToken((current) => current + 1);
+    setMatches([]);
+    setMatchStatus("idle");
+    setLegacyDiscovery(null);
+    setIncludedElementIds(new Set());
+    setTargetReplacements({});
     setEditMode("shared");
     setPreview(null);
     setPreviewOpen(false);
     setPreviewSignature("");
+    setAction(null);
     setLocalError("");
-    if (block.supported && !block.read_only) setMode("edit");
+    setRestoreError("");
+    setEditorResetToken((current) => current + 1);
+
+    if (block.supported && !block.read_only) {
+      setMode("edit");
+      focusEditorForElement(block.element_id);
+    }
+  }
+
+  function selectBlock(
+    block: EditorBlock,
+    skipDiscardConfirmation = false,
+  ) {
+    const changingBlock = block.element_id !== selectedElementId;
+
+    if (!changingBlock) {
+      if (block.supported && !block.read_only) {
+        setMode("edit");
+        setEditorResetToken((current) => current + 1);
+        focusEditorForElement(block.element_id);
+      }
+      return;
+    }
+
+    if (
+      !skipDiscardConfirmation &&
+      (dirty || perDocumentDirty)
+    ) {
+      setPendingBlockSelection(block);
+      return;
+    }
+
+    activateSelectedBlock(block);
+  }
+
+  function confirmPendingBlockSelection() {
+    const block = pendingBlockSelection;
+    if (!block) {
+      return;
+    }
+
+    activateSelectedBlock(block);
+  }
+
+  function cancelPendingBlockSelection() {
+    const currentElementId = selectedElementId;
+
+    setPendingBlockSelection(null);
+    setAction(null);
+    setLocalError("");
+    setRestoreError("");
+
+    if (!currentElementId) {
+      return;
+    }
+
+    /*
+     * Cancel keeps the current draft, but forces a fresh Quill instance so the
+     * editor is immediately clickable after the confirmation dialog closes.
+     */
+    setEditorResetToken((current) => current + 1);
+    focusEditorForElement(currentElementId);
   }
 
   function handleDraftChange(nextDraft: QuillDraft) {
@@ -1415,13 +1688,22 @@ export default function DocumentExperience({
 
   async function handlePreview() {
     if (!operation || !selectedBlock) return;
+    editorActionAbortRef.current?.abort();
+    const requestId = ++editorActionRequestRef.current;
+    const controller = new AbortController();
+    editorActionAbortRef.current = controller;
     setAction("preview");
     setLocalError("");
     try {
       let result: EditorPreviewResponse;
       try {
-        result = await previewEditorEdit(documentSet.id, operation);
+        result = await previewEditorEdit(
+          documentSet.id,
+          operation,
+          controller.signal,
+        );
       } catch (error) {
+        if (controller.signal.aborted) return;
         if (
           !isMissingFeature(error) ||
           editMode !== "shared" ||
@@ -1436,14 +1718,27 @@ export default function DocumentExperience({
             draft?.text ?? "",
             selectedBlock.element_id,
             operation.targets.map((target) => target.element_id),
+            controller.signal,
           ),
           editMode,
         );
+      }
+      if (
+        controller.signal.aborted ||
+        requestId !== editorActionRequestRef.current
+      ) {
+        return;
       }
       setPreview(result);
       setPreviewOpen(true);
       setPreviewSignature(operationSignature);
     } catch (error) {
+      if (
+        controller.signal.aborted ||
+        requestId !== editorActionRequestRef.current
+      ) {
+        return;
+      }
       if (error instanceof ApiError && error.status === 409) {
         setLocalError(
           `${document?.name ?? "Document"} changed since this editor opened. The latest version is being reloaded; review the block again before previewing.`,
@@ -1457,19 +1752,33 @@ export default function DocumentExperience({
         );
       }
     } finally {
-      setAction(null);
+      if (requestId === editorActionRequestRef.current) {
+        if (editorActionAbortRef.current === controller) {
+          editorActionAbortRef.current = null;
+        }
+        setAction(null);
+      }
     }
   }
 
   async function handleGenerate() {
     if (!operation || !selectedBlock || !canGenerate) return;
+    editorActionAbortRef.current?.abort();
+    const requestId = ++editorActionRequestRef.current;
+    const controller = new AbortController();
+    editorActionAbortRef.current = controller;
     setAction("generate");
     setLocalError("");
     try {
       let result: EditorGenerationResponse;
       try {
-        result = await generateEditorEdit(documentSet.id, operation);
+        result = await generateEditorEdit(
+          documentSet.id,
+          operation,
+          controller.signal,
+        );
       } catch (error) {
+        if (controller.signal.aborted) return;
         if (
           !isMissingFeature(error) ||
           editMode !== "shared" ||
@@ -1483,6 +1792,7 @@ export default function DocumentExperience({
           draft?.text ?? "",
           selectedBlock.element_id,
           operation.targets.map((target) => target.element_id),
+          controller.signal,
         );
         result = {
           generation_id: compatible.generation_id,
@@ -1491,6 +1801,12 @@ export default function DocumentExperience({
           document_set: compatible.document_set,
           files: compatible.files,
         };
+      }
+      if (
+        controller.signal.aborted ||
+        requestId !== editorActionRequestRef.current
+      ) {
+        return;
       }
 
       setLastGeneration(result);
@@ -1504,6 +1820,12 @@ export default function DocumentExperience({
       setIncludedElementIds(new Set());
       setRefreshToken((current) => current + 1);
     } catch (error) {
+      if (
+        controller.signal.aborted ||
+        requestId !== editorActionRequestRef.current
+      ) {
+        return;
+      }
       if (error instanceof ApiError && error.status === 409) {
         setLocalError(
           `${document?.name ?? "Document"} changed before generation. No version was created. The latest version is being reloaded.`,
@@ -1520,8 +1842,18 @@ export default function DocumentExperience({
         );
       }
     } finally {
-      setAction(null);
+      if (requestId === editorActionRequestRef.current) {
+        if (editorActionAbortRef.current === controller) {
+          editorActionAbortRef.current = null;
+        }
+        setAction(null);
+      }
     }
+  }
+
+  function dismissEditorError() {
+    setRestoreError("");
+    setLocalError("");
   }
 
   if (!document) {
@@ -1791,6 +2123,14 @@ export default function DocumentExperience({
           <div className="editor-inline-error" role="alert">
             <strong>Action needed</strong>
             <span>{restoreError || localError}</span>
+            <button
+              type="button"
+              onClick={dismissEditorError}
+              aria-label="Dismiss error message"
+              title="Dismiss"
+            >
+              ×
+            </button>
           </div>
         )}
 
@@ -1877,7 +2217,9 @@ export default function DocumentExperience({
             hidden={mode !== "edit"}
             className="editor-mode-panel edit-mode-panel"
           >
+            {/* DOCSYNC_QUILL_REMOUNT_V2 */}
             <QuillBlockEditor
+              key={`${selectedBlock?.element_id ?? "empty"}:${editorResetToken}`}
               block={selectedBlock}
               value={draft?.delta ?? null}
               resetToken={editorResetToken}
@@ -2454,6 +2796,13 @@ export default function DocumentExperience({
           </>
         )}
       </aside>
+
+      {pendingBlockSelection && (
+        <DiscardDraftDialog
+          onConfirm={confirmPendingBlockSelection}
+          onCancel={cancelPendingBlockSelection}
+        />
+      )}
 
       {preview && previewOpen && (
         <PreviewDialog
