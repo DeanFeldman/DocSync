@@ -6,6 +6,12 @@ const path = require("node:path");
 const MAX_OUTPUTS = 100;
 const MAX_CONTENT_CHARACTERS = 1_000_000;
 
+const WINDOWS_RESERVED = new Set([
+  "CON", "PRN", "AUX", "NUL",
+  "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+  "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+]);
+
 function validateOutputs(outputs) {
   if (!Array.isArray(outputs) || outputs.length === 0 || outputs.length > MAX_OUTPUTS) {
     throw new Error(`Expected between 1 and ${MAX_OUTPUTS} generated outputs.`);
@@ -16,11 +22,13 @@ function validateOutputs(outputs) {
       throw new Error(`Output ${index + 1} is invalid.`);
     }
     const fileName = typeof output.file_name === "string" ? output.file_name.trim() : "";
+    const stem = path.parse(fileName).name.toUpperCase();
     if (
       !fileName
       || path.basename(fileName) !== fileName
-      || !fileName.toLocaleLowerCase().endsWith(".txt")
+      || (!fileName.toLocaleLowerCase().endsWith(".txt") && !fileName.toLocaleLowerCase().endsWith(".docx"))
       || /[<>:"/\\|?*\u0000-\u001F]/.test(fileName)
+      || WINDOWS_RESERVED.has(stem)
     ) {
       throw new Error(`Output ${index + 1} has an unsafe filename.`);
     }
