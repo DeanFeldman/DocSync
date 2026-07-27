@@ -503,7 +503,7 @@ Planned work includes:
 - PostgreSQL support for hosted deployments
 - Secure cloud storage and synchronisation
 - Automatic desktop update channels
-
+- Ability to summarise changes on each doc (AI)
 ---
 
 ## Contributing
