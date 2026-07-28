@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Union
 
 from docx import Document
+from docx.document import Document as DocxDocument
 
 from .config import settings
 from .error_mapper import (
@@ -25,14 +26,14 @@ class DocumentValidationService:
     """Performs extension, signature, size, Open XML, encryption and output validation."""
 
     @staticmethod
-    def validate_file(
+    def validate_package(
         source: Union[Path, bytes],
         filename: str = "document.docx",
         max_bytes: int | None = None,
     ) -> bytes:
-        """Validate a DOCX file payload or file path according to rules VR-01 to VR-07.
+        """Validate the DOCX package without constructing its object model.
 
-        Returns payload bytes if valid, or raises a mapped DocuSyncError.
+        The returned bytes are safe to pass to ``parse_file`` exactly once.
         """
         # VR-01 Extension Check
         if not filename.lower().endswith(".docx"):
@@ -163,9 +164,16 @@ class DocumentValidationService:
                 action="Try another copy or resave in Microsoft Word.",
             ) from exc
 
-        # Deep verification with python-docx parser
+        return payload
+
+    @staticmethod
+    def parse_file(
+        payload: bytes,
+        filename: str = "document.docx",
+    ) -> DocxDocument:
+        """Construct and return the validated python-docx representation."""
         try:
-            Document(BytesIO(payload))
+            return Document(BytesIO(payload))
         except Exception as exc:
             exc_str = str(exc).lower()
             if "encrypted" in exc_str or "password" in exc_str or "protected" in exc_str:
@@ -178,4 +186,33 @@ class DocumentValidationService:
                 action="Open and resave the file in Microsoft Word.",
             ) from exc
 
+    @staticmethod
+    def validate_and_parse_file(
+        source: Union[Path, bytes],
+        filename: str = "document.docx",
+        max_bytes: int | None = None,
+    ) -> tuple[bytes, DocxDocument]:
+        """Validate a DOCX and return both bytes and its single parsed instance."""
+        payload = DocumentValidationService.validate_package(
+            source,
+            filename=filename,
+            max_bytes=max_bytes,
+        )
+        return payload, DocumentValidationService.parse_file(
+            payload,
+            filename=filename,
+        )
+
+    @staticmethod
+    def validate_file(
+        source: Union[Path, bytes],
+        filename: str = "document.docx",
+        max_bytes: int | None = None,
+    ) -> bytes:
+        """Validate a DOCX according to rules VR-01 to VR-07."""
+        payload, _document = DocumentValidationService.validate_and_parse_file(
+            source,
+            filename=filename,
+            max_bytes=max_bytes,
+        )
         return payload

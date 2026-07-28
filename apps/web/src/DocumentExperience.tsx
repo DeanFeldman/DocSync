@@ -2,6 +2,9 @@ import {
   Fragment,
   KeyboardEvent as ReactKeyboardEvent,
   ReactNode,
+  UIEvent as ReactUIEvent,
+  memo,
+  useCallback,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -11,7 +14,6 @@ import {
 import {
   absoluteApiUrl,
   ApiError,
-  compareDocumentElements,
   currentDocumentDownloadUrl,
   fetchDocumentVersions,
   fetchDocumentView,
@@ -27,6 +29,19 @@ import {
   saveMatchDecisions,
   versionDownloadUrl,
 } from "./api";
+import {
+  editorResourceKey,
+  exactMatchesResourceKey,
+  getWorkspaceResource,
+  getWorkspaceViewState,
+  loadWorkspaceResource,
+  nearMatchesResourceKey,
+  setWorkspaceViewState,
+  versionHistoryResourceKey,
+  wordPreviewResourceKey,
+  workspaceViewStateKey,
+  type WorkspaceMode,
+} from "./workspaceResources";
 import {
   candidateArrays,
   editorContentFromView,
@@ -59,7 +74,6 @@ import type {
   QuillDelta,
 } from "./types";
 
-type WorkspaceMode = "layout" | "edit" | "compare";
 type LoadingStatus = "idle" | "loading" | "ready" | "error";
 type EditorAction = "preview" | "generate" | "restore" | null;
 
@@ -93,6 +107,9 @@ const WORKSPACE_MODES: Array<{
     description: "Exact and near matches",
   },
 ];
+
+const INITIAL_VISIBLE_BLOCKS = 200;
+const VISIBLE_BLOCK_BATCH = 200;
 
 function isUnavailable(error: unknown): boolean {
   return (
@@ -224,7 +241,7 @@ function findEditorBlockCard(elementId: string): HTMLElement | null {
   );
 }
 
-function BlockCard({
+const BlockCard = memo(function BlockCard({
   block,
   selected,
   searchRange,
@@ -286,7 +303,7 @@ function BlockCard({
       )}
     </div>
   );
-}
+});
 
 function LayoutFallbackBlock({
   block,
@@ -738,6 +755,23 @@ export default function DocumentExperience({
   onGenerated,
   onDirtyChange,
 }: DocumentExperienceProps) {
+  const activeVersionId =
+    document?.current_version_id ?? document?.version_id ?? "";
+  const versionScope = useMemo(
+    () =>
+      documentSet.documents
+        .map(
+          (item) =>
+            `${item.id}:${item.current_version_id ?? item.version_id}`,
+        )
+        .sort()
+        .join(","),
+    [documentSet.documents],
+  );
+  const activeViewStateKey =
+    document && activeVersionId
+      ? workspaceViewStateKey(documentSet.id, document.id, activeVersionId)
+      : "";
   const [mode, setMode] = useState<WorkspaceMode>("edit");
   const [editorContent, setEditorContent] =
     useState<EditorContentResponse | null>(null);
@@ -746,15 +780,18 @@ export default function DocumentExperience({
   const [layoutView, setLayoutView] = useState<DocumentView | null>(null);
   const [layoutStatus, setLayoutStatus] =
     useState<LoadingStatus>("idle");
-  const [layoutRefresh, setLayoutRefresh] = useState(0);
-  const [showLayoutStructure, setShowLayoutStructure] = useState(false);
+  const [showLayoutStructure, setShowLayoutStructure] = useState(true);
   const [selectedElementId, setSelectedElementId] = useState("");
   const [draft, setDraft] = useState<QuillDraft | null>(null);
+  const [visibleBlockCount, setVisibleBlockCount] =
+    useState(INITIAL_VISIBLE_BLOCKS);
   const [editorResetToken, setEditorResetToken] = useState(0);
   const [pendingBlockSelection, setPendingBlockSelection] =
     useState<EditorBlock | null>(null);
   const [matches, setMatches] = useState<EditorMatch[]>([]);
   const [matchStatus, setMatchStatus] =
+    useState<LoadingStatus>("idle");
+  const [nearMatchStatus, setNearMatchStatus] =
     useState<LoadingStatus>("idle");
   const [legacyDiscovery, setLegacyDiscovery] =
     useState<MatchDiscovery | null>(null);
@@ -774,6 +811,7 @@ export default function DocumentExperience({
     useState<DocumentVersionsResponse | null>(null);
   const [versionStatus, setVersionStatus] =
     useState<LoadingStatus>("idle");
+  const [historyRequested, setHistoryRequested] = useState(false);
   const [versionApiAvailable, setVersionApiAvailable] = useState(false);
   const [restoringVersionId, setRestoringVersionId] = useState("");
   const [restoreNotice, setRestoreNotice] = useState("");
@@ -783,6 +821,8 @@ export default function DocumentExperience({
     useState<EditorGenerationResponse | null>(null);
   const previewButtonRef = useRef<HTMLButtonElement>(null);
   const versionHistoryRef = useRef<HTMLDetailsElement>(null);
+  const modeScrollRef = useRef<HTMLDivElement>(null);
+  const modeRef = useRef<WorkspaceMode>(mode);
   const mountedRef = useRef(false);
   const activeDocumentIdRef = useRef(document?.id ?? "");
   const documentContextRef = useRef({
@@ -794,6 +834,9 @@ export default function DocumentExperience({
   const matchRequestRef = useRef(0);
   const editorActionRequestRef = useRef(0);
   const editorActionAbortRef = useRef<AbortController | null>(null);
+  const selectBlockRef = useRef<
+    (block: EditorBlock, skipDiscardConfirmation?: boolean) => void
+  >(() => undefined);
 
   activeDocumentIdRef.current = document?.id ?? "";
   if (documentContextRef.current.documentId !== activeDocumentIdRef.current) {
@@ -854,8 +897,36 @@ export default function DocumentExperience({
     setRestoringVersionId("");
     setLocalError("");
     setPendingBlockSelection(null);
-    setShowLayoutStructure(false);
-  }, [document?.id]);
+    setHistoryRequested(false);
+    setVersions(null);
+    setVersionStatus("idle");
+    setNearMatchStatus("idle");
+    setVisibleBlockCount(INITIAL_VISIBLE_BLOCKS);
+
+    const savedState = activeViewStateKey
+      ? getWorkspaceViewState(activeViewStateKey)
+      : undefined;
+    setMode(savedState?.mode ?? "edit");
+    modeRef.current = savedState?.mode ?? "edit";
+    setSelectedElementId(savedState?.selectedElementId ?? "");
+    setDraft(savedState?.draft ?? null);
+
+    if (document && activeVersionId) {
+      const cachedPreview = getWorkspaceResource<DocumentView>(
+        wordPreviewResourceKey(
+          documentSet.id,
+          document.id,
+          activeVersionId,
+        ),
+      );
+      setLayoutView(cachedPreview ?? null);
+      setLayoutStatus(cachedPreview ? "ready" : "idle");
+    } else {
+      setLayoutView(null);
+      setLayoutStatus("idle");
+    }
+    setShowLayoutStructure(true);
+  }, [activeViewStateKey, activeVersionId, document?.id, documentSet.id]);
 
   useEffect(() => {
     if (!document) {
@@ -865,14 +936,21 @@ export default function DocumentExperience({
     }
 
     const requestId = ++contentRequestRef.current;
-    const controller = new AbortController();
-    setContentStatus("loading");
-    setLayoutView(null);
-    setLayoutStatus("idle");
-    setShowLayoutStructure(false);
-    setSelectedElementId("");
-    setDraft(null);
+    const requestedVersionId =
+      document.current_version_id ?? document.version_id;
+    const resourceKey = editorResourceKey(
+      documentSet.id,
+      document.id,
+      requestedVersionId,
+    );
+    const cachedContent = getWorkspaceResource<EditorContentResponse>(
+      resourceKey,
+    );
+    setContentStatus(cachedContent ? "ready" : "loading");
+    setEditorContent(cachedContent ?? null);
     setMatches([]);
+    setMatchStatus("idle");
+    setNearMatchStatus("idle");
     setPreview(null);
     setPreviewOpen(false);
     setPreviewSignature("");
@@ -880,72 +958,76 @@ export default function DocumentExperience({
 
     async function loadContent() {
       let loaded = false;
-      const requestedVersionId =
-        versions?.document_id === document!.id
-          ? versions.current_version_id
-          : document!.current_version_id ?? document!.version_id;
       try {
-        const response = await fetchEditorContent(
-          requestedVersionId,
-          controller.signal,
+        const response = await loadWorkspaceResource(
+          resourceKey,
+          async () => {
+            try {
+              const content = await fetchEditorContent(requestedVersionId);
+              return normaliseEditorContent(content, document!);
+            } catch (error) {
+              if (!isUnavailable(error)) throw error;
+              const compatibleView =
+                refreshToken === 0 &&
+                fallbackView?.document_id === document!.id &&
+                fallbackView.version_id === requestedVersionId
+                  ? fallbackView
+                  : await fetchDocumentView(requestedVersionId);
+              return editorContentFromView(compatibleView, document!);
+            }
+          },
         );
         if (requestId !== contentRequestRef.current) return;
-        setEditorContent(normaliseEditorContent(response, document!));
+        setEditorContent(response);
+        const savedState = activeViewStateKey
+          ? getWorkspaceViewState(activeViewStateKey)
+          : undefined;
+        const restoredElementId =
+          savedState?.selectedElementId &&
+          response.blocks.some(
+            (block) => block.element_id === savedState.selectedElementId,
+          )
+            ? savedState.selectedElementId
+            : "";
+        setSelectedElementId(restoredElementId);
+        setDraft(restoredElementId ? savedState?.draft ?? null : null);
+        if (restoredElementId) {
+          const restoredIndex = response.blocks.findIndex(
+            (block) => block.element_id === restoredElementId,
+          );
+          setVisibleBlockCount((current) =>
+            Math.max(
+              current,
+              Math.ceil((restoredIndex + 1) / VISIBLE_BLOCK_BATCH) *
+                VISIBLE_BLOCK_BATCH,
+            ),
+          );
+        }
         loaded = true;
       } catch (error) {
-        if (controller.signal.aborted) return;
-        if (!isUnavailable(error)) {
-          if (requestId !== contentRequestRef.current) return;
-          setLocalError(
-            `${document!.name}: ${errorMessage(
-              error,
-              "Editor content could not be loaded.",
-            )}`,
-          );
-        } else {
-          try {
-            const compatibleView =
-              refreshToken === 0 &&
-              fallbackView?.document_id === document!.id
-                ? fallbackView
-                : await fetchDocumentView(
-                    requestedVersionId,
-                    controller.signal,
-                  );
-            if (requestId !== contentRequestRef.current) return;
-            setEditorContent(editorContentFromView(compatibleView, document!));
-            loaded = true;
-          } catch (fallbackError) {
-            if (controller.signal.aborted) return;
-            if (requestId !== contentRequestRef.current) return;
-            setLocalError(
-              `${document!.name}: ${errorMessage(
-                fallbackError,
-                "The structured editor could not open.",
-              )}`,
-            );
-          }
-        }
+        if (requestId !== contentRequestRef.current) return;
+        setLocalError(
+          `${document!.name}: ${errorMessage(
+            error,
+            "The structured editor could not open.",
+          )}`,
+        );
       } finally {
-        if (
-          !controller.signal.aborted &&
-          requestId === contentRequestRef.current
-        ) {
+        if (requestId === contentRequestRef.current) {
           setContentStatus(loaded ? "ready" : "error");
         }
       }
     }
 
     void loadContent();
-    return () => controller.abort();
   }, [
+    activeViewStateKey,
     document?.id,
     document?.version_id,
     document?.current_version_id,
+    documentSet.id,
     fallbackView,
     refreshToken,
-    versions?.current_version_id,
-    versions?.document_id,
   ]);
 
   useEffect(() => {
@@ -1023,121 +1105,126 @@ export default function DocumentExperience({
   ]);
 
   useEffect(() => {
-    if (!document) {
-      setVersions(null);
-      setVersionStatus("idle");
+    if (
+      !activeViewStateKey ||
+      editorContent?.version_id !== activeVersionId
+    ) {
       return;
     }
-    const controller = new AbortController();
+    const existing = getWorkspaceViewState(activeViewStateKey);
+    setWorkspaceViewState(activeViewStateKey, {
+      mode,
+      selectedElementId,
+      draft,
+      scrollTop: existing?.scrollTop ?? {
+        layout: 0,
+        edit: 0,
+        compare: 0,
+      },
+    });
+  }, [
+    activeVersionId,
+    activeViewStateKey,
+    draft,
+    editorContent?.version_id,
+    mode,
+    selectedElementId,
+  ]);
+
+  useLayoutEffect(() => {
+    if (!activeViewStateKey || contentStatus !== "ready") return;
+    const savedState = getWorkspaceViewState(activeViewStateKey);
+    const frame = window.requestAnimationFrame(() => {
+      if (modeScrollRef.current) {
+        modeScrollRef.current.scrollTop =
+          savedState?.scrollTop[mode] ?? 0;
+      }
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [activeViewStateKey, contentStatus, mode]);
+
+  useEffect(() => {
+    if (!document || !historyRequested) {
+      if (!document) {
+        setVersions(null);
+        setVersionStatus("idle");
+      }
+      return;
+    }
+    const expectedVersionId =
+      document.current_version_id ?? document.version_id;
+    const resourceKey = versionHistoryResourceKey(
+      documentSet.id,
+      document.id,
+      expectedVersionId,
+    );
+    const cachedVersions =
+      getWorkspaceResource<DocumentVersionsResponse>(resourceKey);
+    if (cachedVersions) {
+      setVersions(cachedVersions);
+      setVersionStatus("ready");
+      setVersionApiAvailable(true);
+      return;
+    }
+
+    const requestId = documentContextRef.current.token;
     setVersionStatus("loading");
 
     async function loadVersions() {
       let finalStatus: LoadingStatus = "ready";
       try {
-        const response = await fetchDocumentVersions(
-          document!.id,
-          controller.signal,
+        const response = await loadWorkspaceResource(
+          resourceKey,
+          async () =>
+            normaliseVersions(
+              await fetchDocumentVersions(document!.id),
+              document!,
+            ),
         );
-        if (controller.signal.aborted) return;
-        setVersions(normaliseVersions(response, document!));
+        if (
+          requestId !== documentContextRef.current.token ||
+          activeDocumentIdRef.current !== document!.id
+        ) {
+          return;
+        }
+        setVersions(response);
         setVersionApiAvailable(true);
       } catch (error) {
-        if (controller.signal.aborted) return;
+        if (
+          requestId !== documentContextRef.current.token ||
+          activeDocumentIdRef.current !== document!.id
+        ) {
+          return;
+        }
         setVersions(fallbackVersions(document!, editorContent));
         setVersionApiAvailable(false);
         finalStatus = isMissingFeature(error) ? "ready" : "error";
       } finally {
-        if (!controller.signal.aborted) {
+        if (
+          requestId === documentContextRef.current.token &&
+          activeDocumentIdRef.current === document!.id
+        ) {
           setVersionStatus(finalStatus);
         }
       }
     }
 
     void loadVersions();
-    return () => controller.abort();
   }, [
     document?.id,
     document?.version_id,
     document?.current_version_id,
+    documentSet.id,
     editorContent?.version_id,
+    historyRequested,
     refreshToken,
-  ]);
-
-  useEffect(() => {
-    if (!document || mode !== "layout") return;
-    const expectedVersion =
-      document.current_version_id ?? document.version_id;
-    if (
-      layoutView &&
-      layoutView.document_id === document.id &&
-      layoutView.version_id === expectedVersion
-    ) {
-      return;
-    }
-
-    const requestId = ++layoutRequestRef.current;
-    const controller = new AbortController();
-    setLayoutStatus("loading");
-
-    async function loadLayout() {
-      let loaded = false;
-      try {
-        const response = await renderDocumentView(
-          document!.id,
-          controller.signal,
-          expectedVersion,
-        );
-        if (requestId !== layoutRequestRef.current) return;
-        setLayoutView(response);
-        loaded = true;
-      } catch (error) {
-        if (controller.signal.aborted) return;
-        if (requestId !== layoutRequestRef.current) return;
-        try {
-          const fallback = await fetchDocumentView(
-            expectedVersion,
-            controller.signal,
-          );
-          if (requestId !== layoutRequestRef.current) return;
-          setLayoutView(fallback);
-          loaded = true;
-          setLocalError(
-            `${document!.name}: Word layout was unavailable, so the selectable structured document is shown.`,
-          );
-        } catch (fallbackError) {
-          if (controller.signal.aborted) return;
-          if (requestId !== layoutRequestRef.current) return;
-          setLocalError(
-            `${document!.name}: ${errorMessage(
-              fallbackError,
-              "The layout preview could not open.",
-            )}`,
-          );
-        }
-      } finally {
-        if (
-          !controller.signal.aborted &&
-          requestId === layoutRequestRef.current
-        ) {
-          setLayoutStatus(loaded ? "ready" : "error");
-        }
-      }
-    }
-
-    void loadLayout();
-    return () => controller.abort();
-  }, [
-    document?.id,
-    document?.version_id,
-    document?.current_version_id,
-    layoutRefresh,
-    mode,
   ]);
 
   useEffect(() => {
     if (!selectedBlock || !selectedBlock.supported || selectedBlock.read_only) {
       setMatches([]);
       setMatchStatus("idle");
+      setNearMatchStatus("idle");
       setLegacyDiscovery(null);
       return;
     }
@@ -1145,14 +1232,35 @@ export default function DocumentExperience({
     const requestId = ++matchRequestRef.current;
     const controller = new AbortController();
     setMatchStatus("loading");
+    setNearMatchStatus(mode === "compare" ? "loading" : "idle");
     setMatches([]);
     setLegacyDiscovery(null);
 
     async function loadMatches() {
       try {
+        const exactResourceKey = exactMatchesResourceKey(
+          documentSet.id,
+          selectedBlock!.document_id,
+          versionScope,
+          selectedBlock!.element_id,
+        );
+        const nearResourceKey = nearMatchesResourceKey(
+          documentSet.id,
+          selectedBlock!.document_id,
+          versionScope,
+          selectedBlock!.element_id,
+        );
         const [exactResult, similarResult] = await Promise.allSettled([
-          fetchElementMatches(selectedBlock!.element_id, controller.signal),
-          fetchSimilarMatches(selectedBlock!.element_id, controller.signal),
+          loadWorkspaceResource(
+            exactResourceKey,
+            () => fetchElementMatches(selectedBlock!.element_id),
+          ),
+          mode === "compare"
+            ? loadWorkspaceResource(
+                nearResourceKey,
+                () => fetchSimilarMatches(selectedBlock!.element_id),
+              )
+            : Promise.reject(new ApiError("Near matching is deferred.", 404)),
         ]);
         if (
           controller.signal.aborted ||
@@ -1238,11 +1346,9 @@ export default function DocumentExperience({
         .map((match) => match.element_id);
       if (candidateIds.length > 0) {
         try {
-          const comparison = await compareDocumentElements(
-            selectedBlock!.element_id,
-            candidateIds,
-            controller.signal,
-          );
+          // The near-match endpoint already returns the final score, decision,
+          // and difference spans. No second comparison request is necessary.
+          const comparison = { items: [] as EditorMatch[] };
           if (
             controller.signal.aborted ||
             requestId !== matchRequestRef.current
@@ -1321,6 +1427,7 @@ export default function DocumentExperience({
           !controller.signal.aborted &&
           requestId === matchRequestRef.current
         ) {
+          if (mode === "compare") setNearMatchStatus("error");
           setLocalError(
             `${document?.name ?? "Document"} · ${locationLabel(
               selectedBlock!,
@@ -1336,6 +1443,11 @@ export default function DocumentExperience({
           requestId === matchRequestRef.current
         ) {
           setMatchStatus("ready");
+          if (mode === "compare") {
+            setNearMatchStatus((current) =>
+              current === "loading" ? "ready" : current,
+            );
+          }
         }
       }
     }
@@ -1371,13 +1483,98 @@ export default function DocumentExperience({
         setMatchStatus((current) =>
           current === "loading" ? "ready" : current,
         );
+        if (mode === "compare") {
+          setNearMatchStatus((current) =>
+            current === "loading" ? "ready" : current,
+          );
+        }
       });
     return () => controller.abort();
-  }, [document?.name, selectedBlock?.element_id]);
+  }, [
+    document?.name,
+    documentSet.id,
+    mode,
+    selectedBlock?.element_id,
+    versionScope,
+  ]);
+
+  async function loadWordPreview() {
+    if (!document || !activeVersionId || layoutStatus === "loading") return;
+    const requestId = ++layoutRequestRef.current;
+    const resourceKey = wordPreviewResourceKey(
+      documentSet.id,
+      document.id,
+      activeVersionId,
+    );
+    setLayoutStatus("loading");
+    setLocalError("");
+
+    try {
+      const response = await loadWorkspaceResource(
+        resourceKey,
+        () => renderDocumentView(activeVersionId),
+      );
+      if (
+        requestId !== layoutRequestRef.current ||
+        activeDocumentIdRef.current !== document.id
+      ) {
+        return;
+      }
+      setLayoutView(response);
+      setLayoutStatus("ready");
+      setShowLayoutStructure(false);
+    } catch (error) {
+      if (
+        requestId !== layoutRequestRef.current ||
+        activeDocumentIdRef.current !== document.id
+      ) {
+        return;
+      }
+      setLayoutStatus("error");
+      setShowLayoutStructure(true);
+      setLocalError(
+        `${document.name}: ${errorMessage(
+          error,
+          "Microsoft Word could not prepare the preview. Editing remains available.",
+        )}`,
+      );
+    }
+  }
 
   function setWorkspaceMode(nextMode: WorkspaceMode) {
+    const currentMode = modeRef.current;
+    if (activeViewStateKey) {
+      const existing = getWorkspaceViewState(activeViewStateKey);
+      setWorkspaceViewState(activeViewStateKey, {
+        mode: nextMode,
+        selectedElementId,
+        draft,
+        scrollTop: {
+          layout:
+            currentMode === "layout"
+              ? modeScrollRef.current?.scrollTop ?? 0
+              : existing?.scrollTop.layout ?? 0,
+          edit:
+            currentMode === "edit"
+              ? modeScrollRef.current?.scrollTop ?? 0
+              : existing?.scrollTop.edit ?? 0,
+          compare:
+            currentMode === "compare"
+              ? modeScrollRef.current?.scrollTop ?? 0
+              : existing?.scrollTop.compare ?? 0,
+        },
+      });
+    }
+    modeRef.current = nextMode;
     setMode(nextMode);
     window.requestAnimationFrame(() => {
+      const savedState = activeViewStateKey
+        ? getWorkspaceViewState(activeViewStateKey)
+        : undefined;
+      if (modeScrollRef.current) {
+        modeScrollRef.current.scrollTop =
+          savedState?.scrollTop[nextMode] ?? 0;
+      }
       window.document
         .getElementById(`workspace-tab-${nextMode}`)
         ?.focus();
@@ -1404,6 +1601,40 @@ export default function DocumentExperience({
       nextIndex = WORKSPACE_MODES.length - 1;
     }
     setWorkspaceMode(WORKSPACE_MODES[nextIndex].id);
+  }
+
+  function handleModeScroll(event: ReactUIEvent<HTMLDivElement>) {
+    if (activeViewStateKey) {
+      const existing = getWorkspaceViewState(activeViewStateKey);
+      setWorkspaceViewState(activeViewStateKey, {
+        mode,
+        selectedElementId,
+        draft,
+        scrollTop: {
+          layout: existing?.scrollTop.layout ?? 0,
+          edit: existing?.scrollTop.edit ?? 0,
+          compare: existing?.scrollTop.compare ?? 0,
+          [mode]: event.currentTarget.scrollTop,
+        },
+      });
+    }
+
+    if (
+      mode === "edit" &&
+      editorContent &&
+      visibleBlockCount < editorContent.blocks.length &&
+      event.currentTarget.scrollHeight -
+        event.currentTarget.scrollTop -
+        event.currentTarget.clientHeight <
+        1000
+    ) {
+      setVisibleBlockCount((current) =>
+        Math.min(
+          editorContent.blocks.length,
+          current + VISIBLE_BLOCK_BATCH,
+        ),
+      );
+    }
   }
 
   function focusEditorForElement(elementId: string) {
@@ -1482,8 +1713,8 @@ export default function DocumentExperience({
         `${document.name}: this ${sourceLabel.toLocaleLowerCase()} belongs to an older document version. The latest layout is being reloaded.`,
       );
       setLayoutView(null);
-      setShowLayoutStructure(false);
-      setLayoutRefresh((current) => current + 1);
+      setLayoutStatus("idle");
+      setShowLayoutStructure(true);
       return;
     }
 
@@ -1495,6 +1726,15 @@ export default function DocumentExperience({
         `${document.name}: the selected ${sourceLabel.toLocaleLowerCase()} is no longer mapped in the current document version. Refresh the document and try again.`,
       );
       return;
+    }
+    const blockIndex = editorContent.blocks.findIndex(
+      (candidate) => candidate.element_id === elementId,
+    );
+    if (blockIndex >= visibleBlockCount) {
+      setVisibleBlockCount(
+        Math.ceil((blockIndex + 1) / VISIBLE_BLOCK_BATCH) *
+          VISIBLE_BLOCK_BATCH,
+      );
     }
 
     if (
@@ -1531,6 +1771,7 @@ export default function DocumentExperience({
     setDraft({ delta: block.delta, text: block.text });
     setMatches([]);
     setMatchStatus("idle");
+    setNearMatchStatus("idle");
     setLegacyDiscovery(null);
     setIncludedElementIds(new Set());
     setTargetReplacements({});
@@ -1542,7 +1783,7 @@ export default function DocumentExperience({
     setEditorResetToken((current) => current + 1);
 
     if (block.supported && !block.read_only) {
-      setMode("edit");
+      setWorkspaceMode("edit");
       focusEditorForElement(block.element_id);
     }
   }
@@ -1555,7 +1796,7 @@ export default function DocumentExperience({
 
     if (!changingBlock) {
       if (block.supported && !block.read_only) {
-        setMode("edit");
+        setWorkspaceMode("edit");
         setEditorResetToken((current) => current + 1);
         focusEditorForElement(block.element_id);
       }
@@ -1572,6 +1813,12 @@ export default function DocumentExperience({
 
     activateSelectedBlock(block);
   }
+
+  selectBlockRef.current = selectBlock;
+  const handleBlockSelect = useCallback(
+    (block: EditorBlock) => selectBlockRef.current(block),
+    [],
+  );
 
   function confirmPendingBlockSelection() {
     const block = pendingBlockSelection;
@@ -1596,7 +1843,7 @@ export default function DocumentExperience({
      * Cancel keeps the current draft, but forces a fresh Quill instance so the
      * editor is immediately clickable after the confirmation dialog closes.
      */
-    setMode("edit");
+    setWorkspaceMode("edit");
     setEditorResetToken((current) => current + 1);
     focusEditorForElement(currentElementId);
   }
@@ -2096,8 +2343,9 @@ export default function DocumentExperience({
       setLastGeneration(null);
       setEditorResetToken((current) => current + 1);
       setLayoutView(null);
-      setLayoutRefresh((current) => current + 1);
-      setMode("edit");
+      setLayoutStatus("idle");
+      setShowLayoutStructure(true);
+      setWorkspaceMode("edit");
       setRestoreNotice(
         `Version ${result.version.version_number} was created from Version ${result.restored_from_version_number}.`,
       );
@@ -2162,12 +2410,22 @@ export default function DocumentExperience({
               ref={versionHistoryRef}
               className="version-history"
               aria-busy={action === "restore"}
+              onToggle={(event) => {
+                if (event.currentTarget.open) {
+                  setHistoryRequested(true);
+                }
+              }}
             >
               <summary>
                 Version history
                 {versionStatus === "loading" ? "…" : ""}
               </summary>
               <div className="version-history-menu">
+                {versionStatus === "loading" && (
+                  <div className="compact-loading" role="status">
+                    Loading version historyâ€¦
+                  </div>
+                )}
                 {versions?.versions.map((version) => (
                   <article
                     className={`version-history-item ${
@@ -2266,7 +2524,11 @@ export default function DocumentExperience({
           </div>
         )}
 
-        <div className="editor-mode-scroll">
+        <div
+          className="editor-mode-scroll"
+          ref={modeScrollRef}
+          onScroll={handleModeScroll}
+        >
           <section
             id="workspace-panel-layout"
             role="tabpanel"
@@ -2289,11 +2551,10 @@ export default function DocumentExperience({
                 </p>
               </div>
               <div className="layout-heading-actions">
-                {editorContent &&
-                  (layoutStatus === "loading" || layoutView?.pdf_url) && (
+                {layoutView?.pdf_url && (
                   <button
                     type="button"
-                    className="primary-button layout-selection-toggle"
+                    className="quiet-button layout-selection-toggle"
                     onClick={() =>
                       setShowLayoutStructure((current) => !current)
                     }
@@ -2303,23 +2564,25 @@ export default function DocumentExperience({
                       ? "Show Word preview"
                       : "Select from structure"}
                   </button>
-                  )}
-                <button
-                  type="button"
-                  className="quiet-button"
-                  disabled={layoutStatus === "loading"}
-                  onClick={() => {
-                    setLayoutView(null);
-                    setShowLayoutStructure(false);
-                    setLayoutRefresh((current) => current + 1);
-                  }}
-                >
-                  Refresh layout
-                </button>
+                )}
+                {!layoutView?.pdf_url && (
+                  <button
+                    type="button"
+                    className="primary-button"
+                    disabled={layoutStatus === "loading"}
+                    onClick={() => void loadWordPreview()}
+                  >
+                    {layoutStatus === "loading"
+                      ? "Loading Word Previewâ€¦"
+                      : layoutStatus === "error"
+                        ? "Retry Word Preview"
+                        : "Load Word Preview"}
+                  </button>
+                )}
               </div>
             </div>
-            {layoutStatus === "loading" && !showLayoutStructure && (
-              <div className="editor-loading-state" role="status">
+            {layoutStatus === "loading" && (
+              <div className="editor-loading-state nonblocking" role="status">
                 <span className="spinner" aria-hidden="true" />
                 Microsoft Word is preparing the layout preview…
               </div>
@@ -2328,7 +2591,7 @@ export default function DocumentExperience({
               <div className="editor-empty-state">
                 <strong>Layout preview unavailable</strong>
                 <p>
-                  Use Edit for supported blocks or try Refresh layout after
+                  Use Edit for supported blocks or retry the Word preview after
                   closing any Word dialogue.
                 </p>
               </div>
@@ -2352,6 +2615,7 @@ export default function DocumentExperience({
               </div>
             )}
             {editorContent &&
+              mode === "layout" &&
               (showLayoutStructure ||
                 (layoutStatus === "ready" &&
                   layoutView &&
@@ -2475,7 +2739,9 @@ export default function DocumentExperience({
                 </div>
               )}
             <div className="editor-block-list">
-              {editorContent?.blocks.map((block) => (
+              {editorContent?.blocks
+                .slice(0, visibleBlockCount)
+                .map((block) => (
                 <BlockCard
                   block={block}
                   selected={block.element_id === selectedElementId}
@@ -2488,11 +2754,33 @@ export default function DocumentExperience({
                         }
                       : undefined
                   }
-                  onSelect={selectBlock}
+                  onSelect={handleBlockSelect}
                   key={block.element_id}
                 />
               ))}
             </div>
+            {editorContent &&
+              visibleBlockCount < editorContent.blocks.length && (
+                <button
+                  type="button"
+                  className="quiet-button editor-load-more"
+                  onClick={() =>
+                    setVisibleBlockCount((current) =>
+                      Math.min(
+                        editorContent.blocks.length,
+                        current + VISIBLE_BLOCK_BATCH,
+                      ),
+                    )
+                  }
+                >
+                  Show next{" "}
+                  {Math.min(
+                    VISIBLE_BLOCK_BATCH,
+                    editorContent.blocks.length - visibleBlockCount,
+                  )}{" "}
+                  blocks
+                </button>
+              )}
           </section>
 
           <section
@@ -2515,7 +2803,7 @@ export default function DocumentExperience({
                 <button
                   type="button"
                   className="quiet-button"
-                  onClick={() => setMode("edit")}
+                  onClick={() => setWorkspaceMode("edit")}
                 >
                   Back to selected block
                 </button>
@@ -2531,7 +2819,7 @@ export default function DocumentExperience({
                 <button
                   type="button"
                   className="primary-button"
-                  onClick={() => setMode("edit")}
+                  onClick={() => setWorkspaceMode("edit")}
                 >
                   Go to Edit
                 </button>
@@ -2554,13 +2842,14 @@ export default function DocumentExperience({
                   </header>
                   <p>{draft?.text ?? selectedBlock.text}</p>
                 </article>
-                {matchStatus === "loading" && (
+                {nearMatchStatus === "loading" && (
                   <div className="editor-loading-state" role="status">
                     <span className="spinner" aria-hidden="true" />
                     Finding exact and near matches…
                   </div>
                 )}
                 {matchStatus === "ready" &&
+                  nearMatchStatus !== "loading" &&
                   matches.filter(
                     (match) => match.match_type !== "source",
                   ).length === 0 && (
@@ -2697,7 +2986,7 @@ export default function DocumentExperience({
               <button
                 type="button"
                 className="quiet-button"
-                onClick={() => setMode("edit")}
+                onClick={() => setWorkspaceMode("edit")}
               >
                 Switch to Edit
               </button>

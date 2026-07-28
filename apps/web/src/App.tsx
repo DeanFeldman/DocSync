@@ -41,6 +41,12 @@ import type {
 import docSyncLogo from "./assets/Docsync LOGO.png";
 import DocumentExperience from "./DocumentExperience";
 import {
+  clearWorkspaceResourcesForDocument,
+  clearWorkspaceResourcesForSet,
+  clearWorkspaceViewStateForDocument,
+  invalidateDocumentHeadResources,
+} from "./workspaceResources";
+import {
   applyTheme,
   initialTheme,
   persistTheme,
@@ -57,6 +63,13 @@ type BusyAction =
   | "add-documents"
   | "remove-document"
   | "delete-set"
+  | null;
+
+type CreationStage =
+  | "upload"
+  | "validation"
+  | "editor-preparation"
+  | "workspace"
   | null;
 
 const INITIAL_VISIBLE_PAGES = 8;
@@ -198,6 +211,7 @@ const [setNameTouched, setSetNameTouched] = useState(false);
   const [preview, setPreview] = useState<PreviewResponse | null>(null);
   const [generation, setGeneration] = useState<GenerationResponse | null>(null);
   const [busyAction, setBusyAction] = useState<BusyAction>(null);
+  const [creationStage, setCreationStage] = useState<CreationStage>(null);
   const [error, setError] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
   const [searchCursor, setSearchCursor] = useState(-1);
@@ -474,6 +488,12 @@ const [setNameTouched, setSetNameTouched] = useState(false);
     ) {
       return;
     }
+    if (editorDirty && documentSet && activeDocumentId) {
+      clearWorkspaceViewStateForDocument(
+        documentSet.id,
+        activeDocumentId,
+      );
+    }
 
     if (
       updateHistory &&
@@ -508,7 +528,7 @@ const [setNameTouched, setSetNameTouched] = useState(false);
     setError("");
   }
 
-  async function openWorkspace(workspace: DocumentSetResponse) {
+  function openWorkspace(workspace: DocumentSetResponse) {
     if (workspace.documents.some((document) => !document.version_id)) {
       throw new Error(
         "The local document service is an older DocumentSync version. Close and reopen the application, then try again.",
@@ -516,11 +536,6 @@ const [setNameTouched, setSetNameTouched] = useState(false);
     }
 
     const firstDocument = workspace.documents[0] ?? null;
-    const rendered = firstDocument
-      ? await fetchDocumentView(
-          firstDocument.current_version_id ?? firstDocument.version_id,
-        )
-      : null;
 
     if (
       window.history.state?.view !== "workspace" ||
@@ -534,8 +549,8 @@ const [setNameTouched, setSetNameTouched] = useState(false);
 
     setDocumentSet(workspace);
     setActiveDocumentId(firstDocument?.id ?? "");
-    setViewer(rendered);
-    setViewMode(rendered?.pdf_url ? "visual" : "select");
+    setViewer(null);
+    setViewMode("select");
     setCurrentPage(1);
     setSearchQuery("");
     setGlobalSearchQuery("");
@@ -565,10 +580,20 @@ async function handleUpload(event: FormEvent) {
 
   setError("");
   setBusyAction("upload");
+  setCreationStage("upload");
+  const validationTimer = window.setTimeout(
+    () => setCreationStage("validation"),
+    250,
+  );
+  const editorPreparationTimer = window.setTimeout(
+    () => setCreationStage("editor-preparation"),
+    900,
+  );
 
   try {
     const uploaded = await uploadDocumentSet(trimmedSetName, files);
-      await openWorkspace(uploaded);
+      setCreationStage("workspace");
+      openWorkspace(uploaded);
       setFiles([]);
       setSavedSets((current) => [
         {
@@ -583,6 +608,9 @@ async function handleUpload(event: FormEvent) {
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "The upload failed.");
     } finally {
+      window.clearTimeout(validationTimer);
+      window.clearTimeout(editorPreparationTimer);
+      setCreationStage(null);
       setBusyAction(null);
     }
   }
@@ -592,7 +620,7 @@ async function handleUpload(event: FormEvent) {
     setBusyAction("open-set");
     setOpeningSetId(item.id);
     try {
-      await openWorkspace(await fetchDocumentSet(item.id));
+      openWorkspace(await fetchDocumentSet(item.id));
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "The saved workspace could not open.");
     } finally {
@@ -612,6 +640,7 @@ async function handleUpload(event: FormEvent) {
     setBusyAction("delete-set");
     try {
       await deleteDocumentSet(item.id);
+      clearWorkspaceResourcesForSet(item.id);
       setSavedSets((current) => current.filter((saved) => saved.id !== item.id));
       if (documentSet?.id === item.id) {
         window.history.replaceState({ view: "home" }, "");
@@ -671,13 +700,12 @@ async function handleUpload(event: FormEvent) {
       );
       setGeneration(null);
       clearSelection();
+      clearWorkspaceResourcesForDocument(documentSet.id, document.id);
 
       if (activeDocumentId === document.id) {
         const nextDocument = updated.documents[0] ?? null;
         setActiveDocumentId(nextDocument?.id ?? "");
-        setViewer(
-          nextDocument ? await fetchDocumentView(nextDocument.version_id) : null,
-        );
+        setViewer(null);
         setViewMode("select");
         setCurrentPage(1);
       }
@@ -750,10 +778,15 @@ async function handleUpload(event: FormEvent) {
     ) {
       return;
     }
+    if (hasDraft && documentSet && activeDocumentId) {
+      clearWorkspaceViewStateForDocument(
+        documentSet.id,
+        activeDocumentId,
+      );
+    }
 
     setEditorDirty(false);
     setError("");
-    setBusyAction("view");
     setDocumentSearchTarget(
       searchResult
         ? {
@@ -772,35 +805,8 @@ async function handleUpload(event: FormEvent) {
     setCurrentPage(1);
     setSearchQuery("");
     clearSelection();
-    try {
-      const rendered = await fetchDocumentView(
-        document.current_version_id ?? document.version_id,
-      );
-      setViewer(rendered);
-      setViewMode(targetElementId ? "select" : rendered.pdf_url ? "visual" : "select");
-
-      if (targetElementId) {
-        const targetElement =
-          rendered.pages
-            .flatMap((page) => page.elements)
-            .find((element) => element.id === targetElementId) ?? null;
-        if (targetElement) {
-          setVisiblePageCount((current) =>
-            Math.max(current, targetElement.page_number),
-          );
-          await selectElement(targetElement);
-          window.setTimeout(() => {
-            window.document
-              .getElementById(`element-${targetElementId}`)
-              ?.scrollIntoView({ behavior: "smooth", block: "center" });
-          }, 50);
-        }
-      }
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "The document preview failed.");
-    } finally {
-      setBusyAction(null);
-    }
+    setViewer(null);
+    setViewMode("select");
   }
 
   async function selectElement(element: ViewerElement) {
@@ -934,6 +940,9 @@ async function handleUpload(event: FormEvent) {
     const updated = result.document_set;
     setDocumentSearchTarget(null);
     if (updated) {
+      for (const changedVersion of result.versions ?? []) {
+        invalidateDocumentHeadResources(updated.id, changedVersion.document_id);
+      }
       setDocumentSet(updated);
       setSavedSets((current) =>
         current.map((item) =>
@@ -1156,6 +1165,9 @@ const canUpload = files.length >= 2 && !busyAction;
               <button className="primary-button" type="submit" disabled={!canUpload}>
                 {busyAction === "upload" ? "Preparing workspace…" : "Upload and open workspace"}
               </button>
+              {busyAction === "upload" && creationStage && (
+                <CreationProgress stage={creationStage} />
+              )}
             </form>
 
             <section className="saved-library" aria-labelledby="saved-library-title">
@@ -1757,6 +1769,42 @@ function ErrorAlert({
 
 function LoadingState({ label, compact = false }: { label: string; compact?: boolean }) {
   return <div className={`loading-state ${compact ? "compact" : ""}`} role="status"><span className="spinner" aria-hidden="true" /><span>{label}</span></div>;
+}
+
+function CreationProgress({ stage }: { stage: Exclude<CreationStage, null> }) {
+  const stages: Array<{
+    id: Exclude<CreationStage, null>;
+    label: string;
+  }> = [
+    { id: "upload", label: "Uploading local files" },
+    { id: "validation", label: "Validating safe DOCX packages" },
+    { id: "editor-preparation", label: "Preparing structured editor data" },
+    { id: "workspace", label: "Opening the workspace" },
+  ];
+  const activeIndex = stages.findIndex((item) => item.id === stage);
+
+  return (
+    <div className="creation-progress" role="status" aria-live="polite">
+      <strong>Creating your workspace</strong>
+      <ol>
+        {stages.map((item, index) => (
+          <li
+            className={
+              index < activeIndex
+                ? "complete"
+                : index === activeIndex
+                  ? "active"
+                  : "pending"
+            }
+            key={item.id}
+          >
+            <span aria-hidden="true">{index < activeIndex ? "✓" : index + 1}</span>
+            <span>{item.label}</span>
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
 }
 
 export default App;

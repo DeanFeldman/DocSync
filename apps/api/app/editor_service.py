@@ -258,16 +258,23 @@ def _location_key(location: dict | None) -> str:
 def _paragraph_for_element(
     document: DocxDocument,
     element: DocumentElement,
+    *,
+    paragraphs: list[Paragraph] | None = None,
+    tables: list[object] | None = None,
 ) -> tuple[Paragraph | None, object | None]:
     _ordinal, location = _element_location(element)
     if location["kind"] == "body":
         index = int(location["paragraph_index"])
-        if 0 <= index < len(document.paragraphs):
-            return document.paragraphs[index], None
+        body_paragraphs = (
+            paragraphs if paragraphs is not None else document.paragraphs
+        )
+        if 0 <= index < len(body_paragraphs):
+            return body_paragraphs[index], None
         return None, None
     try:
+        document_tables = tables if tables is not None else document.tables
         cell = (
-            document.tables[int(location["table_index"])]
+            document_tables[int(location["table_index"])]
             .rows[int(location["row_index"])]
             .cells[int(location["column_index"])]
         )
@@ -304,8 +311,9 @@ def _run_attributes(run) -> dict:
 def _numbering_type(
     document: DocxDocument,
     paragraph: Paragraph,
+    style_name: str | None = None,
 ) -> tuple[str | None, int | None]:
-    style_name = paragraph.style.name if paragraph.style is not None else ""
+    resolved_style_name = style_name or ""
     paragraph_properties = paragraph._p.pPr
     numbering_properties = (
         paragraph_properties.numPr if paragraph_properties is not None else None
@@ -354,11 +362,11 @@ def _numbering_type(
         except (AttributeError, KeyError, TypeError, ValueError):
             list_type = None
 
-    folded_style = style_name.casefold()
+    folded_style = resolved_style_name.casefold()
     if list_type is None and folded_style.startswith("list"):
         list_type = "ordered" if "number" in folded_style else "bullet"
     if list_type is not None and level is None:
-        match = LIST_LEVEL_SUFFIX.search(style_name)
+        match = LIST_LEVEL_SUFFIX.search(resolved_style_name)
         level = max(int(match.group(1)) - 1, 0) if match else 0
     return list_type, level
 
@@ -369,11 +377,15 @@ def _paragraph_block_attributes(
     list_type: str | None,
     list_level: int | None,
     alignment: str | None,
+    style_name: str | None = None,
 ) -> dict:
     attributes: dict[str, object] = {}
     if element_type == "heading" and paragraph is not None:
-        style_name = paragraph.style.name if paragraph.style is not None else ""
-        match = re.fullmatch(r"Heading\s+(\d+)", style_name, re.IGNORECASE)
+        match = re.fullmatch(
+            r"Heading\s+(\d+)",
+            style_name or "",
+            re.IGNORECASE,
+        )
         attributes["header"] = (
             min(max(int(match.group(1)), 1), 6) if match is not None else 1
         )
@@ -443,12 +455,22 @@ def _revision_values(
     element: DocumentElement,
     *,
     shared_state: str = "shared",
+    paragraphs: list[Paragraph] | None = None,
+    tables: list[object] | None = None,
 ) -> dict:
     ordinal, location = _element_location(element)
     element_type = _element_type(element.style_name)
-    paragraph, cell = _paragraph_for_element(document, element)
+    style_name = _display_style_name(element.style_name)
+    paragraph, cell = _paragraph_for_element(
+        document,
+        element,
+        paragraphs=paragraphs,
+        tables=tables,
+    )
     list_type, list_level = (
-        _numbering_type(document, paragraph) if paragraph is not None else (None, None)
+        _numbering_type(document, paragraph, style_name)
+        if paragraph is not None
+        else (None, None)
     )
     if element_type != "list_item" and list_type is not None:
         element_type = "list_item"
@@ -459,13 +481,9 @@ def _revision_values(
         list_type,
         list_level,
         alignment,
+        style_name,
     )
     reason = _unsupported_reason(paragraph, cell)
-    style_name = (
-        paragraph.style.name
-        if paragraph is not None and paragraph.style is not None
-        else _display_style_name(element.style_name)
-    )
     formatting = {
         "style_name": style_name,
         "runs": [
@@ -543,7 +561,46 @@ def _create_revisions_for_existing_elements(
 def initialise_original_version(
     session: Session,
     document: DocumentRecord,
+    *,
+    parsed_document: DocxDocument | None = None,
+    elements: list[DocumentElement] | None = None,
 ) -> DocumentVersion:
+    if parsed_document is not None and elements is not None:
+        paragraphs = list(parsed_document.paragraphs)
+        tables = list(parsed_document.tables)
+        version = DocumentVersion(
+            id=document.id,
+            document=document,
+            parent_version_id=None,
+            generation_id=None,
+            editor_operation_id=None,
+            version_number=1,
+            storage_area="originals",
+            storage_name=document.stored_name,
+            download_name=document.original_name,
+            checksum_sha256=document.checksum_sha256,
+            created_at=document.created_at,
+        )
+        head = DocumentHead(
+            document=document,
+            current_version=version,
+            revision=1,
+        )
+        revisions = [
+            DocumentBlockRevision(
+                version=version,
+                **_revision_values(
+                    parsed_document,
+                    element,
+                    paragraphs=paragraphs,
+                    tables=tables,
+                ),
+            )
+            for element in elements
+        ]
+        session.add_all([version, head, *revisions])
+        return version
+
     version = session.get(DocumentVersion, document.id)
     if version is None:
         version = DocumentVersion(
@@ -690,7 +747,19 @@ def serialize_editor_content(session: Session, version_id: str) -> dict:
             .order_by(DocumentBlockRevision.ordinal, DocumentBlockRevision.id)
         )
     )
-    diagnostics = _document_diagnostics(document_version_path(version))
+    diagnostics = [
+        {
+            "id": block.element_id,
+            "kind": "unsupported_block",
+            "element_type": block.element_type,
+            "reason": block.unsupported_reason
+            or "This Word block is preserved but read-only in Edit mode.",
+            "location": _location_key(block.location_json),
+            "read_only": True,
+        }
+        for block in blocks
+        if not block.supported
+    ]
     return {
         "document_id": version.document_id,
         "document_set_id": version.document.document_set_id,
@@ -707,8 +776,7 @@ def serialize_editor_content(session: Session, version_id: str) -> dict:
         ],
         "unsupported": diagnostics,
         "diagnostics": diagnostics,
-        "unsupported_count": len(diagnostics)
-        + sum(not block.supported for block in blocks),
+        "unsupported_count": len(diagnostics),
         "notice": (
             "Unsupported Word objects remain preserved in Layout mode and are "
             "read-only in Edit mode."
@@ -1874,8 +1942,8 @@ def _replace_current_elements_and_create_revisions(
 ) -> dict[str, str]:
     from .document_service import _extract_paragraphs
 
-    payload = source_path.read_bytes()
-    extracted = _extract_paragraphs(payload)
+    docx = _load_docx(source_path)
+    extracted = _extract_paragraphs(docx)
     previous_states = _shared_states_by_location(session, base_version_id)
     override_locations = override_locations or set()
     reconnect_locations = reconnect_locations or set()
@@ -1903,7 +1971,6 @@ def _replace_current_elements_and_create_revisions(
         elements.append(element)
     session.flush()
 
-    docx = _load_docx(source_path)
     location_to_element: dict[str, str] = {}
     revisions: list[DocumentBlockRevision] = []
     for element in elements:

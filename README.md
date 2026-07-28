@@ -31,6 +31,32 @@ DocSync-Setup-latest.exe
 
 ---
 
+## Version 1.4.1
+
+DocSync `v1.4.1` makes workspace creation and Layout/Edit/Compare switching
+progressive and version-aware.
+
+### Improvements
+
+- Shows the workspace shell before the first document content request finishes.
+- Displays named stages while creating a document set.
+- Reuses one validated, parsed DOCX representation during initial extraction
+  and editor preparation.
+- Caches editor content, Word previews, exact matches, near matches, history,
+  and view state by immutable version.
+- Opens Layout from structured data and starts Microsoft Word rendering only
+  after **Load Word Preview** is selected.
+- Defers near matching until Compare and version history until its control is
+  opened.
+- Restores per-view selection, draft, and scroll state and progressively mounts
+  large editor block lists.
+- Emits local creation-stage timings without adding external telemetry.
+
+See [the v1.4.1 release notes](docs/v1.4.1-release-notes.md) for the complete
+behavior and verification summary.
+
+---
+
 ## Version 1.4.0
 
 DocSync `v1.4.0` adds direct structured Layout selection and a persistent
@@ -82,8 +108,10 @@ DocSync provides three document workspace modes.
 
 #### Layout
 
-- Displays a read-only Microsoft Word-rendered preview when Microsoft Word is available.
-- Offers a selectable structured document beside the rendered preview.
+- Displays the selectable structured document immediately.
+- Generates a read-only Microsoft Word preview only after the explicit
+  **Load Word Preview** action.
+- Reuses the Word preview for the same immutable document version.
 - Opens supported structured Layout blocks directly in the editor.
 - Shows unsupported or preserved Word structures as read-only with a reason.
 - Uses the selectable structured view as the safe fallback when reliable
@@ -376,7 +404,7 @@ The workflow reads the application version from the Git tag, so the source `pack
 From the repository root:
 
 ```powershell
-$version = "1.4.0"
+$version = "1.4.1"
 
 git switch main
 git pull origin main
@@ -482,6 +510,8 @@ http://localhost:8001/docs
 
 - The packaged desktop release currently targets Windows.
 - High-fidelity layout rendering works best when Microsoft Word desktop is installed.
+- High-fidelity Word rendering is intentionally on demand; the structured
+  Layout view remains available when Word is missing or a preview fails.
 - Some Word structures remain read-only.
 - Direct selection is available in the structured Layout view. The
   high-fidelity Word/PDF preview remains read-only until the renderer can
