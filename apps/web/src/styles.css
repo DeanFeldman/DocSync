@@ -364,6 +364,65 @@ textarea:focus-visible {
 .selected-files li + li { border-top: 1px solid #edf1f5; }
 .selected-files small { color: var(--muted); white-space: nowrap; }
 
+.creation-progress {
+  padding: 15px 16px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  color: var(--ink);
+  background: var(--surface-2);
+}
+
+.creation-progress > strong {
+  display: block;
+  margin-bottom: 10px;
+  font-size: 0.82rem;
+}
+
+.creation-progress ol {
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  list-style: none;
+}
+
+.creation-progress li {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 0.7rem;
+  font-weight: 700;
+}
+
+.creation-progress li > span:first-child {
+  width: 23px;
+  height: 23px;
+  flex: 0 0 23px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background: var(--surface);
+}
+
+.creation-progress li.active {
+  color: var(--navy);
+}
+
+.creation-progress li.active > span:first-child {
+  border-color: var(--teal);
+  box-shadow: 0 0 0 4px rgba(8, 126, 117, 0.1);
+}
+
+.creation-progress li.complete > span:first-child {
+  border-color: var(--teal);
+  color: #fff;
+  background: var(--teal);
+}
+
 .primary-button, .download-button, .quiet-button, .text-button {
   border-radius: 10px;
   display: inline-flex;
@@ -1921,6 +1980,16 @@ button.layout-fallback-block.editable:focus-visible {
   font-size: 0.75rem;
 }
 
+.editor-loading-state.nonblocking {
+  min-height: 0;
+  margin-bottom: 10px;
+  padding: 10px 14px;
+  justify-content: flex-start;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface-2);
+}
+
 .editor-empty-state {
   min-height: 180px;
   padding: 28px;
@@ -2232,6 +2301,11 @@ button.layout-fallback-block.editable:focus-visible {
   gap: 7px;
 }
 
+.editor-load-more {
+  width: 100%;
+  margin-top: 10px;
+}
+
 .editor-block-card {
   padding: 8px 10px 10px;
   position: relative;
@@ -2248,6 +2322,12 @@ button.layout-fallback-block.editable:focus-visible {
 .editor-block-card:hover {
   border-color: #8eacc8;
   background: #f9fcff;
+}
+
+@media (max-width: 760px) {
+  .creation-progress ol {
+    grid-template-columns: 1fr 1fr;
+  }
 }
 
 .editor-block-card.selected {

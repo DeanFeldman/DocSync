@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 import re
 import shutil
 import subprocess
 import threading
+from time import perf_counter
 import unicodedata
 import zipfile
 from collections import defaultdict
@@ -55,6 +57,7 @@ ORDERED_BODY_STYLE_PATTERN = re.compile(r"^body_order:(\d+):(.*)$", re.DOTALL)
 PAGE_LAYOUT_UNITS = 18
 WORD_RENDER_LOCK = threading.Lock()
 LARGE_SET_LINK_GROUP_LIMIT = 100
+logger = logging.getLogger(__name__)
 
 def utc_isoformat(value: datetime) -> str:
     """Return a consistent timezone-aware UTC timestamp."""
@@ -179,28 +182,29 @@ def _validate_docx_payload(filename: str, payload: bytes) -> None:
     DocumentValidationService.validate_file(payload, filename=filename)
 
 
-def _extract_paragraphs(payload: bytes) -> list[tuple[int, str, str | None]]:
-    try:
-        document = Document(BytesIO(payload))
-    except Exception as exc:  # python-docx raises several package/XML errors
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="A DOCX file could not be opened. It may be corrupt or unsupported.",
-        ) from exc
-
+def _extract_paragraphs(
+    document: DocxDocument,
+) -> list[tuple[int, str, str | None]]:
     elements: list[tuple[int, str, str | None]] = []
     body_paragraph_index = 0
     table_index = 0
     document_order = 0
-    synthetic_index = len(document.paragraphs)
+    paragraphs = list(document.paragraphs)
+    tables = list(document.tables)
+    synthetic_index = len(paragraphs)
+    style_names = {
+        style.style_id: style.name
+        for style in document.styles
+        if style.style_id
+    }
 
     paragraph_lookup = {
         paragraph._p: paragraph
-        for paragraph in document.paragraphs
+        for paragraph in paragraphs
     }
     table_lookup = {
         table._tbl: table
-        for table in document.tables
+        for table in tables
     }
 
     for child in document.element.body.iterchildren():
@@ -208,7 +212,14 @@ def _extract_paragraphs(payload: bytes) -> list[tuple[int, str, str | None]]:
         if paragraph is not None:
             text = paragraph.text.strip()
             if text:
-                style_name = paragraph.style.name if paragraph.style is not None else ""
+                paragraph_properties = paragraph._p.pPr
+                paragraph_style = (
+                    paragraph_properties.pStyle
+                    if paragraph_properties is not None
+                    else None
+                )
+                style_id = paragraph_style.val if paragraph_style is not None else ""
+                style_name = style_names.get(style_id, style_id)
                 elements.append(
                     (
                         body_paragraph_index,
@@ -285,20 +296,60 @@ async def create_document_set(
             detail=f"A document set may contain at most {settings.max_files_per_set} files.",
         )
 
+    started_at = perf_counter()
+    timings = {
+        "upload_ms": 0.0,
+        "validation_ms": 0.0,
+        "parsing_ms": 0.0,
+        "persistence_ms": 0.0,
+        "matching_setup_ms": 0.0,
+    }
     document_set = DocumentSet(id=new_id(), name=cleaned_name)
-    session.add(document_set)
     original_dir = settings.data_dir / "originals" / document_set.id
-    original_dir.mkdir(parents=True, exist_ok=False)
-
     seen_names: set[str] = set()
+    prepared: list[
+        tuple[
+            str,
+            bytes,
+            DocxDocument,
+            list[tuple[int, str, str | None]],
+        ]
+    ] = []
     try:
         for upload in files:
             raw_name = upload.filename or "document.docx"
             original_name = _unique_set_filename(seen_names, raw_name)
             seen_names.add(original_name.casefold())
+
+            stage_started = perf_counter()
             payload = await upload.read()
-            _validate_docx_payload(original_name, payload)
-            extracted = _extract_paragraphs(payload)
+            timings["upload_ms"] += (perf_counter() - stage_started) * 1000
+
+            stage_started = perf_counter()
+            payload = DocumentValidationService.validate_package(
+                payload,
+                filename=original_name,
+            )
+            timings["validation_ms"] += (perf_counter() - stage_started) * 1000
+
+            stage_started = perf_counter()
+            parsed_document = DocumentValidationService.parse_file(
+                payload,
+                filename=original_name,
+            )
+            extracted = _extract_paragraphs(parsed_document)
+            timings["parsing_ms"] += (perf_counter() - stage_started) * 1000
+            prepared.append(
+                (original_name, payload, parsed_document, extracted)
+            )
+
+        persistence_started = perf_counter()
+        original_dir.mkdir(parents=True, exist_ok=False)
+        records: list[
+            tuple[DocumentRecord, DocxDocument, list[DocumentElement]]
+        ] = []
+        all_elements: list[DocumentElement] = []
+        for original_name, payload, parsed_document, extracted in prepared:
 
             document_id = new_id()
             stored_name = f"{document_set.id}/{document_id}.docx"
@@ -312,33 +363,59 @@ async def create_document_set(
                 stored_name=stored_name,
                 checksum_sha256=hashlib.sha256(payload).hexdigest(),
             )
-            session.add(record)
-
-            for paragraph_index, text, style_name in extracted:
-                session.add(
-                    DocumentElement(
-                        id=new_id(),
-                        document=record,
-                        paragraph_index=paragraph_index,
-                        text=text,
-                        normalized_text=normalise_text(text),
-                        style_name=style_name,
-                    )
+            elements = [
+                DocumentElement(
+                    id=new_id(),
+                    document=record,
+                    document_id=record.id,
+                    paragraph_index=paragraph_index,
+                    text=text,
+                    normalized_text=normalise_text(text),
+                    style_name=style_name,
                 )
+                for paragraph_index, text, style_name in extracted
+            ]
+            records.append((record, parsed_document, elements))
+            all_elements.extend(elements)
 
-        session.flush()
+        session.add(document_set)
+        session.add_all(
+            [record for record, _parsed, _elements in records]
+        )
+        session.add_all(all_elements)
         from .editor_service import initialise_original_version
 
-        for record in document_set.documents:
-            initialise_original_version(session, record)
+        for record, parsed_document, elements in records:
+            initialise_original_version(
+                session,
+                record,
+                parsed_document=parsed_document,
+                elements=elements,
+            )
+        session.flush()
+        timings["persistence_ms"] = (
+            perf_counter() - persistence_started
+        ) * 1000
+
+        matching_started = perf_counter()
         _create_exact_link_groups(session, document_set.id)
         session.commit()
+        timings["matching_setup_ms"] = (
+            perf_counter() - matching_started
+        ) * 1000
     except Exception:
         session.rollback()
         shutil.rmtree(original_dir, ignore_errors=True)
         raise
 
-    return get_document_set_or_404(session, document_set.id)
+    timings["service_total_ms"] = (perf_counter() - started_at) * 1000
+    result = get_document_set_or_404(session, document_set.id)
+    result._docsync_creation_timings = timings
+    logger.info(
+        "docsync.create_set.timing %s",
+        " ".join(f"{name}={value:.2f}" for name, value in timings.items()),
+    )
+    return result
 
 
 async def add_documents_to_set(
@@ -363,7 +440,9 @@ async def add_documents_to_set(
 
     seen_names = {document.original_name.casefold() for document in document_set.documents}
     created_paths: list[Path] = []
-    created_records: list[DocumentRecord] = []
+    prepared_records: list[
+        tuple[DocumentRecord, DocxDocument, list[DocumentElement]]
+    ] = []
 
     try:
         for upload in files:
@@ -372,8 +451,15 @@ async def add_documents_to_set(
             seen_names.add(original_name.casefold())
 
             payload = await upload.read()
-            _validate_docx_payload(original_name, payload)
-            extracted = _extract_paragraphs(payload)
+            payload = DocumentValidationService.validate_package(
+                payload,
+                filename=original_name,
+            )
+            parsed_document = DocumentValidationService.parse_file(
+                payload,
+                filename=original_name,
+            )
+            extracted = _extract_paragraphs(parsed_document)
 
             document_id = new_id()
             stored_name = f"{document_set.id}/{document_id}.docx"
@@ -390,24 +476,31 @@ async def add_documents_to_set(
                 checksum_sha256=hashlib.sha256(payload).hexdigest(),
             )
             session.add(record)
-            created_records.append(record)
-            for paragraph_index, text, style_name in extracted:
-                session.add(
-                    DocumentElement(
-                        id=new_id(),
-                        document=record,
-                        paragraph_index=paragraph_index,
-                        text=text,
-                        normalized_text=normalise_text(text),
-                        style_name=style_name,
-                    )
+            elements = [
+                DocumentElement(
+                    id=new_id(),
+                    document=record,
+                    document_id=record.id,
+                    paragraph_index=paragraph_index,
+                    text=text,
+                    normalized_text=normalise_text(text),
+                    style_name=style_name,
                 )
+                for paragraph_index, text, style_name in extracted
+            ]
+            session.add_all(elements)
+            prepared_records.append((record, parsed_document, elements))
 
         session.flush()
         from .editor_service import initialise_original_version
 
-        for record in created_records:
-            initialise_original_version(session, record)
+        for record, parsed_document, elements in prepared_records:
+            initialise_original_version(
+                session,
+                record,
+                parsed_document=parsed_document,
+                elements=elements,
+            )
         _rebuild_exact_link_groups(session, document_set_id)
         session.commit()
         session.expire_all()
@@ -663,42 +756,43 @@ def search_document_set(
     }
 
 def _create_exact_link_groups(session: Session, document_set_id: str) -> None:
-    elements = session.scalars(
-        select(DocumentElement)
-        .join(DocumentRecord)
-        .where(DocumentRecord.document_set_id == document_set_id)
+    current_blocks = session.execute(
+        select(DocumentBlockRevision, DocumentElement)
+        .join(
+            DocumentHead,
+            DocumentHead.current_version_id == DocumentBlockRevision.version_id,
+        )
+        .join(
+            DocumentRecord,
+            DocumentRecord.id == DocumentBlockRevision.document_id,
+        )
+        .join(
+            DocumentElement,
+            DocumentElement.id == DocumentBlockRevision.element_id,
+        )
+        .where(
+            DocumentRecord.document_set_id == document_set_id,
+            DocumentBlockRevision.shared_state == "shared",
+            DocumentBlockRevision.supported.is_(True),
+        )
     ).all()
 
-    detached_ids = set(
-        session.scalars(
-            select(DocumentBlockRevision.element_id)
-            .join(
-                DocumentHead,
-                DocumentHead.current_version_id == DocumentBlockRevision.version_id,
-            )
-            .join(
-                DocumentRecord,
-                DocumentRecord.id == DocumentBlockRevision.document_id,
-            )
-            .where(
-                DocumentRecord.document_set_id == document_set_id,
-                DocumentBlockRevision.shared_state == "detached",
-            )
-        )
-    )
-    by_text: dict[tuple[str, str], list[DocumentElement]] = defaultdict(list)
-    for element in elements:
-        if element.id in detached_ids:
-            continue
-        normalized_text = normalise_text(element.text)
+    by_hash: dict[str, list[DocumentElement]] = defaultdict(list)
+    normalized_by_hash: dict[str, str] = {}
+    for revision, element in current_blocks:
+        normalized_text = revision.normalized_text or normalise_text(revision.text)
         element.normalized_text = normalized_text
-        if normalized_text:
-            by_text[
-                (normalized_text, element_type_for_style(element.style_name))
-            ].append(element)
+        if not normalized_text:
+            continue
+        # The revision hash includes both normalized text and the block type
+        # derived from the actual DOCX structure. DocumentElement.style_name
+        # alone cannot distinguish a custom-styled paragraph from one carrying
+        # Word numbering metadata.
+        by_hash[revision.exact_match_hash].append(element)
+        normalized_by_hash[revision.exact_match_hash] = normalized_text
 
     records: list[object] = []
-    for (normalized_text, _element_type), matches in by_text.items():
+    for match_hash, matches in by_hash.items():
         distinct_documents = {match.document_id for match in matches}
         if len(distinct_documents) < 2:
             continue
@@ -707,7 +801,7 @@ def _create_exact_link_groups(session: Session, document_set_id: str) -> None:
             id=new_id(),
             document_set_id=document_set_id,
             representative_text=matches[0].text,
-            normalized_text=normalized_text,
+            normalized_text=normalized_by_hash[match_hash],
             match_type="exact",
         )
         records.append(group)

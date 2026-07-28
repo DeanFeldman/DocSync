@@ -99,6 +99,88 @@ def load_test_app(tmp_path: Path):
     return main.app
 
 
+def test_creation_reuses_one_parsed_docx_and_emits_stage_timings(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    app = load_test_app(tmp_path)
+    validation_service = sys.modules["app.validation_service"]
+    editor_service = sys.modules["app.editor_service"]
+    main_module = sys.modules["app.main"]
+
+    parse_calls = 0
+    render_calls = 0
+    real_parse = validation_service.DocumentValidationService.parse_file
+
+    def counting_parse(payload: bytes, filename: str = "document.docx"):
+        nonlocal parse_calls
+        parse_calls += 1
+        return real_parse(payload, filename=filename)
+
+    def unexpected_reload(_path):
+        raise AssertionError("Initial editor revisions must reuse the parsed upload.")
+
+    def unexpected_render(*_args, **_kwargs):
+        nonlocal render_calls
+        render_calls += 1
+        raise AssertionError("Creation and structured endpoints must not render Word.")
+
+    monkeypatch.setattr(
+        validation_service.DocumentValidationService,
+        "parse_file",
+        staticmethod(counting_parse),
+    )
+    monkeypatch.setattr(editor_service, "_load_docx", unexpected_reload)
+    monkeypatch.setattr(main_module, "render_document_with_word", unexpected_render)
+
+    shared = "The building manager must submit the report every month."
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/document-sets",
+            data={"name": "Timed workspace"},
+            files=[
+                (
+                    "files",
+                    (
+                        "Alpha.docx",
+                        io.BytesIO(make_docx("Alpha", "1 Alpha Road", shared)),
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    ),
+                ),
+                (
+                    "files",
+                    (
+                        "Beta.docx",
+                        io.BytesIO(make_docx("Beta", "2 Beta Road", shared)),
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    ),
+                ),
+            ],
+        )
+        assert created.status_code == 201, created.text
+        assert parse_calls == 2
+        server_timing = created.headers["server-timing"]
+        for stage in (
+            "upload",
+            "validation",
+            "parsing",
+            "persistence",
+            "matching-setup",
+            "serialization",
+            "total",
+        ):
+            assert f"{stage};dur=" in server_timing
+
+        version_id = created.json()["documents"][0]["version_id"]
+        assert client.get(
+            f"/api/document-versions/{version_id}/pages"
+        ).status_code == 200
+        assert client.get(
+            f"/api/document-versions/{version_id}/editor-content"
+        ).status_code == 200
+        assert render_calls == 0
+
+
 def test_desktop_session_cookie_protects_document_endpoints(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("DOCUMENTSYNC_SESSION_TOKEN", "desktop-test-token")
     app = load_test_app(tmp_path)

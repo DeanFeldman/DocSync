@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import logging
 import secrets
+from time import perf_counter
 
-from fastapi import Depends, FastAPI, File, Form, Query, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -63,6 +65,7 @@ from .backup_service import DocumentBackupService
 from .error_mapper import DocuSyncError, ErrorMapper
 from .storage_service import DocumentStorageService
 
+logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -74,7 +77,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="DocumentSync API",
-    version="1.0.0",
+    version="1.4.1",
     description="DocSync structured DOCX viewing and controlled editing service.",
     lifespan=lifespan,
 )
@@ -149,12 +152,34 @@ def read_document_sets(session: Session = Depends(get_session)) -> dict:
 
 @app.post("/api/document-sets", status_code=201)
 async def upload_document_set(
+    response: Response,
     name: str = Form(...),
     files: list[UploadFile] = File(...),
     session: Session = Depends(get_session),
 ) -> dict:
     document_set = await create_document_set(session, name, files)
-    return serialize_document_set(document_set)
+    serialization_started = perf_counter()
+    payload = serialize_document_set(document_set)
+    timings = dict(
+        getattr(document_set, "_docsync_creation_timings", {})
+    )
+    timings["serialization_ms"] = (
+        perf_counter() - serialization_started
+    ) * 1000
+    timings["total_ms"] = (
+        timings.get("service_total_ms", 0.0) +
+        timings["serialization_ms"]
+    )
+    response.headers["Server-Timing"] = ", ".join(
+        f"{name.removesuffix('_ms').replace('_', '-')};dur={value:.2f}"
+        for name, value in timings.items()
+        if name != "service_total_ms"
+    )
+    logger.info(
+        "docsync.create_set.response_timing %s",
+        " ".join(f"{name}={value:.2f}" for name, value in timings.items()),
+    )
+    return payload
 
 
 @app.get("/api/document-sets/{document_set_id}")

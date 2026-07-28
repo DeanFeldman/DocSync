@@ -192,18 +192,14 @@ export async function fetchDocumentView(
 }
 
 export async function renderDocumentView(
-  documentId: string,
+  versionId: string,
   signal?: AbortSignal,
-  fallbackVersionId = documentId,
 ): Promise<DocumentView> {
-  // Keep Word rendering available for a future explicit "Word preview" button.
-  const response = await fetch(`${API_URL}/documents/${documentId}/render`, {
+  // Word rendering is an explicit, version-keyed user action.
+  const response = await fetch(`${API_URL}/documents/${versionId}/render`, {
     method: "POST",
     signal,
   });
-  if ([422, 503, 504].includes(response.status)) {
-    return fetchDocumentView(fallbackVersionId, signal);
-  }
   return parseResponse<DocumentView>(response);
 }
 
