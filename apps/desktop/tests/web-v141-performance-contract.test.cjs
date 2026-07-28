@@ -66,6 +66,14 @@ test("Word preview, near matching, and version history are explicit lazy resourc
   );
   assert.match(experience, /fetchSimilarMatches\(selectedBlock!/);
   assert.doesNotMatch(experience, /compareDocumentElements/);
+  assert.match(
+    experience,
+    /exactResult\.value\.exact_matches\s*\?\?/,
+  );
+  assert.match(
+    experience,
+    /match\.element_type === selectedBlock!\.element_type/,
+  );
 });
 
 test("large editor lists render progressively with memoized cards", () => {

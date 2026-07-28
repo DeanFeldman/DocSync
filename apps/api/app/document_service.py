@@ -756,42 +756,43 @@ def search_document_set(
     }
 
 def _create_exact_link_groups(session: Session, document_set_id: str) -> None:
-    elements = session.scalars(
-        select(DocumentElement)
-        .join(DocumentRecord)
-        .where(DocumentRecord.document_set_id == document_set_id)
+    current_blocks = session.execute(
+        select(DocumentBlockRevision, DocumentElement)
+        .join(
+            DocumentHead,
+            DocumentHead.current_version_id == DocumentBlockRevision.version_id,
+        )
+        .join(
+            DocumentRecord,
+            DocumentRecord.id == DocumentBlockRevision.document_id,
+        )
+        .join(
+            DocumentElement,
+            DocumentElement.id == DocumentBlockRevision.element_id,
+        )
+        .where(
+            DocumentRecord.document_set_id == document_set_id,
+            DocumentBlockRevision.shared_state == "shared",
+            DocumentBlockRevision.supported.is_(True),
+        )
     ).all()
 
-    detached_ids = set(
-        session.scalars(
-            select(DocumentBlockRevision.element_id)
-            .join(
-                DocumentHead,
-                DocumentHead.current_version_id == DocumentBlockRevision.version_id,
-            )
-            .join(
-                DocumentRecord,
-                DocumentRecord.id == DocumentBlockRevision.document_id,
-            )
-            .where(
-                DocumentRecord.document_set_id == document_set_id,
-                DocumentBlockRevision.shared_state == "detached",
-            )
-        )
-    )
-    by_text: dict[tuple[str, str], list[DocumentElement]] = defaultdict(list)
-    for element in elements:
-        if element.id in detached_ids:
-            continue
-        normalized_text = normalise_text(element.text)
+    by_hash: dict[str, list[DocumentElement]] = defaultdict(list)
+    normalized_by_hash: dict[str, str] = {}
+    for revision, element in current_blocks:
+        normalized_text = revision.normalized_text or normalise_text(revision.text)
         element.normalized_text = normalized_text
-        if normalized_text:
-            by_text[
-                (normalized_text, element_type_for_style(element.style_name))
-            ].append(element)
+        if not normalized_text:
+            continue
+        # The revision hash includes both normalized text and the block type
+        # derived from the actual DOCX structure. DocumentElement.style_name
+        # alone cannot distinguish a custom-styled paragraph from one carrying
+        # Word numbering metadata.
+        by_hash[revision.exact_match_hash].append(element)
+        normalized_by_hash[revision.exact_match_hash] = normalized_text
 
     records: list[object] = []
-    for (normalized_text, _element_type), matches in by_text.items():
+    for match_hash, matches in by_hash.items():
         distinct_documents = {match.document_id for match in matches}
         if len(distinct_documents) < 2:
             continue
@@ -800,7 +801,7 @@ def _create_exact_link_groups(session: Session, document_set_id: str) -> None:
             id=new_id(),
             document_set_id=document_set_id,
             representative_text=matches[0].text,
-            normalized_text=normalized_text,
+            normalized_text=normalized_by_hash[match_hash],
             match_type="exact",
         )
         records.append(group)

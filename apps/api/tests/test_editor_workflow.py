@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import hashlib
 import importlib
 import io
@@ -9,6 +10,7 @@ import zipfile
 from pathlib import Path
 
 from docx import Document
+from docx.enum.style import WD_STYLE_TYPE
 from fastapi.testclient import TestClient
 
 
@@ -49,6 +51,24 @@ def make_paragraph_docx(title: str, paragraphs: list[str]) -> bytes:
     document.add_heading(title, level=1)
     for text in paragraphs:
         document.add_paragraph(text)
+    return save_docx(document)
+
+
+def make_custom_style_docx(
+    title: str,
+    shared_text: str,
+    *,
+    numbered: bool,
+) -> bytes:
+    document = Document()
+    document.styles.add_style("Clause2Sub", WD_STYLE_TYPE.PARAGRAPH)
+    document.add_heading(title, level=1)
+    paragraph = document.add_paragraph(shared_text, style="Clause2Sub")
+    if numbered:
+        numbering = deepcopy(
+            document.styles["List Number"].element.pPr.numPr
+        )
+        paragraph._p.get_or_add_pPr().append(numbering)
     return save_docx(document)
 
 
@@ -277,6 +297,102 @@ def test_editor_content_preserves_delta_structure_and_normalized_matching(
         assert discovered_candidate["algorithm_version"] if (
             "algorithm_version" in discovered_candidate
         ) else discovered.json()["algorithm_version"] == "nfkc-sequence-v1"
+
+
+def test_exact_matches_exclude_custom_styled_paragraph_with_word_numbering(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    shared = (
+        "The Occupant understands the financial implications, fees and charges."
+    )
+    app = load_test_app(tmp_path, monkeypatch)
+
+    with TestClient(app) as client:
+        workspace = upload_set(
+            client,
+            {
+                "One.docx": make_custom_style_docx(
+                    "One",
+                    shared,
+                    numbered=False,
+                ),
+                "Two-numbered.docx": make_custom_style_docx(
+                    "Two",
+                    shared,
+                    numbered=True,
+                ),
+                "Three.docx": make_custom_style_docx(
+                    "Three",
+                    shared,
+                    numbered=False,
+                ),
+            },
+            name="Mixed Word numbering",
+        )
+        documents = documents_by_name(workspace)
+        one = read_editor_content(client, documents["One.docx"]["version_id"])
+        two = read_editor_content(
+            client,
+            documents["Two-numbered.docx"]["version_id"],
+        )
+        three = read_editor_content(
+            client,
+            documents["Three.docx"]["version_id"],
+        )
+        source = block_with_text(one, shared)
+        numbered = block_with_text(two, shared)
+        compatible = block_with_text(three, shared)
+
+        assert source["element_type"] == "paragraph"
+        assert compatible["element_type"] == "paragraph"
+        assert numbered["element_type"] == "list_item"
+
+        groups = [
+            group
+            for group in workspace["link_groups"]
+            if group["representative_text"] == shared
+        ]
+        assert len(groups) == 1
+        assert {
+            member["document_name"] for member in groups[0]["members"]
+        } == {"One.docx", "Three.docx"}
+
+        matches = client.get(
+            f"/api/document-elements/{source['element_id']}/matches"
+        )
+        assert matches.status_code == 200, matches.text
+        assert matches.json()["exact_match_count"] == 1
+        assert [
+            item["element_id"] for item in matches.json()["exact_matches"]
+        ] == [compatible["element_id"]]
+        assert {
+            member["element_type"]
+            for member in matches.json()["link_group"]["members"]
+        } == {"paragraph"}
+
+        preview = client.post(
+            f"/api/document-sets/{workspace['id']}/editor-preview",
+            json={
+                "base_versions": current_versions(
+                    workspace,
+                    ["One.docx", "Two-numbered.docx", "Three.docx"],
+                ),
+                "source_element_id": source["element_id"],
+                "edit_mode": "shared",
+                "targets": [
+                    {
+                        "element_id": source["element_id"],
+                        "replacement_text": f"{shared} Updated",
+                    },
+                    {
+                        "element_id": compatible["element_id"],
+                        "replacement_text": f"{shared} Updated",
+                    },
+                ],
+            },
+        )
+        assert preview.status_code == 200, preview.text
 
 
 def test_match_decisions_persist_and_control_near_match_targets(

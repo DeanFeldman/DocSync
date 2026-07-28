@@ -1294,13 +1294,21 @@ export default function DocumentExperience({
 
       if (exactResult.status === "fulfilled") {
         setLegacyDiscovery(exactResult.value);
-        for (const member of exactResult.value.link_group?.members ?? []) {
+        const exactCandidates =
+          exactResult.value.exact_matches ??
+          exactResult.value.link_group?.members ??
+          [];
+        for (const member of exactCandidates) {
           const match = normaliseMatch(
             member,
             selectedBlock!.text,
             "exact",
           );
-          if (match) {
+          if (
+            match &&
+            match.element_id !== selectedBlock!.element_id &&
+            match.element_type === selectedBlock!.element_type
+          ) {
             match.difference_spans = [
               { text: match.text, kind: "shared" },
             ];

@@ -1198,16 +1198,24 @@ def get_editor_matches(session: Session, element_id: str) -> dict:
         and source.shared_state == "shared"
         and candidate.shared_state == "shared"
     ]
-    legacy["source"].update(
-        {
-            "version_id": source.version_id,
-            "exact_match_hash": source.exact_match_hash,
-            "delta": source.delta_json,
-            "supported": source.supported,
-            "read_only": not source.supported,
-            "shared_state": source.shared_state,
-        }
+    serialized_source = _serialize_revision(
+        source,
+        document_name=document.original_name,
     )
+    legacy["source"].update(serialized_source)
+    if legacy["link_group"] is not None:
+        if exact:
+            safe_members = [serialized_source, *exact]
+            legacy["link_group"]["members"] = safe_members
+            legacy["link_group"]["member_count"] = len(safe_members)
+            legacy["link_group"]["document_count"] = len(
+                {member["document_id"] for member in safe_members}
+            )
+        else:
+            # Existing workspaces may contain a legacy text/style group that
+            # predates revision-aware structural matching. Do not expose that
+            # incompatible group as an editable exact match.
+            legacy["link_group"] = None
     legacy["exact_matches"] = exact
     legacy["matches"] = exact
     legacy["exact_match_count"] = len(exact)

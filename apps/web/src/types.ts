@@ -83,6 +83,7 @@ export interface MatchDiscovery {
     column_index?: number;
   };
   link_group: LinkGroup | null;
+  exact_matches?: EditorMatch[];
   exact_match_count: number;
   similar_matches: LinkMember[];
   similarity_status: "not_enabled" | string;
