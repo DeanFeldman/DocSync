@@ -2024,10 +2024,233 @@ def _persist_request_decisions(
         )
 
 
+def queue_editor_generation(
+    session: Session,
+    document_set_id: str,
+    request: EditorEditRequest,
+) -> dict:
+    with EDITOR_GENERATION_LOCK:
+        pending = session.scalar(
+            select(EditorOperation)
+            .where(
+                EditorOperation.document_set_id == document_set_id,
+                EditorOperation.status.in_(("queued", "processing")),
+            )
+            .order_by(EditorOperation.created_at.desc())
+        )
+        if pending is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "This workspace already has an update in progress. "
+                    "Wait for it to finish before generating again."
+                ),
+            )
+
+        _source, _source_document, _base_context, validated_targets = (
+            _validate_editor_request(session, document_set_id, request)
+        )
+        preview = _preview_payload(
+            document_set_id,
+            request,
+            validated_targets,
+        )
+        operation = EditorOperation(
+            id=new_id(),
+            document_set_id=document_set_id,
+            operation_type=request.edit_mode,
+            status="queued",
+            source_element_id=request.source_element_id,
+            replacement_text=(
+                validated_targets[0][0].replacement_text
+                if len(validated_targets) == 1
+                else None
+            ),
+            preview_json={
+                "request": request.model_dump(mode="json"),
+                "preview": preview,
+            },
+        )
+        session.add(operation)
+        session.commit()
+        return {
+            "operation_id": operation.id,
+            "generation_id": operation.id,
+            "status": "queued",
+            "edit_mode": request.edit_mode,
+            "affected_document_count": preview["affected_document_count"],
+            "affected_location_count": preview["affected_location_count"],
+            "status_url": f"/api/editor-operations/{operation.id}",
+        }
+
+
+def serialize_editor_generation_status(
+    session: Session,
+    operation_id: str,
+) -> dict:
+    operation = session.get(EditorOperation, operation_id)
+    if operation is None:
+        raise HTTPException(status_code=404, detail="Editor operation not found.")
+
+    payload = {
+        "operation_id": operation.id,
+        "generation_id": operation.id,
+        "status": operation.status,
+        "edit_mode": operation.operation_type,
+        "status_url": f"/api/editor-operations/{operation.id}",
+    }
+    if operation.status == "failed":
+        payload["error_detail"] = (
+            operation.error_detail
+            or "The background document update failed."
+        )
+        return payload
+    if operation.status != "completed":
+        preview_envelope = operation.preview_json or {}
+        preview = (
+            preview_envelope.get("preview", {})
+            if isinstance(preview_envelope, dict)
+            else {}
+        )
+        payload.update(
+            {
+                "affected_document_count": preview.get(
+                    "affected_document_count", 0
+                ),
+                "affected_location_count": preview.get(
+                    "affected_location_count", 0
+                ),
+            }
+        )
+        return payload
+
+    from .document_service import (
+        get_document_set_or_404,
+        serialize_document_set,
+    )
+
+    versions = sorted(
+        operation.versions,
+        key=lambda item: item.document.original_name.casefold(),
+    )
+    serialized_versions = [
+        {
+            "id": version.id,
+            "document_id": version.document_id,
+            "document_name": version.document.original_name,
+            "version_id": version.id,
+            "version_number": version.version_number,
+            "parent_version_id": version.parent_version_id,
+            "checksum_sha256": version.checksum_sha256,
+            "created_at": utc_isoformat(version.created_at),
+            "status": "completed",
+            "is_current": True,
+            "generation_id": operation.id,
+            "download_url": f"/api/document-versions/{version.id}/download",
+            "editor_content_url": (
+                f"/api/document-versions/{version.id}/editor-content"
+            ),
+        }
+        for version in versions
+    ]
+    payload.update(
+        {
+            "versions": serialized_versions,
+            "files": [
+                {
+                    "source_document_id": item["document_id"],
+                    "version_id": item["version_id"],
+                    "name": item["document_name"],
+                    "download_url": item["download_url"],
+                }
+                for item in serialized_versions
+            ],
+            "download_url": (
+                f"/api/editor-operations/{operation.id}/download"
+                if operation.status == "completed"
+                else None
+            ),
+            "document_set": serialize_document_set(
+                get_document_set_or_404(
+                    session,
+                    operation.document_set_id,
+                )
+            ),
+        }
+    )
+    return payload
+
+
+def process_queued_editor_generation(operation_id: str) -> None:
+    from .database import SessionLocal
+
+    with SessionLocal() as session:
+        operation = session.get(EditorOperation, operation_id)
+        if operation is None or operation.status != "queued":
+            return
+        envelope = operation.preview_json or {}
+        request_payload = (
+            envelope.get("request")
+            if isinstance(envelope, dict)
+            else None
+        )
+        if not isinstance(request_payload, dict):
+            operation.status = "failed"
+            operation.error_detail = "The queued editor request is missing."
+            operation.completed_at = utc_now()
+            session.commit()
+            return
+
+        operation.status = "processing"
+        session.commit()
+        try:
+            request = EditorEditRequest.model_validate(request_payload)
+            generate_editor_versions(
+                session,
+                operation.document_set_id,
+                request,
+                queued_operation_id=operation.id,
+            )
+        except Exception as exc:
+            session.rollback()
+            failed = session.get(EditorOperation, operation_id)
+            if failed is not None:
+                failed.status = "failed"
+                failed.error_detail = (
+                    str(exc.detail)
+                    if isinstance(exc, HTTPException)
+                    else str(exc) or "The background document update failed."
+                )
+                failed.completed_at = utc_now()
+                session.commit()
+
+
+def fail_interrupted_editor_generations(session: Session) -> int:
+    interrupted = list(
+        session.scalars(
+            select(EditorOperation).where(
+                EditorOperation.status.in_(("queued", "processing"))
+            )
+        )
+    )
+    for operation in interrupted:
+        operation.status = "failed"
+        operation.error_detail = (
+            "DocSync restarted before this background update finished. "
+            "Review the current document and generate again."
+        )
+        operation.completed_at = utc_now()
+    if interrupted:
+        session.commit()
+    return len(interrupted)
+
+
 def generate_editor_versions(
     session: Session,
     document_set_id: str,
     request: EditorEditRequest,
+    *,
+    queued_operation_id: str | None = None,
 ) -> dict:
     with EDITOR_GENERATION_LOCK:
         committed = False
@@ -2042,7 +2265,7 @@ def generate_editor_versions(
                 request,
                 validated_targets,
             )
-            operation_id = new_id()
+            operation_id = queued_operation_id or new_id()
             generated_root = settings.data_dir / "generated" / document_set_id
             generated_root.mkdir(parents=True, exist_ok=True)
             staging_directory = generated_root / f".{operation_id}.staging"
@@ -2126,21 +2349,37 @@ def generate_editor_versions(
             staging_directory.replace(final_directory)
             staging_directory = None
 
-            operation = EditorOperation(
-                id=operation_id,
-                document_set_id=document_set_id,
-                operation_type=request.edit_mode,
-                status="completed",
-                source_element_id=request.source_element_id,
-                replacement_text=(
-                    validated_targets[0][0].replacement_text
-                    if len(validated_targets) == 1
-                    else None
-                ),
-                preview_json=preview,
-                completed_at=utc_now(),
+            operation = (
+                session.get(EditorOperation, operation_id)
+                if queued_operation_id is not None
+                else None
             )
-            session.add(operation)
+            if queued_operation_id is not None and operation is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="The queued editor operation no longer exists.",
+                )
+            if operation is None:
+                operation = EditorOperation(
+                    id=operation_id,
+                    document_set_id=document_set_id,
+                    operation_type=request.edit_mode,
+                    status="completed",
+                    source_element_id=request.source_element_id,
+                    replacement_text=(
+                        validated_targets[0][0].replacement_text
+                        if len(validated_targets) == 1
+                        else None
+                    ),
+                    preview_json=preview,
+                    completed_at=utc_now(),
+                )
+                session.add(operation)
+            else:
+                operation.status = "completed"
+                operation.preview_json = preview
+                operation.error_detail = None
+                operation.completed_at = utc_now()
             session.flush()
             _persist_request_decisions(
                 session,

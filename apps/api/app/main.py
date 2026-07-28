@@ -5,14 +5,24 @@ import logging
 import secrets
 from time import perf_counter
 
-from fastapi import Depends, FastAPI, File, Form, Query, Request, Response, UploadFile
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
 from .config import settings
-from .database import get_session, init_db
+from .database import SessionLocal, get_session, init_db
 from .document_service import (
     add_documents_to_set,
     current_document_path,
@@ -39,15 +49,19 @@ from .editor_service import (
     compare_elements,
     document_version_path,
     editor_operation_download_path,
+    fail_interrupted_editor_generations,
     generate_editor_versions,
     get_editor_matches,
     get_similar_matches,
     get_version_or_404,
     preview_editor_edit,
+    process_queued_editor_generation,
+    queue_editor_generation,
     resolve_document_identifier,
     save_match_decisions,
     serialize_document_versions,
     serialize_editor_content,
+    serialize_editor_generation_status,
     serialize_version_document_view,
     restore_document_version,
 )
@@ -70,6 +84,8 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
+    with SessionLocal() as session:
+        fail_interrupted_editor_generations(session)
     DocumentStorageService.init_storage()
     DocumentStorageService.cleanup_stale_temp_files()
     yield
@@ -439,6 +455,32 @@ def generate_document_set_editor_edit(
     session: Session = Depends(get_session),
 ) -> dict:
     return generate_editor_versions(session, document_set_id, request)
+
+
+@app.post(
+    "/api/document-sets/{document_set_id}/editor-generate-async",
+    status_code=202,
+)
+def queue_document_set_editor_edit(
+    document_set_id: str,
+    request: EditorEditRequest,
+    background_tasks: BackgroundTasks,
+    session: Session = Depends(get_session),
+) -> dict:
+    queued = queue_editor_generation(session, document_set_id, request)
+    background_tasks.add_task(
+        process_queued_editor_generation,
+        queued["operation_id"],
+    )
+    return queued
+
+
+@app.get("/api/editor-operations/{operation_id}")
+def read_editor_operation_status(
+    operation_id: str,
+    session: Session = Depends(get_session),
+) -> dict:
+    return serialize_editor_generation_status(session, operation_id)
 
 
 @app.get("/api/document-sets/{document_set_id}/history")

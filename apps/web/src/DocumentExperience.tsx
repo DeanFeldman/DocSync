@@ -18,12 +18,14 @@ import {
   fetchDocumentVersions,
   fetchDocumentView,
   fetchEditorContent,
+  fetchEditorGeneration,
   fetchElementMatches,
   fetchSimilarMatches,
   generateEdit,
   generateEditorEdit,
   previewEdit,
   previewEditorEdit,
+  queueEditorEdit,
   renderDocumentView,
   restoreDocumentVersion,
   saveMatchDecisions,
@@ -122,6 +124,16 @@ function isMissingFeature(error: unknown): boolean {
   return (
     error instanceof ApiError &&
     [404, 405, 501].includes(error.status)
+  );
+}
+
+function isMissingEndpoint(error: unknown): boolean {
+  return (
+    error instanceof ApiError &&
+    (
+      [405, 501].includes(error.status) ||
+      (error.status === 404 && error.message === "Not Found")
+    )
   );
 }
 
@@ -819,6 +831,7 @@ export default function DocumentExperience({
   const [refreshToken, setRefreshToken] = useState(0);
   const [lastGeneration, setLastGeneration] =
     useState<EditorGenerationResponse | null>(null);
+  const [pendingGenerationId, setPendingGenerationId] = useState("");
   const previewButtonRef = useRef<HTMLButtonElement>(null);
   const versionHistoryRef = useRef<HTMLDetailsElement>(null);
   const modeScrollRef = useRef<HTMLDivElement>(null);
@@ -834,11 +847,14 @@ export default function DocumentExperience({
   const matchRequestRef = useRef(0);
   const editorActionRequestRef = useRef(0);
   const editorActionAbortRef = useRef<AbortController | null>(null);
+  const generationPollAbortRef = useRef<AbortController | null>(null);
+  const onGeneratedRef = useRef(onGenerated);
   const selectBlockRef = useRef<
     (block: EditorBlock, skipDiscardConfirmation?: boolean) => void
   >(() => undefined);
 
   activeDocumentIdRef.current = document?.id ?? "";
+  onGeneratedRef.current = onGenerated;
   if (documentContextRef.current.documentId !== activeDocumentIdRef.current) {
     documentContextRef.current = {
       documentId: activeDocumentIdRef.current,
@@ -854,6 +870,8 @@ export default function DocumentExperience({
       editorActionRequestRef.current += 1;
       editorActionAbortRef.current?.abort();
       editorActionAbortRef.current = null;
+      generationPollAbortRef.current?.abort();
+      generationPollAbortRef.current = null;
     };
   }, []);
 
@@ -2064,6 +2082,7 @@ export default function DocumentExperience({
       validTargets &&
       hasChangedOperation &&
       matchStatus === "ready" &&
+      !pendingGenerationId &&
       !action,
   );
   const canGenerate = Boolean(
@@ -2157,39 +2176,101 @@ export default function DocumentExperience({
     setAction("generate");
     setLocalError("");
     try {
-      let result: EditorGenerationResponse;
+      let result: EditorGenerationResponse | null = null;
       try {
-        result = await generateEditorEdit(
+        const queued = await queueEditorEdit(
           documentSet.id,
           operation,
           controller.signal,
         );
+        if (
+          controller.signal.aborted ||
+          requestId !== editorActionRequestRef.current
+        ) {
+          return;
+        }
+
+        const previousEditorContent = editorContent;
+        const documentContextToken = documentContextRef.current.token;
+        const optimisticTarget = operation.targets.find(
+          (target) => target.element_id === selectedBlock.element_id,
+        );
+        setPendingGenerationId(queued.generation_id);
+        setLastGeneration(queued);
+        setPreview(null);
+        setPreviewOpen(false);
+        setPreviewSignature("");
+        if (optimisticTarget) {
+          setEditorContent((current) =>
+            current
+              ? {
+                  ...current,
+                  blocks: current.blocks.map((block) =>
+                    block.element_id === optimisticTarget.element_id
+                      ? {
+                          ...block,
+                          text: optimisticTarget.replacement_text,
+                          delta: optimisticTarget.delta ?? block.delta,
+                        }
+                      : block,
+                  ),
+                }
+              : current,
+          );
+          setDraft((current) =>
+            current
+              ? {
+                  text: optimisticTarget.replacement_text,
+                  delta: optimisticTarget.delta ?? current.delta,
+                }
+              : current,
+          );
+        }
+        void reconcileQueuedGeneration(
+          queued.generation_id,
+          previousEditorContent,
+          documentContextToken,
+        );
+        return;
       } catch (error) {
         if (controller.signal.aborted) return;
-        if (
-          !isMissingFeature(error) ||
-          editMode !== "shared" ||
-          !legacyDiscovery?.link_group
-        ) {
+        if (!isMissingEndpoint(error)) {
           throw error;
         }
-        const compatible = await generateEdit(
-          documentSet.id,
-          legacyDiscovery.link_group.id,
-          draft?.text ?? "",
-          selectedBlock.element_id,
-          operation.targets.map((target) => target.element_id),
-          controller.signal,
-        );
-        result = {
-          generation_id: compatible.generation_id,
-          status: compatible.status,
-          download_url: compatible.download_url,
-          document_set: compatible.document_set,
-          files: compatible.files,
-        };
+        try {
+          result = await generateEditorEdit(
+            documentSet.id,
+            operation,
+            controller.signal,
+          );
+        } catch (fallbackError) {
+          if (
+            controller.signal.aborted ||
+            !isMissingFeature(fallbackError) ||
+            editMode !== "shared" ||
+            !legacyDiscovery?.link_group
+          ) {
+            throw fallbackError;
+          }
+          const compatible = await generateEdit(
+            documentSet.id,
+            legacyDiscovery.link_group.id,
+            draft?.text ?? "",
+            selectedBlock.element_id,
+            operation.targets.map((target) => target.element_id),
+            controller.signal,
+          );
+          result = {
+            generation_id: compatible.generation_id,
+            status: compatible.status,
+            download_url: compatible.download_url,
+            document_set: compatible.document_set,
+            files: compatible.files,
+          };
+        }
       }
       if (
+        !result ||
         controller.signal.aborted ||
         requestId !== editorActionRequestRef.current
       ) {
@@ -2235,6 +2316,65 @@ export default function DocumentExperience({
         }
         setAction(null);
       }
+    }
+  }
+
+  async function reconcileQueuedGeneration(
+    generationId: string,
+    previousEditorContent: EditorContentResponse | null,
+    documentContextToken: number,
+  ) {
+    generationPollAbortRef.current?.abort();
+    const controller = new AbortController();
+    generationPollAbortRef.current = controller;
+
+    while (!controller.signal.aborted && mountedRef.current) {
+      await new Promise<void>((resolve) => {
+        window.setTimeout(resolve, 500);
+      });
+      if (controller.signal.aborted || !mountedRef.current) return;
+
+      let result: EditorGenerationResponse;
+      try {
+        result = await fetchEditorGeneration(
+          generationId,
+          controller.signal,
+        );
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        // A transient polling failure must not turn a safely queued update
+        // into a user-visible failure. Keep reconciling in the background.
+        continue;
+      }
+
+      if (result.status === "queued" || result.status === "processing") {
+        setLastGeneration(result);
+        continue;
+      }
+
+      setPendingGenerationId("");
+      generationPollAbortRef.current = null;
+      if (result.status === "completed") {
+        setLastGeneration(result);
+        onGeneratedRef.current(result);
+        if (documentContextRef.current.token === documentContextToken) {
+          setSelectedElementId("");
+          setDraft(null);
+          setMatches([]);
+          setIncludedElementIds(new Set());
+          setRefreshToken((current) => current + 1);
+        }
+      } else {
+        if (documentContextRef.current.token === documentContextToken) {
+          setEditorContent(previousEditorContent);
+        }
+        setLastGeneration(result);
+        setLocalError(
+          result.error_detail ??
+            "The update could not be completed. Your documents were not changed.",
+        );
+      }
+      return;
     }
   }
 
@@ -2670,6 +2810,7 @@ export default function DocumentExperience({
               block={selectedBlock}
               value={draft?.delta ?? null}
               resetToken={editorResetToken}
+              disabled={Boolean(pendingGenerationId)}
               onChange={handleDraftChange}
             />
             <div className="structured-document-heading">
@@ -3228,8 +3369,10 @@ export default function DocumentExperience({
                   disabled={!canGenerate}
                 >
                   {action === "generate"
-                    ? "Generating versions…"
-                    : "Generate new versions"}
+                    ? "Accepting update…"
+                    : pendingGenerationId
+                      ? "Update accepted — processing…"
+                      : "Generate new versions"}
                 </button>
               </div>
               <p className="generate-safety-copy">
@@ -3252,16 +3395,36 @@ export default function DocumentExperience({
               )}
 
               {lastGeneration && (
-                <div className="generation-ready-state" role="status">
-                  <strong>New versions created</strong>
+                <div
+                  className={`generation-ready-state ${
+                    ["queued", "processing"].includes(lastGeneration.status)
+                      ? "processing"
+                      : lastGeneration.status
+                  }`}
+                  role="status"
+                  aria-live="polite"
+                >
+                  <strong>
+                    {["queued", "processing"].includes(lastGeneration.status)
+                      ? "Update accepted"
+                      : lastGeneration.status === "completed"
+                        ? "New versions created"
+                        : "Update needs attention"}
+                  </strong>
                   <span>
-                    The editor reloaded the current document mappings.
+                    {["queued", "processing"].includes(lastGeneration.status)
+                      ? "Your change is already reflected here. DocSync is creating and validating the Word versions in the background."
+                      : lastGeneration.status === "completed"
+                        ? "The Word versions are ready and the editor mappings were refreshed."
+                        : lastGeneration.error_detail ??
+                          "The background update did not complete."}
                   </span>
-                  {lastGeneration.download_url && (
-                    <a href={absoluteApiUrl(lastGeneration.download_url)}>
-                      Download generated set
-                    </a>
-                  )}
+                  {lastGeneration.status === "completed" &&
+                    lastGeneration.download_url && (
+                      <a href={absoluteApiUrl(lastGeneration.download_url)}>
+                        Download generated set
+                      </a>
+                    )}
                 </div>
               )}
             </div>

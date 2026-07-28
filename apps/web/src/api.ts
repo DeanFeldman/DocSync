@@ -286,6 +286,34 @@ export async function generateEditorEdit(
   return parseResponse<EditorGenerationResponse>(response);
 }
 
+export async function queueEditorEdit(
+  documentSetId: string,
+  request: EditorOperationRequest,
+  signal?: AbortSignal,
+): Promise<EditorGenerationResponse> {
+  const response = await fetch(
+    `${API_URL}/document-sets/${documentSetId}/editor-generate-async`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(request),
+      signal,
+    },
+  );
+  return parseResponse<EditorGenerationResponse>(response);
+}
+
+export async function fetchEditorGeneration(
+  operationId: string,
+  signal?: AbortSignal,
+): Promise<EditorGenerationResponse> {
+  const response = await fetch(
+    `${API_URL}/editor-operations/${operationId}`,
+    { signal },
+  );
+  return parseResponse<EditorGenerationResponse>(response);
+}
+
 export async function fetchDocumentVersions(
   documentId: string,
   signal?: AbortSignal,

@@ -84,3 +84,18 @@ test("large editor lists render progressively with memoized cards", () => {
   assert.match(experience, /\.slice\(0, visibleBlockCount\)/);
   assert.match(experience, /Show next/);
 });
+
+test("generation is accepted optimistically and reconciled in the background", () => {
+  const experience = read("apps/web/src/DocumentExperience.tsx");
+  const api = read("apps/web/src/api.ts");
+
+  assert.match(api, /editor-generate-async/);
+  assert.match(api, /editor-operations\/\$\{operationId\}/);
+  assert.match(experience, /await queueEditorEdit\(/);
+  assert.match(experience, /setPendingGenerationId\(queued\.generation_id\)/);
+  assert.match(experience, /optimisticTarget\.replacement_text/);
+  assert.match(experience, /reconcileQueuedGeneration/);
+  assert.match(experience, /fetchEditorGeneration\(/);
+  assert.match(experience, /Update accepted/);
+  assert.match(experience, /creating and validating the Word versions in the background/);
+});
