@@ -395,6 +395,76 @@ def test_exact_matches_exclude_custom_styled_paragraph_with_word_numbering(
         assert preview.status_code == 200, preview.text
 
 
+def test_editor_generation_can_be_queued_and_reconciled_by_status(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    shared = "The resident submits the signed schedule every month."
+    app = load_test_app(tmp_path, monkeypatch)
+
+    with TestClient(app) as client:
+        workspace = upload_set(
+            client,
+            {
+                "Alpha.docx": make_paragraph_docx("Alpha", [shared]),
+                "Beta.docx": make_paragraph_docx("Beta", [shared]),
+            },
+            name="Queued generation",
+        )
+        documents = documents_by_name(workspace)
+        alpha = read_editor_content(
+            client,
+            documents["Alpha.docx"]["version_id"],
+        )
+        beta = read_editor_content(
+            client,
+            documents["Beta.docx"]["version_id"],
+        )
+        source = block_with_text(alpha, shared)
+        candidate = block_with_text(beta, shared)
+        request = {
+            "base_versions": current_versions(
+                workspace,
+                ["Alpha.docx", "Beta.docx"],
+            ),
+            "source_element_id": source["element_id"],
+            "edit_mode": "shared",
+            "targets": [
+                {
+                    "element_id": source["element_id"],
+                    "replacement_text": f"{shared} Updated",
+                },
+                {
+                    "element_id": candidate["element_id"],
+                    "replacement_text": f"{shared} Updated",
+                },
+            ],
+        }
+
+        queued = client.post(
+            f"/api/document-sets/{workspace['id']}/editor-generate-async",
+            json=request,
+        )
+        assert queued.status_code == 202, queued.text
+        assert queued.json()["status"] == "queued"
+        operation_id = queued.json()["operation_id"]
+
+        completed = client.get(f"/api/editor-operations/{operation_id}")
+        assert completed.status_code == 200, completed.text
+        assert completed.json()["status"] == "completed"
+        assert len(completed.json()["versions"]) == 2
+        assert completed.json()["document_set"]["id"] == workspace["id"]
+        assert completed.json()["download_url"].endswith(
+            f"/{operation_id}/download"
+        )
+
+        stale_duplicate = client.post(
+            f"/api/document-sets/{workspace['id']}/editor-generate-async",
+            json=request,
+        )
+        assert stale_duplicate.status_code == 409
+
+
 def test_match_decisions_persist_and_control_near_match_targets(
     tmp_path: Path,
     monkeypatch,

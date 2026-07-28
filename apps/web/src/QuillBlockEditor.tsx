@@ -18,6 +18,7 @@ interface QuillBlockEditorProps {
   block: EditorBlock | null;
   value: QuillDelta | null;
   resetToken: number;
+  disabled?: boolean;
   onChange: (draft: QuillDraft) => void;
 }
 
@@ -110,6 +111,7 @@ export default function QuillBlockEditor({
   block,
   value,
   resetToken,
+  disabled = false,
   onChange,
 }: QuillBlockEditorProps) {
   const hostRef = useRef<HTMLDivElement>(null);
@@ -160,7 +162,7 @@ export default function QuillBlockEditor({
       },
     });
     quillRef.current = quill;
-    const readOnly = block.read_only || !block.supported;
+    const readOnly = disabled || block.read_only || !block.supported;
     setQuillInteractiveState(quill, toolbar, readOnly);
 
     const initial = initialDeltaRef.current ?? block.delta;
@@ -247,6 +249,7 @@ export default function QuillBlockEditor({
     block?.element_id,
     block?.read_only,
     block?.supported,
+    disabled,
     resetToken,
   ]);
 
@@ -266,7 +269,7 @@ export default function QuillBlockEditor({
       return;
     }
 
-    const readOnly = block.read_only || !block.supported;
+    const readOnly = disabled || block.read_only || !block.supported;
     setQuillInteractiveState(quill, toolbar, readOnly);
 
     if (readOnly) {
@@ -288,12 +291,14 @@ export default function QuillBlockEditor({
     });
 
     return () => window.cancelAnimationFrame(frame);
-  }, [block?.element_id, resetToken]);
+  }, [block?.element_id, disabled, resetToken]);
 
   return (
     <section
       className={`quill-block-editor ${
-        !block || block.read_only || !block.supported ? "is-disabled" : ""
+        !block || disabled || block.read_only || !block.supported
+          ? "is-disabled"
+          : ""
       }`}
       aria-labelledby="quill-editor-title"
     >
