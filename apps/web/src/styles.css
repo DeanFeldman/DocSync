@@ -2937,6 +2937,18 @@ button.layout-fallback-block.editable:focus-visible {
   background: #eefaf8;
 }
 
+.generation-ready-state.processing {
+  border-color: #b9d4ed;
+  color: #1e557e;
+  background: #eef7ff;
+}
+
+.generation-ready-state.failed {
+  border-color: #e4b6bd;
+  color: #8d2938;
+  background: #fff1f3;
+}
+
 .preview-ready-state strong,
 .generation-ready-state strong {
   font-size: 0.65rem;
@@ -3327,6 +3339,18 @@ button.layout-fallback-block.editable:focus-visible {
   color: #a9eee4;
   background: #143a38;
   border-color: #34776f;
+}
+
+:root[data-theme="dark"] .generation-ready-state.processing {
+  color: #b9dcfb;
+  background: #173249;
+  border-color: #3b6e95;
+}
+
+:root[data-theme="dark"] .generation-ready-state.failed {
+  color: #ffb6c0;
+  background: #421f27;
+  border-color: #8f4552;
 }
 
 :root[data-theme="dark"] .target-row.excluded,

@@ -397,8 +397,13 @@ export interface DocumentVersionRestoreResponse {
 }
 
 export interface EditorGenerationResponse {
+  operation_id?: string;
   generation_id: string;
   status: string;
+  status_url?: string;
+  error_detail?: string;
+  affected_document_count?: number;
+  affected_location_count?: number;
   download_url?: string;
   document_set?: DocumentSetResponse;
   versions?: DocumentVersion[];

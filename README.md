@@ -67,6 +67,8 @@ progressive and version-aware.
   opened.
 - Restores per-view selection, draft, and scroll state and progressively mounts
   large editor block lists.
+- Accepts reviewed generation immediately, reflects the edit optimistically,
+  and completes DOCX version creation through a durable local background job.
 - Emits local creation-stage timings without adding external telemetry.
 
 See [the v1.4.1 release notes](docs/v1.4.1-release-notes.md) for the complete
