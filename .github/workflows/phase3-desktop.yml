@@ -45,8 +45,12 @@ jobs:
       - run: npm ci
       - run: python -m pip install -r apps/api/requirements-build.txt
       - run: npm test
-      - run: npm run build:web
-      - run: npm run dist:win
+      - name: Build the web app and frozen Windows backend
+        run: npm run build:desktop
+      - name: Smoke test the exact frozen backend
+        run: npm run smoke:api:win
+      - name: Package the tested backend in the installer
+        run: npm run package:win
       - name: Create installer checksum
         shell: pwsh
         run: Get-FileHash release/v1/*.exe -Algorithm SHA256 | ForEach-Object { "$($_.Hash)  $($_.Path | Split-Path -Leaf)" } | Set-Content release/v1/SHA256SUMS.txt

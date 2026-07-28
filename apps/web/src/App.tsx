@@ -1041,7 +1041,12 @@ const canUpload = files.length >= 2 && !busyAction;
               </p> */}
 
         <div className="topbar-actions">
-          {/* <span className="release-pill">Desktop v1</span> */}
+          <span
+            className="version-badge"
+            aria-label={`DocSync version ${__DOCSYNC_VERSION__}`}
+          >
+            v{__DOCSYNC_VERSION__}
+          </span>
           <button
             type="button"
             className="theme-toggle"

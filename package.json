@@ -1,6 +1,6 @@
 {
   "name": "docsync-desktop",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "private": true,
   "description": "DocSync Windows desktop application for coordinated DOCX editing",
   "author": "Dean Feldman",
@@ -22,7 +22,9 @@
     "prepack:win": "npm run build:desktop",
     "pack:win": "electron-builder --win dir",
     "predist:win": "npm run build:desktop",
-    "dist:win": "electron-builder --win nsis --publish never"
+    "dist:win": "electron-builder --win nsis --publish never",
+    "package:win": "electron-builder --win nsis --publish never",
+    "smoke:api:win": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-packaged-backend.ps1"
   },
   "devDependencies": {
     "electron": "43.1.1",
@@ -38,6 +40,7 @@
     },
     "files": [
       "apps/desktop/main.cjs",
+      "apps/desktop/startup-supervision.cjs",
       "package.json"
     ],
     "extraResources": [
