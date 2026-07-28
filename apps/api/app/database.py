@@ -3,15 +3,19 @@ from __future__ import annotations
 from collections.abc import Generator
 import hashlib
 import json
+import logging
 import re
 import unicodedata
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from .config import settings
+
+
+logger = logging.getLogger(__name__)
 
 
 class Base(DeclarativeBase):
@@ -33,9 +37,33 @@ _HEADING_LEVEL = re.compile(r"^heading\s+(\d+)$", re.IGNORECASE)
 
 def init_db() -> None:
     from . import models  # noqa: F401
+    from .migration_service import WorkspaceMigration, run_workspace_migrations
 
-    Base.metadata.create_all(bind=engine)
-    _backfill_version_foundation()
+    def report_stage(stage: str) -> None:
+        logger.warning("docsync.startup.stage=%s", stage)
+
+    report_stage("checking_workspace_schema")
+    result = run_workspace_migrations(
+        engine=engine,
+        database_url=settings.database_url,
+        backup_directory=settings.data_dir / "migration-backups",
+        create_schema=lambda connection: Base.metadata.create_all(bind=connection),
+        migrations=(
+            WorkspaceMigration(
+                version=1,
+                name="version_foundation",
+                apply=_migrate_version_foundation,
+            ),
+        ),
+        report_stage=report_stage,
+    )
+    if result.applied_versions:
+        logger.warning(
+            "docsync.startup.migrations_applied=%s backup=%s",
+            ",".join(str(version) for version in result.applied_versions),
+            result.backup_path or "not-required",
+        )
+    report_stage("workspace_schema_ready")
 
 
 def _normalise_text(value: str) -> str:
@@ -425,8 +453,59 @@ def _backfill_block_revisions(
             _restore_before_text(state, generation_targets)
 
 
-def _backfill_version_foundation() -> None:
-    """Idempotently bridge pre-versioning SQLite databases at startup.
+def _version_foundation_is_complete(session: Session) -> bool:
+    """Use indexed relational checks instead of rebuilding every block snapshot."""
+
+    checks = (
+        """
+        SELECT 1
+        FROM documents d
+        LEFT JOIN document_versions v ON v.id = d.id AND v.document_id = d.id
+        WHERE v.id IS NULL
+        LIMIT 1
+        """,
+        """
+        SELECT 1
+        FROM documents d
+        LEFT JOIN document_heads h ON h.document_id = d.id
+        LEFT JOIN document_versions v
+          ON v.id = h.current_version_id AND v.document_id = d.id
+        WHERE h.document_id IS NULL OR v.id IS NULL
+        LIMIT 1
+        """,
+        """
+        SELECT 1
+        FROM document_elements e
+        JOIN document_versions v ON v.document_id = e.document_id
+        LEFT JOIN document_block_revisions r
+          ON r.version_id = v.id AND r.element_id = e.id
+        WHERE r.id IS NULL
+        LIMIT 1
+        """,
+        """
+        SELECT 1
+        FROM generated_versions g
+        JOIN generation_jobs j ON j.id = g.generation_id
+        LEFT JOIN document_versions v
+          ON v.id = g.id
+         AND v.document_id = g.source_document_id
+         AND v.generation_id = g.generation_id
+        WHERE j.status = 'completed' AND v.id IS NULL
+        LIMIT 1
+        """,
+    )
+    return all(session.execute(text(query)).first() is None for query in checks)
+
+
+def _migrate_version_foundation(session: Session) -> None:
+    if _version_foundation_is_complete(session):
+        logger.warning("docsync.startup.version_foundation=already_complete")
+        return
+    _backfill_version_foundation(session)
+
+
+def _backfill_version_foundation(session: Session) -> None:
+    """Bridge pre-versioning SQLite databases during schema migration 1.
 
     The original document keeps its historical public ID. Legacy generated rows
     likewise keep their IDs, so existing links remain valid while every document
@@ -435,18 +514,17 @@ def _backfill_version_foundation() -> None:
 
     from .models import DocumentRecord
 
-    with SessionLocal.begin() as session:
-        documents = list(
-            session.scalars(
-                select(DocumentRecord).order_by(
-                    DocumentRecord.created_at,
-                    DocumentRecord.id,
-                )
-            )
+    documents = session.scalars(
+        select(DocumentRecord).order_by(
+            DocumentRecord.created_at,
+            DocumentRecord.id,
         )
-        for document in documents:
-            versions, head = _backfill_document_versions(session, document)
-            _backfill_block_revisions(session, document, versions, head)
+    ).yield_per(25)
+    for index, document in enumerate(documents, start=1):
+        versions, head = _backfill_document_versions(session, document)
+        _backfill_block_revisions(session, document, versions, head)
+        if index % 25 == 0:
+            session.flush()
 
 
 def get_session() -> Generator[Session, None, None]:

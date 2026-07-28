@@ -69,15 +69,19 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    logger.warning("docsync.startup.stage=database_initialization")
     init_db()
+    logger.warning("docsync.startup.stage=storage_initialization")
     DocumentStorageService.init_storage()
+    logger.warning("docsync.startup.stage=temporary_file_cleanup")
     DocumentStorageService.cleanup_stale_temp_files()
+    logger.warning("docsync.startup.stage=ready")
     yield
 
 
 app = FastAPI(
     title="DocumentSync API",
-    version="1.4.1",
+    version="1.4.2",
     description="DocSync structured DOCX viewing and controlled editing service.",
     lifespan=lifespan,
 )

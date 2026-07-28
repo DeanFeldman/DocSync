@@ -6,6 +6,12 @@ const http = require("node:http");
 const net = require("node:net");
 const path = require("node:path");
 const {
+  appendBounded,
+  formatStartupFailure,
+  startupTimeoutMs,
+  waitForHealthy,
+} = require("./startup-supervision.cjs");
+const {
   app,
   BrowserWindow,
   dialog,
@@ -21,6 +27,10 @@ let backendProcess = null;
 let backendPort = null;
 let backendOrigin = null;
 let backendErrorLog = "";
+let backendOutputLog = "";
+let backendExitDetails = { exitCode: null, signal: null };
+let backendSessionToken = "";
+let backendWorkspacePath = "";
 let mainWindow = null;
 
 function applicationPaths() {
@@ -45,7 +55,7 @@ function applicationPaths() {
   };
 }
 
-function findAvailablePort() {
+function reserveAvailablePort() {
   return new Promise((resolve, reject) => {
     const reservation = net.createServer();
     reservation.unref();
@@ -62,14 +72,41 @@ function findAvailablePort() {
   });
 }
 
+async function findAvailablePort(maxAttempts = 3) {
+  let latestError = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      return await reserveAvailablePort();
+    } catch (error) {
+      latestError = error;
+    }
+  }
+  throw latestError || new Error("Windows did not allocate a local port.");
+}
+
 function healthRequest() {
   return new Promise((resolve, reject) => {
     const request = http.get(
       { hostname: "127.0.0.1", port: backendPort, path: "/api/health", timeout: 1_500 },
       (response) => {
-        response.resume();
-        if (response.statusCode === 200) resolve();
-        else reject(new Error(`The local service health check returned ${response.statusCode}.`));
+        let body = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk) => {
+          body = appendBounded(body, chunk, 1_000);
+        });
+        response.on("end", () => {
+          if (response.statusCode !== 200) {
+            reject(new Error(`The local service health check returned ${response.statusCode}.`));
+            return;
+          }
+          try {
+            const payload = JSON.parse(body);
+            if (payload.status === "ok") resolve();
+            else reject(new Error("The local service health response was not ready."));
+          } catch {
+            reject(new Error("The local service health response was invalid."));
+          }
+        });
       },
     );
     request.once("timeout", () => request.destroy(new Error("The local service health check timed out.")));
@@ -77,36 +114,24 @@ function healthRequest() {
   });
 }
 
-async function waitForHealth() {
-  let latestError = null;
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    if (!backendProcess) throw new Error("The local document service stopped during startup.");
-    try {
-      await healthRequest();
-      return;
-    } catch (error) {
-      latestError = error;
-      await new Promise((resolve) => setTimeout(resolve, 500));
-    }
-  }
-  throw latestError || new Error("The local document service did not become ready.");
-}
-
 async function startBackend() {
   const paths = applicationPaths();
   backendPort = await findAvailablePort();
   backendOrigin = `http://127.0.0.1:${backendPort}`;
-  const sessionToken = crypto.randomBytes(32).toString("base64url");
-  const dataDirectory = path.join(app.getPath("userData"), "workspace");
+  backendSessionToken = crypto.randomBytes(32).toString("base64url");
+  backendWorkspacePath = path.join(app.getPath("userData"), "workspace");
+  backendErrorLog = "";
+  backendOutputLog = "";
+  backendExitDetails = { exitCode: null, signal: null };
 
   backendProcess = spawn(paths.executable, paths.args, {
     cwd: paths.workingDirectory,
     env: {
       ...process.env,
-      DOCUMENTSYNC_DATA_DIR: dataDirectory,
+      DOCUMENTSYNC_DATA_DIR: backendWorkspacePath,
       DOCUMENTSYNC_WEB_DIST: paths.webDist,
       DOCUMENTSYNC_RENDER_SCRIPT: paths.renderScript,
-      DOCUMENTSYNC_SESSION_TOKEN: sessionToken,
+      DOCUMENTSYNC_SESSION_TOKEN: backendSessionToken,
       DOCUMENTSYNC_CORS_ORIGINS: backendOrigin,
       DOCUMENTSYNC_PORT: String(backendPort),
       PYTHONUNBUFFERED: "1",
@@ -115,28 +140,44 @@ async function startBackend() {
     windowsHide: true,
   });
 
-  backendProcess.stdout.on("data", () => {});
+  backendProcess.stdout.on("data", (chunk) => {
+    backendOutputLog = appendBounded(backendOutputLog, chunk.toString("utf8"));
+  });
   backendProcess.stderr.on("data", (chunk) => {
-    backendErrorLog = `${backendErrorLog}${chunk.toString("utf8")}`.slice(-12_000);
+    backendErrorLog = appendBounded(backendErrorLog, chunk.toString("utf8"));
   });
   backendProcess.once("error", (error) => {
-    backendErrorLog = `${backendErrorLog}\n${error.message}`.slice(-12_000);
-    backendProcess = null;
+    backendErrorLog = appendBounded(backendErrorLog, `\n${error.message}`);
+    backendExitDetails = {
+      exitCode: error.code || "spawn error",
+      signal: null,
+    };
   });
-  backendProcess.once("exit", () => {
-    backendProcess = null;
+  backendProcess.once("exit", (exitCode, signal) => {
+    backendExitDetails = { exitCode, signal };
   });
 
   await session.defaultSession.cookies.set({
     url: backendOrigin,
     name: "docsync_session",
-    value: sessionToken,
+    value: backendSessionToken,
     path: "/",
     httpOnly: true,
     secure: false,
     sameSite: "strict",
   });
-  await waitForHealth();
+  await waitForHealthy({
+    requestHealth: healthRequest,
+    isRunning: () => Boolean(
+      backendProcess &&
+      backendExitDetails.exitCode === null &&
+      backendExitDetails.signal === null &&
+      backendProcess.exitCode === null &&
+      !backendProcess.killed
+    ),
+    getExitDetails: () => backendExitDetails,
+    timeoutMs: startupTimeoutMs(app.isPackaged),
+  });
 }
 
 function isTrustedUrl(targetUrl) {
@@ -204,7 +245,9 @@ function createWindow() {
 
 function stopBackend() {
   if (!backendProcess) return;
-  backendProcess.kill();
+  if (backendProcess.exitCode === null && !backendProcess.killed) {
+    backendProcess.kill();
+  }
   backendProcess = null;
 }
 
@@ -223,8 +266,15 @@ if (hasSingleInstanceLock) {
       await startBackend();
       createWindow();
     } catch (error) {
-      const detail = backendErrorLog.trim() ? `\n\nService details:\n${backendErrorLog.trim()}` : "";
-      dialog.showErrorBox("DocSync could not start", `${error.message}${detail}`);
+      dialog.showErrorBox(
+        "DocSync could not start",
+        formatStartupFailure(error, {
+          workspacePath: backendWorkspacePath,
+          stderr: backendErrorLog,
+          stdout: backendOutputLog,
+          secrets: [backendSessionToken],
+        }),
+      );
       app.quit();
     }
   });

@@ -51,8 +51,14 @@ jobs:
       - name: Run tests
         run: npm test
 
-      - name: Build Windows installer
-        run: npm run dist:win
+      - name: Build the web app and frozen Windows backend
+        run: npm run build:desktop
+
+      - name: Smoke test the exact frozen backend
+        run: npm run smoke:api:win
+
+      - name: Package the tested backend in the installer
+        run: npm run package:win
 
       - name: Prepare release files
         shell: pwsh

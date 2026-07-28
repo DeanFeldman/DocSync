@@ -31,6 +31,23 @@ DocSync-Setup-latest.exe
 
 ---
 
+## Version 1.4.2
+
+DocSync `v1.4.2` makes installed Windows startup safe and predictable for
+existing local workspaces. Ordered schema migrations run once, a verified
+timestamped database backup is created before legacy data is changed, and a
+failed migration restores the original active database. Packaged startup now
+distinguishes an early service crash from a live preparation timeout and allows
+up to 120 seconds for a legacy workspace to become ready.
+
+The header displays the installed version as `v1.4.2` on the home and workspace
+screens. That value is injected from the root package during the Vite build.
+Windows CI also starts the exact frozen backend that is packaged into the
+installer and verifies `/api/health` against a temporary workspace.
+
+See [the v1.4.2 release notes](docs/v1.4.2-release-notes.md) for migration
+backup/recovery details and the complete verification scope.
+
 ## Version 1.4.1
 
 DocSync `v1.4.1` makes workspace creation and Layout/Edit/Compare switching
@@ -262,7 +279,19 @@ The backend reads configuration from environment variables.
 
 See [`.env.example`](.env.example) for a local development template.
 
-Existing workspaces are upgraded and backfilled when the backend starts. No manual migration command is normally required.
+Existing workspaces are upgraded by ordered, one-time schema migrations when the
+backend starts. Before an older database is modified, DocSync stores and verifies
+a timestamped backup under `workspace/migration-backups`; the five newest
+backups are retained. A current workspace skips completed migrations and does
+not rerun the version/block-revision backfill. No manual migration command is
+normally required.
+
+If migration fails, the active database is restored automatically and the
+startup dialog shows the workspace and recovery-backup paths. Do not move or
+delete the workspace. Close DocSync before any manual restore, preserve the
+active `documentsync.db`, then copy the support-selected backup into place as
+`documentsync.db`. See the
+[v1.4.2 recovery notes](docs/v1.4.2-release-notes.md#manual-recovery).
 
 ---
 
@@ -404,7 +433,7 @@ The workflow reads the application version from the Git tag, so the source `pack
 From the repository root:
 
 ```powershell
-$version = "1.4.1"
+$version = "1.4.2"
 
 git switch main
 git pull origin main
