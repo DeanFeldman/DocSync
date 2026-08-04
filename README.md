@@ -59,6 +59,24 @@ See [the v1.8.0 release notes](docs/v1.8.0-release-notes.md),
 and [manual test plan](docs/v1.8.0-manual-testing.md).
 
 ---
+DocSync `v1.8.0` adds direct, confidence-gated selection to the high-fidelity
+Microsoft Word preview. After Word exports the immutable version to PDF,
+DocSync prepares a versioned coordinate map in the background. Reliable body,
+heading, list, table, header, and footer regions can be clicked or activated
+with Enter or Space to open the exact block in Edit.
+
+Coordinates are normalised to each page and remain aligned during zoom,
+fit-to-width, fit-to-page, scrolling, window resizing, and sidebar resizing.
+Hover, focus, selected, read-only, and **Show selectable areas** states expose
+the map without permanently obscuring the document. Ambiguous or low-confidence
+matches never become editable; the PDF stays visible and **Select from
+structure** remains available when a map is partial or fails.
+
+See [the v1.8.0 release notes](docs/v1.8.0-release-notes.md),
+[preview-overlay requirements](docs/v1.8.0-preview-overlay-requirements.md),
+[manual test plan](docs/v1.8.0-manual-testing.md),
+[architecture](docs/architecture.md), and
+[editable editor design](docs/editable-document-editor.md).
 
 ## Version 1.7.0
 
@@ -213,6 +231,13 @@ DocSync provides three document workspace modes.
   directly without leaving Layout.
 - Reuses the complete operation sidebar for formatting, exact and near matches,
   target selection, preview, and generation.
+- Selects reliably mapped body, list, table, header, and footer blocks directly
+  from the high-fidelity Word preview.
+- Keeps normalised overlays aligned during zoom, fitting, scrolling, and
+  viewer or sidebar resizing.
+- Supports mouse, Tab, Shift+Tab, Enter, and Space selection with accessible
+  editable/read-only labels.
+- Opens supported structured Layout blocks directly in the editor.
 - Shows unsupported or preserved Word structures as read-only with a reason.
 - Provides **Select from structure** when a coordinate is missing or uncertain.
 - Preserves the original document as the authoritative layout reference.
@@ -313,6 +338,18 @@ DocSync is designed around controlled document editing.
 9. Generate new immutable versions in the background.
 10. Review the rerendered Word layout, or use structured **Edit** as a fallback.
 11. Download or restore versions when needed.
+3. Open a document in **Layout** or **Edit**.
+4. In **Layout**, load the Word preview and select a reliably mapped region, or
+   choose **Select from structure** when a coordinate is unavailable.
+5. DocSync validates the displayed immutable version, opens the exact supported
+   block, and focuses it in **Edit**.
+6. Edit the block in the structured editor.
+7. Review exact and near matches in **Compare**.
+8. Choose the editing mode.
+9. Select the intended targets.
+10. Preview the complete result.
+11. Generate new immutable versions.
+12. Download or restore versions when needed.
 
 ---
 
@@ -323,6 +360,8 @@ DocSync is designed around controlled document editing.
 - **Frontend:** React, TypeScript, Vite, and Quill 2
 - **Backend:** FastAPI and Python
 - **Document processing:** `python-docx` and PyMuPDF
+- **Document processing:** `python-docx`
+- **PDF coordinate mapping:** PyMuPDF
 - **Database:** SQLAlchemy with SQLite
 - **Backend packaging:** PyInstaller
 - **Automation:** GitHub Actions
@@ -648,6 +687,12 @@ http://localhost:8001/docs
   and nested tables remain preserved and read-only.
 - Direct inline editing is limited to reliable mapped paragraphs. Adding,
   deleting, splitting, merging, or moving paragraphs is not supported.
+- Direct preview selection depends on reliable PDF text-coordinate extraction.
+  Complex, ambiguous, or unmatched Word content may remain unmapped.
+- The PDF is a selection surface, not an in-place editor. All changes continue
+  through the structured editor, preview, and immutable generation flow.
+- Unsupported objects remain visible and read-only even when their PDF text can
+  be located.
 - Authentication, PostgreSQL, hosted cloud storage, and multi-device synchronisation are not yet part of the local desktop release.
 - The Windows installer is not yet commercially code-signed.
 

@@ -60,6 +60,7 @@ import WordPreviewOverlay, {
   type LayoutSelectionIntent,
 } from "./WordPreviewOverlay";
 import type { InlineEditorCommand } from "./InlineLayoutEditor";
+import WordPreviewOverlay from "./WordPreviewOverlay";
 import type {
   DifferenceSpan,
   DocumentSearchTarget,
@@ -2960,6 +2961,8 @@ export default function DocumentExperience({
                   {showLayoutStructure || !layoutView?.pdf_url
                     ? "Choose a supported structure as a safe fallback, or load the Word preview for direct inline editing."
                     : "Click supported text, place the cursor where you need it, and use the complete editing sidebar without leaving Layout."}
+                    ? "Choose a supported heading, body paragraph, list item, table paragraph, header paragraph, or footer paragraph to open its exact mapped block in Edit."
+                    : "This view is rendered from the current DOCX. Click a reliable selectable area to open its exact block in Edit, or use Select from structure."}
                 </p>
               </div>
               <div className="layout-heading-actions">
@@ -3040,6 +3043,21 @@ export default function DocumentExperience({
                   onRetryPreview={() => void loadWordPreview()}
                 />
               </div>
+                <div className="layout-iframe-shell">
+                  <WordPreviewOverlay
+                    documentName={document.name}
+                    versionId={layoutView.version_id}
+                    pdfUrl={layoutView.pdf_url}
+                    selectedElementId={selectedElementId}
+                    onSelect={(elementId, sourceVersionId) =>
+                      selectElementById(elementId, {
+                        sourceVersionId,
+                        sourceLabel: "Word preview region",
+                      })
+                    }
+                    onShowStructure={() => setShowLayoutStructure(true)}
+                  />
+                </div>
             )}
             {editorContent &&
               mode === "layout" &&

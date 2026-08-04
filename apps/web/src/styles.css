@@ -1994,7 +1994,8 @@ textarea:focus-visible {
   display: block;
 }
 
-.layout-iframe-shell iframe {
+.layout-iframe-shell iframe,
+.render-map-pdf-fallback {
   width: 100%;
   height: 100%;
   border: 1px solid #bcc8d6;
@@ -2011,6 +2012,9 @@ textarea:focus-visible {
   overflow: hidden;
   border: 1px solid #bcc8d6;
   border-radius: 10px;
+  border: 1px solid #bcc8d6;
+  border-radius: 10px;
+  overflow: hidden;
   background: #dce3eb;
   box-shadow: 0 10px 28px rgba(23, 42, 66, 0.13);
 }
@@ -2028,6 +2032,7 @@ textarea:focus-visible {
 .render-map-toolbar button,
 .inline-formatting-toolbar button,
 .inline-formatting-toolbar select {
+.render-map-toolbar button {
   min-height: 31px;
   padding: 5px 9px;
   border: 1px solid #bcc8d6;
@@ -2055,6 +2060,7 @@ textarea:focus-visible {
 .render-map-toolbar button.active,
 .render-map-toolbar button[aria-pressed="true"],
 .inline-formatting-toolbar button:hover:not(:disabled) {
+.render-map-toolbar button[aria-pressed="true"] {
   color: #075f58;
   border-color: #72aaa5;
   background: #e9f7f5;
@@ -2063,12 +2069,14 @@ textarea:focus-visible {
 .render-map-toolbar button:focus-visible,
 .inline-formatting-toolbar button:focus-visible,
 .inline-formatting-toolbar select:focus-visible {
+.render-map-toolbar button:focus-visible {
   outline: 3px solid rgba(19, 121, 114, 0.3);
   outline-offset: 1px;
 }
 
 .render-map-toolbar button:disabled,
 .inline-formatting-toolbar :disabled {
+.render-map-toolbar button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
@@ -2166,6 +2174,7 @@ textarea:focus-visible {
 
 .render-map-region.interactive {
   cursor: text;
+  cursor: pointer;
 }
 
 .render-map-region.read-only {
@@ -2197,6 +2206,7 @@ textarea:focus-visible {
     rgba(255, 255, 255, 0.12) 4px,
     rgba(255, 255, 255, 0.12) 8px
   );
+  cursor: not-allowed;
 }
 
 .render-map-region.selected,
@@ -2204,6 +2214,7 @@ textarea:focus-visible {
   opacity: 1;
   border-color: #b45f06;
   background: rgba(255, 177, 64, 0.23);
+  background: rgba(255, 177, 64, 0.27);
   box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.8), 0 0 0 4px rgba(180, 95, 6, 0.7);
 }
 
@@ -2417,6 +2428,12 @@ textarea:focus-visible {
   .render-map-status span:not(.spinner) {
     white-space: normal;
   }
+.render-map-pdf-fallback {
+  min-height: 0;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  background: #fff;
 }
 
 .layout-structured-fallback {
@@ -4203,6 +4220,49 @@ button.layout-fallback-block.editable:focus-visible {
 
 :root[data-theme="dark"] .layout-fallback-meta {
   color: #68758a;
+}
+
+:root[data-theme="dark"] .word-map-preview,
+:root[data-theme="dark"] .render-map-pages {
+  border-color: var(--line);
+  background: #202c3a;
+}
+
+:root[data-theme="dark"] .render-map-toolbar,
+:root[data-theme="dark"] .render-map-status {
+  color: var(--muted);
+  border-color: var(--line);
+  background: var(--surface);
+}
+
+:root[data-theme="dark"] .render-map-toolbar button {
+  color: var(--ink);
+  border-color: var(--line);
+  background: var(--surface-2);
+}
+
+:root[data-theme="dark"] .render-map-toolbar output,
+:root[data-theme="dark"] .render-map-status strong {
+  color: var(--ink);
+}
+
+@media (max-width: 780px) {
+  .render-map-toolbar {
+    flex-wrap: wrap;
+  }
+
+  .render-map-toolbar-spacer {
+    flex-basis: 20px;
+  }
+
+  .render-map-status span:not(.spinner) {
+    white-space: normal;
+  }
+
+  .render-map-pages {
+    padding: 10px;
+    gap: 14px;
+  }
 }
 
 @media (max-width: 520px) {

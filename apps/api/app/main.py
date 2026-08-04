@@ -289,6 +289,9 @@ def read_rendered_document(
     if not path.exists():
         raise HTTPException(status_code=404, detail="The Word preview is not ready yet.")
     request_render_map(session, version.id)
+        render_document_with_word(session, document, version)
+    else:
+        request_render_map(session, version.id)
     return FileResponse(
         path,
         media_type="application/pdf",

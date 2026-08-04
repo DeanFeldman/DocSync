@@ -8,7 +8,7 @@ from typing import Any
 
 from .config import settings
 
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 
 class AuditLogger:
     """Structured audit logger recording non-sensitive operational diagnostics."""

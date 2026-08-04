@@ -7,6 +7,8 @@ flowchart LR
     A --> V[Validation and authorisation boundary]
     V --> P[DOCX parser and edit engine]
     V --> R[Microsoft Word PDF renderer]
+    R --> M[PyMuPDF coordinate mapper]
+    M --> C[Versioned JSON map and page cache]
     V --> D[(Relational database)]
     V --> S[(Private file storage)]
     P --> S
@@ -22,6 +24,8 @@ The browser never receives database credentials or storage credentials. All docu
 - Original files: `apps/api/data/originals/{document-set-id}/`
 - Generated files: `apps/api/data/generated/{document-set-id}/{generation-id}/`
 - Cached Word-layout PDFs: `apps/api/data/renders/{document-set-id}/`
+- Versioned coordinate maps and controlled page images:
+  `apps/api/data/renders/{document-set-id}/`
 - Local database: `apps/api/data/documentsync.db`
 
 The paths are excluded from Git. Production deployment should replace local storage with private object storage and use short-lived or backend-mediated downloads.
@@ -46,7 +50,12 @@ A generated edit may only target `DocumentElement` rows that belong to the selec
 
 ## Viewer and working-version boundary
 
-The visual tab is a PDF exported by the installed Microsoft Word engine, so it uses Word's fonts, pagination, tables, images, headers, and footers. The separate Select text tab derives deterministic logical pages from extracted body elements and provides stable, keyboard-accessible element selection. Direct selection over the PDF awaits an element-to-render coordinate map.
+The visual tab starts with the PDF exported by the installed Microsoft Word
+engine, so Word remains authoritative for fonts, pagination, tables, images,
+headers, and footers. After background mapping completes, the frontend displays
+page images extracted from that exact PDF and positions HTML regions inside each
+page using normalised coordinates. The existing structured Layout view remains
+the stable, keyboard-accessible fallback.
 
 Each `DocumentRecord` is a stable logical document. Its uploaded DOCX remains immutable. A confirmed edit creates a `GeneratedVersion`; the newest completed version becomes that document's current source for rendering, further edits, and downloads. The element rows and exact-match groups are refreshed transactionally after each applied edit, while `GenerationTarget` rows preserve the before/after audit trail.
 
@@ -144,3 +153,41 @@ match decisions, target replacements, preview signature, and generation
 request remain owned by `DocumentExperience`. Generation retains the existing
 atomic head-advance boundary. Only after commit are result-version preview jobs
 queued; a preview failure cannot roll back a committed DOCX version.
+## v1.8 preview-coordinate boundary
+
+```mermaid
+flowchart LR
+    D[Immutable DOCX version] --> W[Microsoft Word PDF]
+    W --> P[PyMuPDF pages, words, and line geometry]
+    B[Immutable block revisions] --> M[Contextual matcher]
+    P --> M
+    M --> J[Versioned JSON render map]
+    P --> I[Versioned PNG page cache]
+    J --> O[Normalised HTML overlays]
+    I --> O
+    O --> E[Existing version-safe Edit selection]
+```
+
+`GET /api/document-versions/{version_id}/render-map` never blocks on the full
+map. It returns a cached terminal result or queues a bounded worker and reports
+`queued`/`processing`. The Word PDF is already available, so map extraction can
+fail independently without removing the high-fidelity view.
+
+The JSON cache identity includes immutable version/document/workspace IDs,
+source SHA-256, exact PDF SHA-256, PDF size/mtime fingerprint, Word render
+engine, mapper algorithm and PyMuPDF version, render DPI, page count, and render
+ID. A new/restored version naturally uses another key; a regenerated PDF or
+engine/config change fails cache validation.
+
+Matching is deliberately conservative. Full-line boundaries and positional
+context prevent substring matches. Type/story/page-band context separates body,
+table, header, and footer candidates. Document order may resolve only a
+one-to-one duplicate sequence. Cross-type overlap removes all conflicting
+targets. Missing, ambiguous, overlapping, unsupported, or below-threshold
+results cannot become editable.
+
+The page endpoint re-resolves the immutable version and serves a PNG only when
+its render ID and page number match the current validated map. The browser also
+checks map/region version IDs before using the established editor selection
+path, which performs document/version/block/read-only checks and draft
+protection again.

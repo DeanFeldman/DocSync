@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
 
 
 api_dir = Path(SPECPATH)
@@ -8,11 +8,12 @@ api_dir = Path(SPECPATH)
 a = Analysis(
     [str(api_dir / "desktop_backend.py")],
     pathex=[str(api_dir)],
-    binaries=[],
-    datas=collect_data_files("docx"),
+    binaries=collect_dynamic_libs("pymupdf"),
+    datas=collect_data_files("docx") + collect_data_files("pymupdf"),
     hiddenimports=[
         "pymupdf",
         "sqlalchemy.dialects.sqlite",
+        "pymupdf",
         "uvicorn.lifespan.on",
         "uvicorn.logging",
         "uvicorn.loops.auto",
@@ -33,9 +34,12 @@ a = Analysis(
         "jupyter_client",
         "matplotlib",
         "numpy",
+        "openpyxl",
+        "pandas",
         "parso",
         "psutil",
         "pytest",
+        "scipy",
         "tkinter",
         "tornado",
         "watchfiles",
