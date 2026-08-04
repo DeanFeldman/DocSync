@@ -15,6 +15,7 @@ import type {
   MatchDecisionPayload,
   MatchDiscovery,
   PreviewResponse,
+  RenderMapResponse,
   SimilarMatchesResponse,
 } from "./types";
 
@@ -202,6 +203,17 @@ export async function renderDocumentView(
     signal,
   });
   return parseResponse<DocumentView>(response);
+}
+
+export async function fetchRenderMap(
+  versionId: string,
+  signal?: AbortSignal,
+): Promise<RenderMapResponse> {
+  const response = await fetch(
+    `${API_URL}/document-versions/${versionId}/render-map`,
+    { signal },
+  );
+  return parseResponse<RenderMapResponse>(response);
 }
 
 export async function fetchElementMatches(

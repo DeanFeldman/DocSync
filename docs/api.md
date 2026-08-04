@@ -54,11 +54,80 @@ Each document includes a `version_id` and `view_url` for the immutable uploaded 
 
 ## `POST /documents/{document_id}/render`
 
-Exports the current working DOCX version to a cached PDF through Microsoft Word and returns both the PDF URL and the structured element payload. Applying an edit invalidates the affected PDF cache before the browser refreshes it.
+Exports the current immutable DOCX version to a cached PDF through Microsoft
+Word, queues coordinate extraction, and returns the PDF URL, render-map status
+and URL, and structured element payload. PDF viewing does not wait for the map.
 
 ## `GET /document-versions/{version_id}/rendered-file`
 
 Returns the Microsoft Word-generated PDF inline for the high-fidelity layout tab.
+
+## `GET /document-versions/{version_id}/render-map`
+
+Returns the version/render-bound coordinate map. Status is one of
+`not_requested`, `queued`, `processing`, `completed`, `partial`, or `failed`.
+Queued and processing responses should be polled with bounded backoff.
+
+Example terminal response (abridged):
+
+```json
+{
+  "schema_version": 1,
+  "version_id": "version-456",
+  "document_id": "document-123",
+  "document_set_id": "workspace-789",
+  "status": "completed",
+  "coordinate_unit": "normalised",
+  "render_id": "4d92381ce36b19c4eabc1234",
+  "render_version": "4d92381ce36b19c4eabc1234",
+  "source_sha256": "...",
+  "pdf_sha256": "...",
+  "pdf_engine": "Microsoft Word ExportAsFixedFormat PDF",
+  "mapper": "PyMuPDF",
+  "mapper_version": "1.28.0",
+  "interactive_threshold": 0.9,
+  "page_count": 1,
+  "pages": [
+    {
+      "page_id": "4d92381ce36b19c4eabc1234:1",
+      "page_number": 1,
+      "page_width": 612.0,
+      "page_height": 792.0,
+      "coordinate_unit": "normalised",
+      "render_version": "4d92381ce36b19c4eabc1234",
+      "image_url": "/api/document-versions/version-456/render-pages/4d92381ce36b19c4eabc1234/1.png"
+    }
+  ],
+  "regions": [
+    {
+      "region_id": "element-123:1:1",
+      "element_id": "element-123",
+      "version_id": "version-456",
+      "element_type": "paragraph",
+      "page_number": 1,
+      "x": 0.1421569,
+      "y": 0.3180521,
+      "width": 0.6110049,
+      "height": 0.0471221,
+      "confidence": 0.99,
+      "mapping_method": "word_pdf_text_context_order",
+      "interactive": true,
+      "read_only": false,
+      "reason": null
+    }
+  ],
+  "unmapped": []
+}
+```
+
+A `partial` result keeps reliable regions selectable and lists unresolved
+blocks in `unmapped`. A `failed` result has no clickable regions and does not
+affect the successful PDF. Maps are disposable cache data, not document state.
+
+## `GET /document-versions/{version_id}/render-pages/{render_id}/{page}.png`
+
+Returns one controlled page image only when the immutable version, current map,
+render ID, and page number all match. Mismatched or stale paths return `404`.
 
 ## `GET /document-versions/{version_id}/pages`
 

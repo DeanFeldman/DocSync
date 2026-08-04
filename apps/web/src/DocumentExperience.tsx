@@ -54,6 +54,7 @@ import {
 import QuillBlockEditor, {
   type QuillDraft,
 } from "./QuillBlockEditor";
+import WordPreviewOverlay from "./WordPreviewOverlay";
 import type {
   DifferenceSpan,
   DocumentSearchTarget,
@@ -2784,7 +2785,7 @@ export default function DocumentExperience({
                 <p>
                   {showLayoutStructure || !layoutView?.pdf_url
                     ? "Choose a supported heading, body paragraph, list item, table paragraph, header paragraph, or footer paragraph to open its exact mapped block in Edit."
-                    : "This view is rendered from the current DOCX. Choose Select from structure when you want to open a mapped element in the editor."}
+                    : "This view is rendered from the current DOCX. Click a reliable selectable area to open its exact block in Edit, or use Select from structure."}
                 </p>
               </div>
               <div className="layout-heading-actions">
@@ -2836,20 +2837,21 @@ export default function DocumentExperience({
             {layoutStatus === "ready" &&
               layoutView?.pdf_url &&
               !showLayoutStructure && (
-              <div className="layout-iframe-shell">
-                <div className="render-notice">
-                  <strong>Word layout</strong>
-                  <span>
-                    {layoutView.notice} This PDF remains read-only because no
-                    reliable element-coordinate map is available. Use Select
-                    from structure for safe direct selection.
-                  </span>
+                <div className="layout-iframe-shell">
+                  <WordPreviewOverlay
+                    documentName={document.name}
+                    versionId={layoutView.version_id}
+                    pdfUrl={layoutView.pdf_url}
+                    selectedElementId={selectedElementId}
+                    onSelect={(elementId, sourceVersionId) =>
+                      selectElementById(elementId, {
+                        sourceVersionId,
+                        sourceLabel: "Word preview region",
+                      })
+                    }
+                    onShowStructure={() => setShowLayoutStructure(true)}
+                  />
                 </div>
-                <iframe
-                  src={absoluteApiUrl(layoutView.pdf_url)}
-                  title={`${document.name} Word layout preview`}
-                />
-              </div>
             )}
             {editorContent &&
               mode === "layout" &&
