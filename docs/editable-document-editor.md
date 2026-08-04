@@ -5,9 +5,9 @@ DocSync uses two complementary document surfaces:
 - **Layout** renders the current immutable DOCX version through Microsoft Word when
   Word is available. It is read-only and remains the source of truth for pagination
   and unsupported Word objects.
-- **Edit** exposes supported headings, paragraphs, list items, and top-level table
-  cells as version-scoped structured blocks. One selected block is edited with the
-  locally bundled Quill 2 editor.
+- **Edit** exposes supported headings, paragraphs, list items, and individual
+  paragraphs in supported top-level table cells as version-scoped structured
+  blocks. One selected block is edited with the locally bundled Quill 2 editor.
 - **Compare** reviews exact and near matches, highlights word-level differences,
   chooses target documents, and prepares a shared, per-document, or full-override
   operation.
@@ -42,11 +42,38 @@ Every version owns immutable `DocumentBlockRevision` snapshots. A snapshot recor
 - element type, original and normalised text, and exact/structure hashes;
 - Quill Delta and supported inline/paragraph formatting;
 - list type and level;
-- paragraph or table-cell write-back location;
+- body-paragraph or table/row/column/in-cell-paragraph write-back location;
 - supported/read-only state and an actionable reason where applicable.
 
 Generated versions receive new current element IDs. Historical snapshots retain
 their original IDs for audit and download purposes.
+
+## Table-paragraph mapping
+
+Each non-empty direct paragraph in a supported top-level table cell is stored as
+`element_type: table_paragraph`. Its immutable location contains:
+
+```json
+{
+  "kind": "table_paragraph",
+  "document_order": 4,
+  "table_index": 0,
+  "row_index": 2,
+  "column_index": 1,
+  "paragraph_index": 0
+}
+```
+
+`document_order` keeps body paragraphs and tables in logical DOCX order. The
+other indexes identify the exact physical paragraph for extraction, search,
+preview, comparison, and write-back. Empty cell paragraphs are not presented as
+editable blocks. Repeated XML cell references created by Word merges are
+deduplicated by physical cell identity.
+
+Generation resolves the mapped cell and then the mapped paragraph. It updates
+only that paragraph's runs and supported paragraph properties. It does not set
+`cell.text`, rebuild the table, or delete sibling paragraphs, so other cell
+content and table OOXML remain present.
 
 ## Version restoration
 
@@ -72,7 +99,9 @@ version, and new result.
 ## Matching and comparison
 
 Exact matching uses Unicode NFKC normalisation, case folding, trimming, and
-whitespace collapsing. Element type is part of the exact-match identity.
+whitespace collapsing. Element type is part of the exact-match identity, so a
+`table_paragraph` never automatically targets an unrelated body paragraph with
+the same text.
 
 Near matching is bounded and configurable. It combines text similarity with element
 type, relative document position, and neighbouring-block context. Near matches are
@@ -137,12 +166,17 @@ Supported:
 - normal body paragraphs and headings;
 - ordered and unordered list items, including supported indentation levels;
 - bold, italic, underline, alignment, and heading metadata represented in Delta;
-- non-empty top-level table cells where a stable table/row/cell location exists.
+- non-empty paragraphs in top-level table cells where a stable
+  table/row/column/paragraph location exists;
+- ordered and unordered list metadata and supported indentation in those table
+  paragraphs. Heading levels remain unavailable inside table cells.
 
 Read-only or diagnostic-only:
 
 - floating text boxes, shapes, SmartArt, and drawing objects;
-- nested/merged table structures without a safe stable target;
+- nested or merged table structures without a safe stable target;
+- cells containing drawings, fields, hyperlinks, tracked changes, comments, or
+  other Word objects that cannot be rewritten safely;
 - tracked changes, comments, footnotes, endnotes, fields, and complex
   cross-references;
 - structural block insertion, deletion, split, merge, and reorder operations.
@@ -163,4 +197,5 @@ Manual acceptance should cover exact shared wording, branch-specific values, lis
 preservation, a full override followed by another shared edit, unsupported Word
 objects, active-block undo and redo, successful restoration with preserved
 history, stale-current restoration conflict handling, and controlled generation
-failure.
+failure. The complete v1.5 table matrix is in
+[`v1.5.0-manual-testing.md`](v1.5.0-manual-testing.md).

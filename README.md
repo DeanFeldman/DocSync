@@ -31,6 +31,37 @@ DocSync-Setup-latest.exe
 
 ---
 
+## Version 1.5.0
+
+DocSync `v1.5.0` expands safe Microsoft Word table editing from whole-cell
+blocks to individual paragraphs inside supported top-level cells.
+
+### Expanded table editing
+
+- Extracts each non-empty cell paragraph as a separate `table_paragraph` block.
+- Stores table, row, column, in-cell paragraph, document-order, and immutable
+  version metadata for exact write-back.
+- Preserves other paragraphs, cells, table dimensions, shading, borders,
+  images, and unrelated formatting when one paragraph changes.
+- Supports inline bold, italic, underline, alignment, and safely represented
+  ordered/unordered list indentation inside table paragraphs.
+- Keeps merged cells, nested tables, drawings, fields, tracked changes, and
+  other unsafe table structures visible but read-only with a plain-language
+  reason.
+- Includes table paragraphs in exact matching, near matching, comparison,
+  global search, per-document values, overrides, previews, generation,
+  version history, restoration, Undo, and Redo.
+- Regenerates legacy table-cell maps through schema migration 2 only after a
+  verified workspace database backup has been created.
+- Caches Word structure and style metadata while migrating large historical
+  workspaces, avoiding repeated full-document traversal during startup.
+
+See [the v1.5.0 release notes](docs/v1.5.0-release-notes.md), the
+[editable-editor design](docs/editable-document-editor.md), and the
+[manual Word test checklist](docs/v1.5.0-manual-testing.md).
+
+---
+
 ## Version 1.4.2
 
 DocSync `v1.4.2` makes installed Windows startup safe and predictable for
@@ -139,7 +170,8 @@ DocSync provides three document workspace modes.
 
 #### Edit
 
-- Exposes supported headings, paragraphs, list items, and top-level table cells as stable blocks.
+- Exposes supported headings, paragraphs, list items, and individual
+  paragraphs in supported top-level table cells as stable blocks.
 - Uses Quill 2 for structured rich-text editing.
 - Supports selected formatting metadata, including:
   - bold
@@ -178,7 +210,8 @@ DocSync supports three controlled editing modes:
 ### Preview and generation
 
 - Preview the resolved result before writing any files.
-- Show every affected document and location.
+- Show every affected document, source version, editing mode, and exact table
+  paragraph location.
 - Reject stale operations when a document changed after the editor was opened.
 - Generate changes atomically.
 - Create new immutable document versions.
@@ -285,8 +318,10 @@ Existing workspaces are upgraded by ordered, one-time schema migrations when the
 backend starts. Before an older database is modified, DocSync stores and verifies
 a timestamped backup under `workspace/migration-backups`; the five newest
 backups are retained. A current workspace skips completed migrations and does
-not rerun the version/block-revision backfill. No manual migration command is
-normally required.
+not rerun the version/block-revision or table-paragraph backfill. Schema 2
+reparses stored immutable DOCX versions to replace legacy whole-cell maps with
+paragraph-level table locations. No manual migration command is normally
+required.
 
 If migration fails, the active database is restored automatically and the
 startup dialog shows the workspace and recovery-backup paths. Do not move or
@@ -435,7 +470,7 @@ The workflow reads the application version from the Git tag, so the source `pack
 From the repository root:
 
 ```powershell
-$version = "1.4.2"
+$version = "1.5.0"
 
 git switch main
 git pull origin main

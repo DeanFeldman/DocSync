@@ -261,6 +261,120 @@ def test_repeated_real_startup_does_not_duplicate_version_foundation(
             for table in baseline
         }
     assert after == baseline
-    assert detect_schema_version(database_path) == 1
+    assert detect_schema_version(database_path) == 2
     backups = list((data_directory / "migration-backups").glob("*.db"))
     assert len(backups) == 1
+
+
+def _table_docx(text: str) -> bytes:
+    document = Document()
+    document.add_heading("Legacy table", level=1)
+    table = document.add_table(rows=1, cols=1)
+    table.cell(0, 0).text = text
+    stream = io.BytesIO()
+    document.save(stream)
+    return stream.getvalue()
+
+
+def test_v15_migration_regenerates_legacy_table_cells_after_verified_backup(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    data_directory = tmp_path / "data"
+    database_path = tmp_path / "v142-workspace.db"
+    monkeypatch.setenv("DOCUMENTSYNC_DATA_DIR", str(data_directory))
+    monkeypatch.setenv("DOCUMENTSYNC_DATABASE_URL", database_url(database_path))
+    monkeypatch.setenv("DOCUMENTSYNC_SESSION_TOKEN", "")
+    monkeypatch.delenv("DOCUMENTSYNC_WEB_DIST", raising=False)
+    for module_name in list(sys.modules):
+        if module_name == "app" or module_name.startswith("app."):
+            del sys.modules[module_name]
+
+    main = importlib.import_module("app.main")
+    with TestClient(main.app) as client:
+        response = client.post(
+            "/api/document-sets",
+            data={"name": "Legacy table workspace"},
+            files=[
+                (
+                    "files",
+                    (
+                        "one.docx",
+                        _table_docx("Shared legacy cell"),
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    ),
+                ),
+                (
+                    "files",
+                    (
+                        "two.docx",
+                        _table_docx("Shared legacy cell"),
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    ),
+                ),
+            ],
+        )
+        assert response.status_code == 201, response.text
+        workspace = response.json()
+
+    database = importlib.import_module("app.database")
+    editor_service = importlib.import_module("app.editor_service")
+    with database.engine.begin() as connection:
+        connection.exec_driver_sql(
+            """
+            UPDATE document_elements
+            SET style_name = 'table_cell_order:1:0:0:0'
+            WHERE style_name LIKE 'table_paragraph_order:%'
+            """
+        )
+        connection.exec_driver_sql(
+            """
+            UPDATE document_block_revisions
+            SET element_type = 'table_cell',
+                location_json = '{"kind":"table_cell","document_order":1,"paragraph_index":1,"table_index":0,"row_index":0,"column_index":0}'
+            WHERE element_type = 'table_paragraph'
+            """
+        )
+        connection.exec_driver_sql(
+            "DELETE FROM docsync_schema_migrations WHERE version = 2"
+        )
+
+    original_revision_values = editor_service._revision_values
+    cached_revision_calls = 0
+
+    def require_cached_document_structure(*args, **kwargs):
+        nonlocal cached_revision_calls
+        assert kwargs.get("paragraphs") is not None
+        assert kwargs.get("tables") is not None
+        assert kwargs.get("style_name_cache") is not None
+        cached_revision_calls += 1
+        return original_revision_values(*args, **kwargs)
+
+    monkeypatch.setattr(
+        editor_service,
+        "_revision_values",
+        require_cached_document_structure,
+    )
+    database.init_db()
+
+    assert cached_revision_calls > 0
+    assert detect_schema_version(database_path) == 2
+    backups = list((data_directory / "migration-backups").glob("*.db"))
+    assert len(backups) == 1
+    assert backups[0].stat().st_size > 0
+
+    with TestClient(main.app) as client:
+        first = workspace["documents"][0]
+        content = client.get(
+            f"/api/document-versions/{first['version_id']}/editor-content"
+        )
+        assert content.status_code == 200, content.text
+        table_blocks = [
+            block
+            for block in content.json()["blocks"]
+            if block["element_type"] == "table_paragraph"
+        ]
+        assert len(table_blocks) == 1
+        assert table_blocks[0]["text"] == "Shared legacy cell"
+        assert table_blocks[0]["paragraph_index"] == 0
+        assert table_blocks[0]["supported"] is True

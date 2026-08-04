@@ -53,7 +53,17 @@ TABLE_CELL_STYLE_PATTERN = re.compile(r"^table_cell:(\d+):(\d+):(\d+)$")
 ORDERED_TABLE_CELL_STYLE_PATTERN = re.compile(
     r"^table_cell_order:(\d+):(\d+):(\d+):(\d+)$"
 )
+TABLE_PARAGRAPH_STYLE_PATTERN = re.compile(
+    r"^table_paragraph:(\d+):(\d+):(\d+):(\d+)$"
+)
+ORDERED_TABLE_PARAGRAPH_STYLE_PATTERN = re.compile(
+    r"^table_paragraph_order:(\d+):(\d+):(\d+):(\d+):(\d+):(\d+)$"
+)
 ORDERED_BODY_STYLE_PATTERN = re.compile(r"^body_order:(\d+):(.*)$", re.DOTALL)
+BLOCK_ORDERED_BODY_STYLE_PATTERN = re.compile(
+    r"^body_block_order:(\d+):(\d+):(\d+):(.*)$",
+    re.DOTALL,
+)
 PAGE_LAYOUT_UNITS = 18
 WORD_RENDER_LOCK = threading.Lock()
 LARGE_SET_LINK_GROUP_LIMIT = 100
@@ -79,6 +89,10 @@ def normalise_text(text: str) -> str:
 
 
 def table_cell_location(style_name: str | None) -> tuple[int, int, int] | None:
+    paragraph_location = table_paragraph_location(style_name)
+    if paragraph_location is not None:
+        return paragraph_location[:3]
+
     value = style_name or ""
     ordered_match = ORDERED_TABLE_CELL_STYLE_PATTERN.fullmatch(value)
     if ordered_match is not None:
@@ -91,22 +105,92 @@ def table_cell_location(style_name: str | None) -> tuple[int, int, int] | None:
     return tuple(int(item) for item in match.groups())
 
 
-def element_document_order(element: DocumentElement) -> tuple[int, int, int]:
+def table_paragraph_location(
+    style_name: str | None,
+) -> tuple[int, int, int, int] | None:
+    value = style_name or ""
+    ordered_match = ORDERED_TABLE_PARAGRAPH_STYLE_PATTERN.fullmatch(value)
+    if ordered_match is not None:
+        (
+            _block_order,
+            _document_order,
+            table_index,
+            row_index,
+            column_index,
+            paragraph_index,
+        ) = ordered_match.groups()
+        return tuple(
+            int(item)
+            for item in (
+                table_index,
+                row_index,
+                column_index,
+                paragraph_index,
+            )
+        )
+
+    match = TABLE_PARAGRAPH_STYLE_PATTERN.fullmatch(value)
+    if match is not None:
+        return tuple(int(item) for item in match.groups())
+
+    # Legacy v1.4 table-cell blocks map to the first non-empty paragraph. The
+    # v1.5 workspace migration regenerates them, but this fallback keeps a
+    # partially migrated workspace safe and readable.
+    ordered_cell = ORDERED_TABLE_CELL_STYLE_PATTERN.fullmatch(value)
+    if ordered_cell is not None:
+        _order, table_index, row_index, column_index = ordered_cell.groups()
+        return int(table_index), int(row_index), int(column_index), 0
+    cell = TABLE_CELL_STYLE_PATTERN.fullmatch(value)
+    if cell is not None:
+        table_index, row_index, column_index = cell.groups()
+        return int(table_index), int(row_index), int(column_index), 0
+    return None
+
+
+def body_paragraph_location(style_name: str | None) -> int | None:
+    match = BLOCK_ORDERED_BODY_STYLE_PATTERN.fullmatch(style_name or "")
+    return int(match.group(3)) if match is not None else None
+
+
+def mapped_paragraph_index(element: DocumentElement) -> int:
+    table_location = table_paragraph_location(element.style_name)
+    if table_location is not None:
+        return table_location[3]
+    body_location = body_paragraph_location(element.style_name)
+    return body_location if body_location is not None else element.paragraph_index
+
+
+def element_document_order(element: DocumentElement) -> tuple[int, int, int, int]:
     style_name = element.style_name or ""
+
+    table_paragraph = ORDERED_TABLE_PARAGRAPH_STYLE_PATTERN.fullmatch(style_name)
+    if table_paragraph is not None:
+        block_order, _document_order, _table, row, column, paragraph = (
+            int(value) for value in table_paragraph.groups()
+        )
+        return block_order, row, column, paragraph
+
+    body_block = BLOCK_ORDERED_BODY_STYLE_PATTERN.fullmatch(style_name)
+    if body_block is not None:
+        block_order, _document_order, paragraph_index, _style = body_block.groups()
+        return int(block_order), -1, -1, int(paragraph_index)
 
     table_match = ORDERED_TABLE_CELL_STYLE_PATTERN.fullmatch(style_name)
     if table_match is not None:
         order, _table_index, row_index, column_index = table_match.groups()
-        return int(order), int(row_index), int(column_index)
+        return int(order), int(row_index), int(column_index), 0
 
     body_match = ORDERED_BODY_STYLE_PATTERN.fullmatch(style_name)
     if body_match is not None:
-        return int(body_match.group(1)), 0, 0
+        return int(body_match.group(1)), -1, -1, element.paragraph_index
 
-    return element.paragraph_index, 0, 0
+    return element.paragraph_index, -1, -1, element.paragraph_index
 
 
 def display_style_name(style_name: str | None) -> str | None:
+    block_match = BLOCK_ORDERED_BODY_STYLE_PATTERN.fullmatch(style_name or "")
+    if block_match is not None:
+        return block_match.group(4) or None
     body_match = ORDERED_BODY_STYLE_PATTERN.fullmatch(style_name or "")
     if body_match is None:
         return style_name
@@ -114,20 +198,21 @@ def display_style_name(style_name: str | None) -> str | None:
 
 
 def element_location_payload(style_name: str | None) -> dict:
-    location = table_cell_location(style_name)
+    location = table_paragraph_location(style_name)
     if location is None:
         return {}
-    table_index, row_index, column_index = location
+    table_index, row_index, column_index, paragraph_index = location
     return {
         "table_index": table_index,
         "row_index": row_index,
         "column_index": column_index,
+        "paragraph_index": paragraph_index,
     }
 
 
 def element_type_for_style(style_name: str | None) -> str:
-    if table_cell_location(style_name) is not None:
-        return "table_cell"
+    if table_paragraph_location(style_name) is not None:
+        return "table_paragraph"
 
     style = (display_style_name(style_name) or "").casefold()
     if style.startswith("heading") or style.startswith("title"):
@@ -160,7 +245,7 @@ def _layout_pages(elements: list[DocumentElement]) -> list[dict]:
             {
                 "id": element.id,
                 "document_id": element.document_id,
-                "paragraph_index": element.paragraph_index,
+                "paragraph_index": mapped_paragraph_index(element),
                 "element_type": element_type,
                 "text": element.text,
                 "style_name": display_style_name(element.style_name),
@@ -191,7 +276,7 @@ def _extract_paragraphs(
     document_order = 0
     paragraphs = list(document.paragraphs)
     tables = list(document.tables)
-    synthetic_index = len(paragraphs)
+    block_order = 0
     style_names = {
         style.style_id: style.name
         for style in document.styles
@@ -222,11 +307,15 @@ def _extract_paragraphs(
                 style_name = style_names.get(style_id, style_id)
                 elements.append(
                     (
-                        body_paragraph_index,
+                        block_order,
                         text,
-                        f"body_order:{document_order}:{style_name}",
+                        (
+                            f"body_block_order:{block_order}:{document_order}:"
+                            f"{body_paragraph_index}:{style_name}"
+                        ),
                     )
                 )
+                block_order += 1
             body_paragraph_index += 1
             document_order += 1
             continue
@@ -243,21 +332,22 @@ def _extract_paragraphs(
                     continue
                 seen_cells.add(cell_key)
 
-                text = cell.text.strip()
-                if not text:
-                    continue
-
-                elements.append(
-                    (
-                        synthetic_index,
-                        text,
+                for paragraph_index, paragraph in enumerate(cell.paragraphs):
+                    text = paragraph.text.strip()
+                    if not text:
+                        continue
+                    elements.append(
                         (
-                            f"table_cell_order:{document_order}:{table_index}:"
-                            f"{row_index}:{column_index}"
-                        ),
+                            block_order,
+                            text,
+                            (
+                                f"table_paragraph_order:{block_order}:"
+                                f"{document_order}:{table_index}:{row_index}:"
+                                f"{column_index}:{paragraph_index}"
+                            ),
+                        )
                     )
-                )
-                synthetic_index += 1
+                    block_order += 1
 
         table_index += 1
         document_order += 1
@@ -721,7 +811,12 @@ def search_document_set(
                     "element_type": revision.element_type,
                     **{
                         key: location[key]
-                        for key in ("table_index", "row_index", "column_index")
+                        for key in (
+                            "document_order",
+                            "table_index",
+                            "row_index",
+                            "column_index",
+                        )
                         if key in location
                     },
                     "text": revision.text,
@@ -1037,7 +1132,7 @@ def serialize_document_view(document: DocumentRecord) -> dict:
         "page_count": len(pages),
         "notice": (
             "Structured browser preview. Paragraphs, headings, list items, and non-empty "
-            "top-level table cells are selectable. Page grouping is estimated; the original "
+            "top-level table paragraphs are selectable. Page grouping is estimated; the original "
             "DOCX remains the source of truth."
         ),
         "pages": pages,
@@ -1196,7 +1291,7 @@ def serialize_link_group(group: LinkGroup) -> dict:
                 "element_id": member.element.id,
                 "document_id": member.element.document_id,
                 "document_name": member.element.document.original_name,
-                "paragraph_index": member.element.paragraph_index,
+                "paragraph_index": mapped_paragraph_index(member.element),
                 "element_type": element_type_for_style(member.element.style_name),
                 "text": member.element.text,
                 "style_name": display_style_name(member.element.style_name),
@@ -1252,7 +1347,7 @@ def get_element_matches_or_404(session: Session, element_id: str) -> dict:
         "element_id": element.id,
         "document_id": element.document_id,
         "document_name": element.document.original_name,
-        "paragraph_index": element.paragraph_index,
+        "paragraph_index": mapped_paragraph_index(element),
         "element_type": element_type_for_style(element.style_name),
         "text": element.text,
         "style_name": display_style_name(element.style_name),
@@ -1320,7 +1415,7 @@ def preview_edit(
         item["changes"].append(
             {
                 "element_id": element.id,
-                "paragraph_index": element.paragraph_index,
+                "paragraph_index": mapped_paragraph_index(element),
                 "element_type": element_type_for_style(element.style_name),
                 **element_location_payload(element.style_name),
                 "before": element.text,
@@ -1350,17 +1445,6 @@ def _replace_paragraph_text(paragraph: Paragraph, replacement_text: str) -> None
             run.text = ""
     else:
         paragraph.add_run(replacement_text)
-
-
-def _replace_table_cell_text(cell, replacement_text: str) -> None:
-    paragraphs = list(cell.paragraphs)
-    if not paragraphs:
-        cell.text = replacement_text
-        return
-
-    _replace_paragraph_text(paragraphs[0], replacement_text)
-    for paragraph in paragraphs[1:]:
-        _replace_paragraph_text(paragraph, "")
 
 
 def _load_source_document(session: Session, record: DocumentRecord) -> DocxDocument:
@@ -1393,28 +1477,40 @@ def generate_versions(
             record = elements[0].document
             docx = _load_source_document(session, record)
             for element in sorted(elements, key=lambda item: item.paragraph_index):
-                table_location = table_cell_location(element.style_name)
+                table_location = table_paragraph_location(element.style_name)
                 if table_location is not None:
-                    table_index, row_index, column_index = table_location
+                    (
+                        table_index,
+                        row_index,
+                        column_index,
+                        paragraph_index,
+                    ) = table_location
                     try:
                         cell = docx.tables[table_index].rows[row_index].cells[column_index]
-                    except IndexError as exc:
+                        paragraph = cell.paragraphs[paragraph_index]
+                    except (IndexError, TypeError) as exc:
                         raise HTTPException(
                             status_code=500,
                             detail=(
-                                f"Table-cell location is no longer valid for "
+                                f"Table-paragraph location is no longer valid for "
                                 f"{record.original_name}."
                             ),
                         ) from exc
-                    _replace_table_cell_text(cell, replacement_text)
+                    _replace_paragraph_text(paragraph, replacement_text)
                     continue
 
-                if element.paragraph_index >= len(docx.paragraphs):
+                body_location = body_paragraph_location(element.style_name)
+                paragraph_index = (
+                    body_location
+                    if body_location is not None
+                    else element.paragraph_index
+                )
+                if paragraph_index >= len(docx.paragraphs):
                     raise HTTPException(
                         status_code=500,
                         detail=f"Paragraph location is no longer valid for {record.original_name}.",
                     )
-                _replace_paragraph_text(docx.paragraphs[element.paragraph_index], replacement_text)
+                _replace_paragraph_text(docx.paragraphs[paragraph_index], replacement_text)
 
             source_name = Path(record.original_name)
             output_name = safe_download_name(f"{source_name.stem}-updated.docx")

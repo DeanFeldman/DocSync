@@ -50,9 +50,19 @@ from .schemas import (
 
 
 BODY_STYLE_PATTERN = re.compile(r"^body_order:(\d+):(.*)$", re.DOTALL)
+BLOCK_BODY_STYLE_PATTERN = re.compile(
+    r"^body_block_order:(\d+):(\d+):(\d+):(.*)$",
+    re.DOTALL,
+)
 TABLE_STYLE_PATTERN = re.compile(r"^table_cell:(\d+):(\d+):(\d+)$")
 ORDERED_TABLE_STYLE_PATTERN = re.compile(
     r"^table_cell_order:(\d+):(\d+):(\d+):(\d+)$"
+)
+TABLE_PARAGRAPH_STYLE_PATTERN = re.compile(
+    r"^table_paragraph:(\d+):(\d+):(\d+):(\d+)$"
+)
+ORDERED_TABLE_PARAGRAPH_STYLE_PATTERN = re.compile(
+    r"^table_paragraph_order:(\d+):(\d+):(\d+):(\d+):(\d+):(\d+)$"
 )
 LIST_LEVEL_SUFFIX = re.compile(r"\s+(\d+)$")
 TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]+|\s+", re.UNICODE)
@@ -186,11 +196,18 @@ def current_version_for_document(
 
 
 def _display_style_name(style_name: str | None) -> str | None:
+    block_match = BLOCK_BODY_STYLE_PATTERN.fullmatch(style_name or "")
+    if block_match is not None:
+        return block_match.group(4) or None
     match = BODY_STYLE_PATTERN.fullmatch(style_name or "")
     if match is None:
         if TABLE_STYLE_PATTERN.fullmatch(style_name or ""):
             return None
         if ORDERED_TABLE_STYLE_PATTERN.fullmatch(style_name or ""):
+            return None
+        if TABLE_PARAGRAPH_STYLE_PATTERN.fullmatch(style_name or ""):
+            return None
+        if ORDERED_TABLE_PARAGRAPH_STYLE_PATTERN.fullmatch(style_name or ""):
             return None
         return style_name
     return match.group(2) or None
@@ -198,6 +215,10 @@ def _display_style_name(style_name: str | None) -> str | None:
 
 def _element_type(style_name: str | None) -> str:
     value = style_name or ""
+    if TABLE_PARAGRAPH_STYLE_PATTERN.fullmatch(
+        value
+    ) or ORDERED_TABLE_PARAGRAPH_STYLE_PATTERN.fullmatch(value):
+        return "table_paragraph"
     if TABLE_STYLE_PATTERN.fullmatch(value) or ORDERED_TABLE_STYLE_PATTERN.fullmatch(
         value
     ):
@@ -212,6 +233,37 @@ def _element_type(style_name: str | None) -> str:
 
 def _element_location(element: DocumentElement) -> tuple[int, dict]:
     style_name = element.style_name or ""
+    table_paragraph = ORDERED_TABLE_PARAGRAPH_STYLE_PATTERN.fullmatch(style_name)
+    if table_paragraph is not None:
+        (
+            order,
+            document_order,
+            table_index,
+            row_index,
+            column_index,
+            paragraph_index,
+        ) = (int(value) for value in table_paragraph.groups())
+        return order, {
+            "kind": "table_paragraph",
+            "document_order": document_order,
+            "paragraph_index": paragraph_index,
+            "table_index": table_index,
+            "row_index": row_index,
+            "column_index": column_index,
+        }
+    legacy_table_paragraph = TABLE_PARAGRAPH_STYLE_PATTERN.fullmatch(style_name)
+    if legacy_table_paragraph is not None:
+        table_index, row_index, column_index, paragraph_index = (
+            int(value) for value in legacy_table_paragraph.groups()
+        )
+        return element.paragraph_index, {
+            "kind": "table_paragraph",
+            "document_order": element.paragraph_index,
+            "paragraph_index": paragraph_index,
+            "table_index": table_index,
+            "row_index": row_index,
+            "column_index": column_index,
+        }
     table_match = ORDERED_TABLE_STYLE_PATTERN.fullmatch(style_name)
     if table_match is not None:
         order, table_index, row_index, column_index = (
@@ -237,6 +289,14 @@ def _element_location(element: DocumentElement) -> tuple[int, dict]:
             "table_index": table_index,
             "row_index": row_index,
             "column_index": column_index,
+        }
+    body_block = BLOCK_BODY_STYLE_PATTERN.fullmatch(style_name)
+    if body_block is not None:
+        order, document_order, paragraph_index, _style = body_block.groups()
+        return int(order), {
+            "kind": "body",
+            "document_order": int(document_order),
+            "paragraph_index": int(paragraph_index),
         }
     body_match = BODY_STYLE_PATTERN.fullmatch(style_name)
     order = int(body_match.group(1)) if body_match is not None else element.paragraph_index
@@ -280,8 +340,13 @@ def _paragraph_for_element(
         )
     except IndexError:
         return None, None
-    paragraphs = [paragraph for paragraph in cell.paragraphs if paragraph.text.strip()]
-    return (paragraphs[0] if paragraphs else cell.paragraphs[0]), cell
+    if location["kind"] == "table_paragraph":
+        try:
+            return cell.paragraphs[int(location["paragraph_index"])], cell
+        except (IndexError, KeyError, TypeError, ValueError):
+            return None, cell
+    non_empty = [paragraph for paragraph in cell.paragraphs if paragraph.text.strip()]
+    return (non_empty[0] if non_empty else cell.paragraphs[0]), cell
 
 
 def _alignment_name(paragraph: Paragraph | None) -> str | None:
@@ -306,6 +371,30 @@ def _run_attributes(run) -> dict:
     if run.underline:
         attributes["underline"] = True
     return attributes
+
+
+def _paragraph_style_name(
+    paragraph: Paragraph,
+    cache: dict[str | None, str | None] | None = None,
+) -> str | None:
+    """Resolve a paragraph style once per underlying Word style ID.
+
+    python-docx searches the complete style collection whenever an unstyled
+    paragraph asks for its default style. Large document migrations contain
+    thousands of those paragraphs, so cache both explicit style IDs and the
+    default (``None``) lookup for the lifetime of one parsed document.
+    """
+
+    properties = paragraph._p.pPr
+    style_element = properties.pStyle if properties is not None else None
+    style_id = str(style_element.val) if style_element is not None else None
+    if cache is not None and style_id in cache:
+        return cache[style_id]
+    style = paragraph.style
+    name = style.name if style is not None else None
+    if cache is not None:
+        cache[style_id] = name
+    return name
 
 
 def _numbering_type(
@@ -402,19 +491,30 @@ def _paragraph_delta(
     text: str,
     paragraph: Paragraph | None,
     block_attributes: dict,
+    formatted_runs: list[dict] | None = None,
 ) -> dict:
     operations: list[dict] = []
     if paragraph is not None and paragraph.runs:
         covered = ""
-        for run in paragraph.runs:
-            if not run.text:
+        runs = formatted_runs
+        if runs is None:
+            runs = [
+                {"text": run.text, **_run_attributes(run)}
+                for run in paragraph.runs
+                if run.text
+            ]
+        for run in runs:
+            run_text = str(run.get("text") or "")
+            if not run_text:
                 continue
-            operation = {"insert": run.text}
-            attributes = _run_attributes(run)
+            operation = {"insert": run_text}
+            attributes = {
+                key: value for key, value in run.items() if key != "text"
+            }
             if attributes:
                 operation["attributes"] = attributes
             operations.append(operation)
-            covered += run.text
+            covered += run_text
         # Hyperlinks and some field content are not exposed as normal runs. The
         # read-only diagnostic handles those; keep the visible text complete.
         if covered != text and text:
@@ -428,9 +528,26 @@ def _paragraph_delta(
     return {"ops": operations}
 
 
+def _cell_uses_merged_structure(cell: object | None) -> bool:
+    if cell is None:
+        return False
+    try:
+        properties = cell._tc.tcPr
+        grid_span = properties.gridSpan
+        if grid_span is not None and int(grid_span.val or 1) > 1:
+            return True
+        if properties.vMerge is not None:
+            return True
+    except (AttributeError, TypeError, ValueError):
+        return True
+    return False
+
+
 def _unsupported_reason(
     paragraph: Paragraph | None,
     cell: object | None,
+    *,
+    allow_multiple_paragraphs: bool = False,
 ) -> str | None:
     if paragraph is not None:
         for node in paragraph._p.iter():
@@ -439,11 +556,35 @@ def _unsupported_reason(
                 return f"{reason} is read-only in Edit mode."
     if cell is not None:
         if getattr(cell, "tables", None):
-            return "Nested tables are read-only in Edit mode."
+            return (
+                "This table cell uses a nested structure that DocSync cannot "
+                "safely edit. The content will remain unchanged in the "
+                "generated document."
+            )
+        if _cell_uses_merged_structure(cell):
+            return (
+                "This table cell uses a merged structure that DocSync cannot "
+                "safely edit. The content will remain unchanged in the "
+                "generated document."
+            )
+        try:
+            for node in cell._tc.iter():
+                reason = UNSUPPORTED_XML_TAGS.get(node.tag)
+                if reason is not None:
+                    return (
+                        f"This table cell contains {reason.lower()} that DocSync "
+                        "cannot safely edit. The content will remain unchanged in "
+                        "the generated document."
+                    )
+        except AttributeError:
+            return (
+                "This table cell cannot be mapped safely. The content will remain "
+                "unchanged in the generated document."
+            )
         non_empty = [
             item for item in getattr(cell, "paragraphs", []) if item.text.strip()
         ]
-        if len(non_empty) > 1:
+        if not allow_multiple_paragraphs and len(non_empty) > 1:
             return (
                 "Table cells containing multiple paragraphs are read-only in Edit mode."
             )
@@ -457,6 +598,7 @@ def _revision_values(
     shared_state: str = "shared",
     paragraphs: list[Paragraph] | None = None,
     tables: list[object] | None = None,
+    style_name_cache: dict[str | None, str | None] | None = None,
 ) -> dict:
     ordinal, location = _element_location(element)
     element_type = _element_type(element.style_name)
@@ -467,12 +609,17 @@ def _revision_values(
         paragraphs=paragraphs,
         tables=tables,
     )
+    if (
+        element_type == "table_paragraph"
+        and paragraph is not None
+    ):
+        style_name = _paragraph_style_name(paragraph, style_name_cache)
     list_type, list_level = (
         _numbering_type(document, paragraph, style_name)
         if paragraph is not None
         else (None, None)
     )
-    if element_type != "list_item" and list_type is not None:
+    if element_type not in {"list_item", "table_paragraph"} and list_type is not None:
         element_type = "list_item"
     alignment = _alignment_name(paragraph)
     block_attributes = _paragraph_block_attributes(
@@ -483,21 +630,29 @@ def _revision_values(
         alignment,
         style_name,
     )
-    reason = _unsupported_reason(paragraph, cell)
-    formatting = {
-        "style_name": style_name,
-        "runs": [
-            {
-                "text": run.text,
-                **_run_attributes(run),
-            }
-            for run in (paragraph.runs if paragraph is not None else [])
-            if run.text
-        ],
-    }
-    delta = _paragraph_delta(element.text, paragraph, block_attributes)
+    reason = _unsupported_reason(
+        paragraph,
+        cell,
+        allow_multiple_paragraphs=element_type == "table_paragraph",
+    )
+    formatted_runs = [
+        {
+            "text": run.text,
+            **_run_attributes(run),
+        }
+        for run in (paragraph.runs if paragraph is not None else [])
+        if run.text
+    ]
+    formatting = {"style_name": style_name, "runs": formatted_runs}
+    delta = _paragraph_delta(
+        element.text,
+        paragraph,
+        block_attributes,
+        formatted_runs,
+    )
     structure = {
         "element_type": element_type,
+        "context": "table" if element_type == "table_paragraph" else "body",
         "style_name": style_name,
         "list_type": list_type,
         "list_level": list_level,
@@ -543,6 +698,9 @@ def _create_revisions_for_existing_elements(
     source_path: Path,
 ) -> list[DocumentBlockRevision]:
     docx = _load_docx(source_path)
+    paragraphs = list(docx.paragraphs)
+    tables = list(docx.tables)
+    style_name_cache: dict[str | None, str | None] = {}
     elements = list(
         session.scalars(
             select(DocumentElement)
@@ -551,7 +709,16 @@ def _create_revisions_for_existing_elements(
         )
     )
     revisions = [
-        DocumentBlockRevision(version_id=version.id, **_revision_values(docx, element))
+        DocumentBlockRevision(
+            version_id=version.id,
+            **_revision_values(
+                docx,
+                element,
+                paragraphs=paragraphs,
+                tables=tables,
+                style_name_cache=style_name_cache,
+            ),
+        )
         for element in elements
     ]
     session.add_all(revisions)
@@ -568,6 +735,7 @@ def initialise_original_version(
     if parsed_document is not None and elements is not None:
         paragraphs = list(parsed_document.paragraphs)
         tables = list(parsed_document.tables)
+        style_name_cache: dict[str | None, str | None] = {}
         version = DocumentVersion(
             id=document.id,
             document=document,
@@ -594,6 +762,7 @@ def initialise_original_version(
                     element,
                     paragraphs=paragraphs,
                     tables=tables,
+                    style_name_cache=style_name_cache,
                 ),
             )
             for element in elements
@@ -685,7 +854,13 @@ def _serialize_revision(
     payload.update(
         {
             key: location[key]
-            for key in ("table_index", "row_index", "column_index")
+            for key in (
+                "document_order",
+                "table_index",
+                "row_index",
+                "column_index",
+                "paragraph_index",
+            )
             if key in location
         }
     )
@@ -1673,6 +1848,21 @@ def _validate_editor_request(
             revision,
             target.replacement_text,
         )
+        if revision.element_type == "table_paragraph":
+            operations = list(delta.get("ops") or [])
+            newline_attributes = (
+                operations[-1].get("attributes") or {}
+                if operations and operations[-1].get("insert") == "\n"
+                else {}
+            )
+            if "header" in newline_attributes:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "Heading levels cannot be applied inside a table cell. "
+                        "Use bold, lists, indentation, or alignment instead."
+                    ),
+                )
         validated_targets.append((target, revision, document, delta))
 
     return source, source_document, base_context, validated_targets
@@ -1755,7 +1945,7 @@ def _apply_target_to_docx(
 ) -> None:
     location = revision.location_json or {}
     paragraph: Paragraph
-    if location.get("kind") == "table_cell":
+    if location.get("kind") in {"table_cell", "table_paragraph"}:
         try:
             cell = (
                 document.tables[int(location["table_index"])]
@@ -1765,18 +1955,29 @@ def _apply_target_to_docx(
         except (IndexError, KeyError, TypeError, ValueError) as exc:
             raise HTTPException(
                 status_code=409,
-                detail="The target table-cell location is no longer valid.",
+                detail="The target table-paragraph location is no longer valid.",
             ) from exc
-        non_empty = [item for item in cell.paragraphs if item.text.strip()]
-        if len(non_empty) > 1 or cell.tables:
+        if location.get("kind") == "table_paragraph":
+            try:
+                paragraph = cell.paragraphs[int(location["paragraph_index"])]
+            except (IndexError, KeyError, TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="The target table paragraph is no longer present.",
+                ) from exc
+        else:
+            non_empty = [item for item in cell.paragraphs if item.text.strip()]
+            paragraph = non_empty[0] if non_empty else cell.paragraphs[0]
+        reason = _unsupported_reason(
+            paragraph,
+            cell,
+            allow_multiple_paragraphs=location.get("kind") == "table_paragraph",
+        )
+        if reason is not None:
             raise HTTPException(
                 status_code=422,
-                detail=(
-                    "Table cells containing multiple paragraphs or nested tables "
-                    "are read-only."
-                ),
+                detail=reason,
             )
-        paragraph = non_empty[0] if non_empty else cell.paragraphs[0]
     else:
         try:
             paragraph = document.paragraphs[int(location["paragraph_index"])]
@@ -1785,7 +1986,16 @@ def _apply_target_to_docx(
                 status_code=409,
                 detail="The target paragraph location is no longer valid.",
             ) from exc
-    existing_list_type, _existing_level = _numbering_type(document, paragraph)
+    existing_style_name = (
+        paragraph.style.name
+        if paragraph.style is not None
+        else None
+    )
+    existing_list_type, _existing_level = _numbering_type(
+        document,
+        paragraph,
+        existing_style_name,
+    )
     newline_attributes = _apply_inline_delta(paragraph, delta)
     if target.delta is not None:
         # A submitted Quill document is authoritative for supported block
@@ -1850,6 +2060,7 @@ def _preview_payload(
 ) -> dict:
     documents: dict[str, dict] = {}
     for target, revision, document, delta in validated_targets:
+        location = dict(revision.location_json or {})
         item = documents.setdefault(
             document.id,
             {
@@ -1863,11 +2074,21 @@ def _preview_payload(
         item["changes"].append(
             {
                 "element_id": revision.element_id,
-                "paragraph_index": (revision.location_json or {}).get(
+                "paragraph_index": location.get(
                     "paragraph_index", revision.ordinal
                 ),
                 "element_type": revision.element_type,
-                "location": revision.location_json,
+                "document_order": location.get("document_order", revision.ordinal),
+                "location": location,
+                **{
+                    key: location[key]
+                    for key in (
+                        "table_index",
+                        "row_index",
+                        "column_index",
+                    )
+                    if key in location
+                },
                 "before": revision.text,
                 "after": target.replacement_text,
                 "before_delta": revision.delta_json,
@@ -1952,6 +2173,9 @@ def _replace_current_elements_and_create_revisions(
 
     docx = _load_docx(source_path)
     extracted = _extract_paragraphs(docx)
+    paragraphs = list(docx.paragraphs)
+    tables = list(docx.tables)
+    style_name_cache: dict[str | None, str | None] = {}
     previous_states = _shared_states_by_location(session, base_version_id)
     override_locations = override_locations or set()
     reconnect_locations = reconnect_locations or set()
@@ -1989,7 +2213,14 @@ def _replace_current_elements_and_create_revisions(
             shared_state = "detached"
         elif key in reconnect_locations:
             shared_state = "shared"
-        values = _revision_values(docx, element, shared_state=shared_state)
+        values = _revision_values(
+            docx,
+            element,
+            shared_state=shared_state,
+            paragraphs=paragraphs,
+            tables=tables,
+            style_name_cache=style_name_cache,
+        )
         revision = DocumentBlockRevision(version_id=version.id, **values)
         revisions.append(revision)
         location_to_element[key] = element.id

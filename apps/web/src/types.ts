@@ -15,7 +15,7 @@ export interface LinkMember {
   document_id: string;
   document_name: string;
   paragraph_index: number;
-  element_type: "paragraph" | "heading" | "list_item" | "table_cell";
+  element_type: "paragraph" | "heading" | "list_item" | "table_cell" | "table_paragraph";
   text: string;
   style_name: string | null;
   table_index?: number;
@@ -27,7 +27,7 @@ export interface ViewerElement {
   id: string;
   document_id: string;
   paragraph_index: number;
-  element_type: "paragraph" | "heading" | "list_item" | "table_cell";
+  element_type: "paragraph" | "heading" | "list_item" | "table_cell" | "table_paragraph";
   text: string;
   style_name: string | null;
   table_index?: number;
@@ -126,7 +126,7 @@ export interface GlobalSearchResult {
   document_name: string;
   version_id: string;
   paragraph_index: number;
-  element_type: "paragraph" | "heading" | "list_item" | "table_cell";
+  element_type: "paragraph" | "heading" | "list_item" | "table_cell" | "table_paragraph";
   table_index?: number;
   row_index?: number;
   column_index?: number;
@@ -220,6 +220,7 @@ export type EditorElementType =
   | "heading"
   | "list_item"
   | "table_cell"
+  | "table_paragraph"
   | "unsupported"
   | string;
 
@@ -246,6 +247,7 @@ export interface EditorBlock {
   table_index?: number;
   row_index?: number;
   column_index?: number;
+  document_order?: number;
 }
 
 export interface EditorContentResponse {
@@ -300,6 +302,7 @@ export interface EditorMatch {
   table_index?: number;
   row_index?: number;
   column_index?: number;
+  document_order?: number;
 }
 
 export interface SimilarMatchesResponse {

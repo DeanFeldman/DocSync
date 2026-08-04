@@ -9,7 +9,7 @@ import unicodedata
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
-from sqlalchemy import create_engine, select, text
+from sqlalchemy import create_engine, delete, select, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from .config import settings
@@ -30,7 +30,17 @@ _ORDERED_TABLE_STYLE = re.compile(
     r"^table_cell_order:(\d+):(\d+):(\d+):(\d+)$"
 )
 _TABLE_STYLE = re.compile(r"^table_cell:(\d+):(\d+):(\d+)$")
+_ORDERED_TABLE_PARAGRAPH_STYLE = re.compile(
+    r"^table_paragraph_order:(\d+):(\d+):(\d+):(\d+):(\d+):(\d+)$"
+)
+_TABLE_PARAGRAPH_STYLE = re.compile(
+    r"^table_paragraph:(\d+):(\d+):(\d+):(\d+)$"
+)
 _ORDERED_BODY_STYLE = re.compile(r"^body_order:(\d+):(.*)$", re.DOTALL)
+_BLOCK_ORDERED_BODY_STYLE = re.compile(
+    r"^body_block_order:(\d+):(\d+):(\d+):(.*)$",
+    re.DOTALL,
+)
 _LIST_LEVEL_SUFFIX = re.compile(r"\s+(\d+)$")
 _HEADING_LEVEL = re.compile(r"^heading\s+(\d+)$", re.IGNORECASE)
 
@@ -53,6 +63,11 @@ def init_db() -> None:
                 version=1,
                 name="version_foundation",
                 apply=_migrate_version_foundation,
+            ),
+            WorkspaceMigration(
+                version=2,
+                name="table_paragraph_foundation",
+                apply=_migrate_table_paragraph_foundation,
             ),
         ),
         report_stage=report_stage,
@@ -99,49 +114,100 @@ def _block_shape(style_name: str | None, paragraph_index: int) -> dict:
     ordinal = paragraph_index
     location: dict[str, int] = {"paragraph_index": paragraph_index}
 
-    table_match = _ORDERED_TABLE_STYLE.fullmatch(raw_style)
-    if table_match is not None:
-        order, table_index, row_index, column_index = (
-            int(value) for value in table_match.groups()
-        )
-        ordinal = order
-        location.update(
-            {
-                "table_index": table_index,
-                "row_index": row_index,
-                "column_index": column_index,
-            }
-        )
-        element_type = "table_cell"
+    table_paragraph_match = _ORDERED_TABLE_PARAGRAPH_STYLE.fullmatch(raw_style)
+    if table_paragraph_match is not None:
+        (
+            ordinal,
+            document_order,
+            table_index,
+            row_index,
+            column_index,
+            cell_paragraph_index,
+        ) = (int(value) for value in table_paragraph_match.groups())
+        location = {
+            "kind": "table_paragraph",
+            "document_order": document_order,
+            "table_index": table_index,
+            "row_index": row_index,
+            "column_index": column_index,
+            "paragraph_index": cell_paragraph_index,
+        }
+        element_type = "table_paragraph"
         display_style = None
     else:
-        legacy_table_match = _TABLE_STYLE.fullmatch(raw_style)
-        if legacy_table_match is not None:
-            table_index, row_index, column_index = (
-                int(value) for value in legacy_table_match.groups()
+        legacy_paragraph_match = _TABLE_PARAGRAPH_STYLE.fullmatch(raw_style)
+        if legacy_paragraph_match is not None:
+            table_index, row_index, column_index, cell_paragraph_index = (
+                int(value) for value in legacy_paragraph_match.groups()
             )
             location.update(
                 {
+                    "kind": "table_paragraph",
                     "table_index": table_index,
                     "row_index": row_index,
                     "column_index": column_index,
+                    "paragraph_index": cell_paragraph_index,
                 }
             )
-            element_type = "table_cell"
+            element_type = "table_paragraph"
             display_style = None
         else:
-            body_match = _ORDERED_BODY_STYLE.fullmatch(raw_style)
-            if body_match is not None:
-                ordinal = int(body_match.group(1))
-                display_style = body_match.group(2) or None
-
-            folded_style = (display_style or "").casefold()
-            if folded_style.startswith(("heading", "title")):
-                element_type = "heading"
-            elif folded_style.startswith("list"):
-                element_type = "list_item"
+            table_match = _ORDERED_TABLE_STYLE.fullmatch(raw_style)
+            if table_match is not None:
+                order, table_index, row_index, column_index = (
+                    int(value) for value in table_match.groups()
+                )
+                ordinal = order
+                location.update(
+                    {
+                        "kind": "table_cell",
+                        "document_order": order,
+                        "table_index": table_index,
+                        "row_index": row_index,
+                        "column_index": column_index,
+                    }
+                )
+                element_type = "table_cell"
+                display_style = None
             else:
-                element_type = "paragraph"
+                legacy_table_match = _TABLE_STYLE.fullmatch(raw_style)
+                if legacy_table_match is not None:
+                    table_index, row_index, column_index = (
+                        int(value) for value in legacy_table_match.groups()
+                    )
+                    location.update(
+                        {
+                            "kind": "table_cell",
+                            "table_index": table_index,
+                            "row_index": row_index,
+                            "column_index": column_index,
+                        }
+                    )
+                    element_type = "table_cell"
+                    display_style = None
+                else:
+                    body_block_match = _BLOCK_ORDERED_BODY_STYLE.fullmatch(raw_style)
+                    if body_block_match is not None:
+                        ordinal = int(body_block_match.group(1))
+                        location = {
+                            "kind": "body",
+                            "document_order": int(body_block_match.group(2)),
+                            "paragraph_index": int(body_block_match.group(3)),
+                        }
+                        display_style = body_block_match.group(4) or None
+                    else:
+                        body_match = _ORDERED_BODY_STYLE.fullmatch(raw_style)
+                        if body_match is not None:
+                            ordinal = int(body_match.group(1))
+                            display_style = body_match.group(2) or None
+
+                    folded_style = (display_style or "").casefold()
+                    if folded_style.startswith(("heading", "title")):
+                        element_type = "heading"
+                    elif folded_style.startswith("list"):
+                        element_type = "list_item"
+                    else:
+                        element_type = "paragraph"
 
     folded_style = (display_style or "").casefold()
     list_type: str | None = None
@@ -525,6 +591,185 @@ def _backfill_version_foundation(session: Session) -> None:
         _backfill_block_revisions(session, document, versions, head)
         if index % 25 == 0:
             session.flush()
+
+
+def _migrate_table_paragraph_foundation(session: Session) -> None:
+    """Regenerate immutable block maps with v1.5 paragraph-level table locations.
+
+    The migration deliberately reparses every stored immutable DOCX instead of
+    guessing paragraph boundaries from legacy cell text. Workspace migration
+    orchestration creates and verifies a SQLite backup before this runs, and a
+    failure in any version restores the active database without advancing the
+    schema marker.
+    """
+
+    from .document_service import _extract_paragraphs, _rebuild_exact_link_groups
+    from .editor_service import (
+        _load_docx,
+        _element_location,
+        _location_key,
+        _revision_values,
+        document_version_path,
+    )
+    from .models import (
+        DocumentBlockRevision,
+        DocumentElement,
+        DocumentHead,
+        DocumentRecord,
+        DocumentVersion,
+        LinkMember,
+    )
+
+    documents = list(
+        session.scalars(
+            select(DocumentRecord).order_by(
+                DocumentRecord.created_at,
+                DocumentRecord.id,
+            )
+        )
+    )
+    document_set_ids: set[str] = set()
+    for document in documents:
+        document_set_ids.add(document.document_set_id)
+        head = session.get(DocumentHead, document.id)
+        if head is None:
+            raise RuntimeError(
+                f"Document {document.id} has no current version during table migration."
+            )
+        versions = list(
+            session.scalars(
+                select(DocumentVersion)
+                .where(DocumentVersion.document_id == document.id)
+                .order_by(DocumentVersion.version_number, DocumentVersion.id)
+            )
+        )
+        for version in versions:
+            source_path = document_version_path(version)
+            parsed = _load_docx(source_path)
+            extracted = _extract_paragraphs(parsed)
+            # python-docx rebuilds its Paragraph/Table proxy lists whenever the
+            # properties are accessed.  Passing stable lists into every
+            # revision lookup keeps this migration linear in the number of
+            # blocks; without them, a large workspace repeatedly walks the
+            # complete document tree for every block and can exceed desktop's
+            # startup supervision window.
+            paragraphs = list(parsed.paragraphs)
+            tables = list(parsed.tables)
+            style_name_cache: dict[str | None, str | None] = {}
+            previous_revisions = list(
+                session.scalars(
+                    select(DocumentBlockRevision).where(
+                        DocumentBlockRevision.version_id == version.id
+                    )
+                )
+            )
+            previous_states = {
+                _location_key(revision.location_json): revision.shared_state
+                for revision in previous_revisions
+            }
+            legacy_cell_states = {
+                (
+                    int(location["table_index"]),
+                    int(location["row_index"]),
+                    int(location["column_index"]),
+                ): revision.shared_state
+                for revision in previous_revisions
+                for location in [dict(revision.location_json or {})]
+                if all(
+                    key in location
+                    for key in ("table_index", "row_index", "column_index")
+                )
+                and revision.element_type != "table_paragraph"
+            }
+            previous_body_states = {
+                int(location["paragraph_index"]): revision.shared_state
+                for revision in previous_revisions
+                for location in [dict(revision.location_json or {})]
+                if "table_index" not in location and "paragraph_index" in location
+            }
+
+            session.execute(
+                delete(DocumentBlockRevision).where(
+                    DocumentBlockRevision.version_id == version.id
+                )
+            )
+
+            is_current = version.id == head.current_version_id
+            if is_current:
+                current_ids = list(
+                    session.scalars(
+                        select(DocumentElement.id).where(
+                            DocumentElement.document_id == document.id
+                        )
+                    )
+                )
+                if current_ids:
+                    session.execute(
+                        delete(LinkMember).where(LinkMember.element_id.in_(current_ids))
+                    )
+                session.execute(
+                    delete(DocumentElement).where(
+                        DocumentElement.document_id == document.id
+                    )
+                )
+                session.flush()
+
+            elements: list[DocumentElement] = []
+            for paragraph_index, block_text, style_name in extracted:
+                element = DocumentElement(
+                    id=str(
+                        uuid5(
+                            NAMESPACE_URL,
+                            (
+                                f"docsync:v1.5:{version.id}:"
+                                f"{paragraph_index}:{style_name or ''}"
+                            ),
+                        )
+                    ),
+                    document_id=document.id,
+                    paragraph_index=paragraph_index,
+                    text=block_text,
+                    normalized_text=_normalise_text(block_text),
+                    style_name=style_name,
+                )
+                if is_current:
+                    session.add(element)
+                elements.append(element)
+            if is_current:
+                session.flush()
+
+            for element in elements:
+                _ordinal, location = _element_location(element)
+                location_key = _location_key(location)
+                shared_state = previous_states.get(location_key)
+                if shared_state is None and location.get("kind") == "table_paragraph":
+                    shared_state = legacy_cell_states.get(
+                        (
+                            int(location["table_index"]),
+                            int(location["row_index"]),
+                            int(location["column_index"]),
+                        )
+                    )
+                if shared_state is None and location.get("kind") == "body":
+                    shared_state = previous_body_states.get(
+                        int(location["paragraph_index"])
+                    )
+                values = _revision_values(
+                    parsed,
+                    element,
+                    shared_state=shared_state or "shared",
+                    paragraphs=paragraphs,
+                    tables=tables,
+                    style_name_cache=style_name_cache,
+                )
+                session.add(
+                    DocumentBlockRevision(version_id=version.id, **values)
+                )
+            session.flush()
+
+    for document_set_id in document_set_ids:
+        _rebuild_exact_link_groups(session, document_set_id)
+    session.flush()
 
 
 def get_session() -> Generator[Session, None, None]:
