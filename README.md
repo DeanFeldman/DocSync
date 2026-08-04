@@ -31,6 +31,54 @@ DocSync-Setup-latest.exe
 
 ---
 
+## Version 1.7.0
+
+DocSync `v1.7.0` adds safe, section-aware editing for Microsoft Word header
+and footer paragraphs. Default, first-page, and even-page parts are extracted
+across every section. Linked sections that share one physical Word part are
+deduplicated into one editor target and are explained before processing.
+
+Supported header and footer paragraphs use the same single-paragraph rich-text
+editor, exact/near comparison, global search, preview, background generation,
+immutable history, and restoration flow as body and table paragraphs. Page
+numbers, complex fields, logos, images, shapes, watermarks, content controls,
+and other unsafe objects remain visible, preserved, and read-only.
+
+Existing workspaces are upgraded by schema migration 4, which reparses every
+stored immutable DOCX version after creating and verifying a SQLite backup.
+See [the v1.7.0 release notes](docs/v1.7.0-release-notes.md),
+[header/footer requirements](docs/v1.7.0-header-footer-requirements.md), and
+[manual test plan](docs/v1.7.0-manual-testing.md).
+
+## Version 1.6.0
+
+DocSync `v1.6.0` moves reviewed document processing into durable, non-blocking
+background jobs. Process returns quickly while users continue navigating, and
+the application keeps visible queued, preparing, applying, validating, saving,
+refreshing, completed, failed, and interrupted states. Completion selectively
+refreshes affected document heads, versions, blocks, matches, search results,
+and downloads without replacing an unrelated active draft.
+
+The release also preserves custom Word list styles when the list type is not
+changed, strengthens SQLite processing reliability and conflict handling, and
+marks unfinished jobs as interrupted after a restart so they can be retried
+safely. See [the v1.6.0 release notes](docs/v1.6.0-release-notes.md).
+
+## Version 1.5.0
+
+DocSync `v1.5.0` maps each non-empty paragraph in a supported top-level table
+cell as its own `table_paragraph` block. The immutable location records table,
+row, column, paragraph, and document order so selection, formatting, exact and
+near matching, preview, and generation all resolve the same Word paragraph.
+
+Schema migration 2 reparses every stored immutable DOCX to backfill
+paragraph-level table locations from OOXML. Merged cells, nested tables,
+drawings, fields, and other unsafe table structures remain preserved and
+read-only. See [the v1.5.0 release notes](docs/v1.5.0-release-notes.md) and
+[the editable editor design](docs/editable-document-editor.md).
+
+---
+
 ## Version 1.4.2
 
 DocSync `v1.4.2` makes installed Windows startup safe and predictable for
@@ -139,7 +187,10 @@ DocSync provides three document workspace modes.
 
 #### Edit
 
-- Exposes supported headings, paragraphs, list items, and top-level table cells as stable blocks.
+- Exposes supported headings, body paragraphs, list items, table paragraphs,
+  header paragraphs, and footer paragraphs as stable blocks.
+- Labels header/footer blocks by section, part type, and paragraph and explains
+  when linked sections share the same physical Word part.
 - Uses Quill 2 for structured rich-text editing.
 - Supports selected formatting metadata, including:
   - bold
@@ -178,9 +229,12 @@ DocSync supports three controlled editing modes:
 ### Preview and generation
 
 - Preview the resolved result before writing any files.
-- Show every affected document and location.
+- Show every affected document and exact body, table, header, or footer
+  location, including linked sections.
 - Reject stale operations when a document changed after the editor was opened.
 - Generate changes atomically.
+- Submit processing to a durable background job and keep navigation available.
+- Refresh only affected workspace resources when processing completes.
 - Create new immutable document versions.
 - Keep original uploads unchanged.
 - Continue editing from the newly generated current versions.
@@ -287,6 +341,10 @@ a timestamped backup under `workspace/migration-backups`; the five newest
 backups are retained. A current workspace skips completed migrations and does
 not rerun the version/block-revision backfill. No manual migration command is
 normally required.
+
+Schema migration 2 introduced paragraph-level table mappings, schema migration
+3 added durable background-job progress fields, and schema migration 4 reparses
+all immutable versions to add deduplicated, section-aware header/footer blocks.
 
 If migration fails, the active database is restored automatically and the
 startup dialog shows the workspace and recovery-backup paths. Do not move or
@@ -435,7 +493,7 @@ The workflow reads the application version from the Git tag, so the source `pack
 From the repository root:
 
 ```powershell
-$version = "1.4.2"
+$version = "1.7.0"
 
 git switch main
 git pull origin main
@@ -543,7 +601,12 @@ http://localhost:8001/docs
 - High-fidelity layout rendering works best when Microsoft Word desktop is installed.
 - High-fidelity Word rendering is intentionally on demand; the structured
   Layout view remains available when Word is missing or a preview fails.
-- Some Word structures remain read-only.
+- Header and footer text is editable only when its physical Word paragraph can
+  be mapped and rewritten safely.
+- Page numbers, page counts, dates, document-property fields, cross-references,
+  and other complex fields remain preserved and read-only.
+- Header/footer images, logos, watermarks, shapes, text boxes, content controls,
+  and nested tables remain preserved and read-only.
 - Direct selection is available in the structured Layout view. The
   high-fidelity Word/PDF preview remains read-only until the renderer can
   provide reliable page-relative element coordinates.
@@ -556,15 +619,14 @@ http://localhost:8001/docs
 
 Planned work includes:
 
-- Reliable element-coordinate overlays for the high-fidelity Word/PDF preview
-- Broader editing support for complex Word structures
-- Stronger file validation and local document protection
-- Linux and macOS support
+- Reliable high-fidelity preview coordinate overlays
+- Additional complex Word structures
+- Linux and macOS feasibility
+- Commercial code signing
+- Automatic update channels
 - Hosted authentication
-- PostgreSQL support for hosted deployments
-- Secure cloud storage and synchronisation
-- Automatic desktop update channels
-- Ability to summarise changes on each doc (AI)
+- PostgreSQL
+- Cloud storage and synchronisation
 ---
 
 ## Contributing

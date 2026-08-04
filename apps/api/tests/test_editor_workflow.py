@@ -13,6 +13,9 @@ from pathlib import Path
 from docx import Document
 from docx.enum.style import WD_STYLE_TYPE
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.shared import Inches
 from fastapi.testclient import TestClient
 
 
@@ -148,6 +151,61 @@ def make_unsupported_table_structures_docx() -> bytes:
     return save_docx(document)
 
 
+def add_page_field(paragraph) -> None:
+    paragraph.add_run("Page ")
+    run = paragraph.add_run()
+    begin = OxmlElement("w:fldChar")
+    begin.set(qn("w:fldCharType"), "begin")
+    instruction = OxmlElement("w:instrText")
+    instruction.set(qn("xml:space"), "preserve")
+    instruction.text = " PAGE "
+    separate = OxmlElement("w:fldChar")
+    separate.set(qn("w:fldCharType"), "separate")
+    result = OxmlElement("w:t")
+    result.text = "1"
+    end = OxmlElement("w:fldChar")
+    end.set(qn("w:fldCharType"), "end")
+    for node in (begin, instruction, separate, result, end):
+        run._r.append(node)
+
+
+def make_header_footer_docx(
+    title: str,
+    shared_header: str,
+    *,
+    footer_address: str = "14 Example Road, Cape Town",
+) -> bytes:
+    document = Document()
+    document.settings.odd_and_even_pages_header_footer = True
+    first = document.sections[0]
+    first.different_first_page_header_footer = True
+
+    first.header.paragraphs[0].text = shared_header
+    first.header.add_paragraph(f"{title} registration")
+    first.first_page_header.paragraphs[0].text = f"{title} first page"
+    first.even_page_header.paragraphs[0].text = f"{title} even pages"
+
+    first.footer.paragraphs[0].text = footer_address
+    field_paragraph = first.footer.add_paragraph()
+    add_page_field(field_paragraph)
+    image_paragraph = first.footer.add_paragraph("Protected logo ")
+    image_paragraph.add_run().add_picture(
+        str(API_DIR.parents[1] / "build" / "icon.png")
+    )
+    footer_table = first.footer.add_table(rows=1, cols=1, width=Inches(2))
+    footer_table.cell(0, 0).text = "Protected footer table"
+    first.first_page_footer.paragraphs[0].text = f"{title} first footer"
+    first.even_page_footer.paragraphs[0].text = f"{title} even footer"
+
+    document.add_paragraph(shared_header)
+    document.add_paragraph("Body content before section two.")
+    second = document.add_section()
+    document.add_paragraph("Body content in section two.")
+    assert second.header.is_linked_to_previous
+    assert second.footer.is_linked_to_previous
+    return save_docx(document)
+
+
 def upload_set(
     client: TestClient,
     originals: dict[str, bytes],
@@ -195,6 +253,181 @@ def version_count(client: TestClient, document_id: str) -> int:
     response = client.get(f"/api/documents/{document_id}/versions")
     assert response.status_code == 200, response.text
     return len(response.json()["versions"])
+
+
+def test_header_footer_blocks_are_section_aware_deduplicated_and_safely_written(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    shared_header = "Care Centres resident services"
+    app = load_test_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        workspace = upload_set(
+            client,
+            {
+                "Alpha.docx": make_header_footer_docx("Alpha", shared_header),
+                "Beta.docx": make_header_footer_docx("Beta", shared_header),
+                "Gamma.docx": make_header_footer_docx(
+                    "Gamma",
+                    "Care Centre resident service",
+                ),
+            },
+            name="Header and footer workflow",
+        )
+        documents = documents_by_name(workspace)
+        alpha_content = read_editor_content(
+            client,
+            documents["Alpha.docx"]["version_id"],
+        )
+        beta_content = read_editor_content(
+            client,
+            documents["Beta.docx"]["version_id"],
+        )
+
+        header_blocks = [
+            block
+            for block in alpha_content["blocks"]
+            if block["element_type"] == "header_paragraph"
+        ]
+        footer_blocks = [
+            block
+            for block in alpha_content["blocks"]
+            if block["element_type"] == "footer_paragraph"
+        ]
+        assert {block["header_footer_type"] for block in header_blocks} == {
+            "default_header",
+            "first_page_header",
+            "even_page_header",
+        }
+        assert {block["header_footer_type"] for block in footer_blocks} == {
+            "default_footer",
+            "first_page_footer",
+            "even_page_footer",
+        }
+
+        source = next(
+            block
+            for block in header_blocks
+            if block["text"] == shared_header
+        )
+        assert source["kind"] == "header_paragraph"
+        assert source["section_index"] == 0
+        assert source["source_section_index"] == 0
+        assert source["paragraph_index"] == 0
+        assert source["part_relationship_id"].startswith("rId")
+        assert source["section_indexes"] == [0, 1]
+        assert source["linked_section_indexes"] == [1]
+        assert source["is_linked_to_previous"] is True
+        # One physical header paragraph is exposed once even though section 2
+        # inherits the same part.
+        assert sum(block["text"] == shared_header for block in header_blocks) == 1
+
+        page_field = next(
+            block for block in footer_blocks if block["text"].startswith("Page ")
+        )
+        logo = next(
+            block for block in footer_blocks if block["text"] == "Protected logo"
+        )
+        assert page_field["read_only"] is True
+        assert "word field" in page_field["unsupported_reason"]
+        assert logo["read_only"] is True
+        assert "drawing or floating object" in logo["unsupported_reason"]
+
+        matches = client.get(
+            f"/api/document-elements/{source['element_id']}/matches"
+        )
+        assert matches.status_code == 200, matches.text
+        exact = matches.json()["exact_matches"]
+        assert [item["document_name"] for item in exact] == ["Beta.docx"]
+        assert exact[0]["header_footer_type"] == "default_header"
+        # Identical body text is deliberately not a header match target.
+        assert all(item["element_type"] == "header_paragraph" for item in exact)
+
+        similar = client.get(
+            f"/api/document-elements/{source['element_id']}/similar-matches",
+            params={"threshold": 0, "limit": 20},
+        )
+        assert similar.status_code == 200, similar.text
+        assert any(
+            item["document_name"] == "Gamma.docx"
+            and item["header_footer_type"] == "default_header"
+            and 0 < item["similarity_score"] < 1
+            for item in similar.json()["matches"]
+        )
+
+        search = client.get(
+            f"/api/document-sets/{workspace['id']}/search",
+            params={"q": "resident services"},
+        )
+        assert search.status_code == 200, search.text
+        header_result = next(
+            item
+            for item in search.json()["results"]
+            if item["document_name"] == "Alpha.docx"
+            and item["element_type"] == "header_paragraph"
+        )
+        assert header_result["section_index"] == 0
+        assert header_result["header_footer_type"] == "default_header"
+
+        replacement = "Care Centres community services"
+        request = {
+            "base_versions": {
+                documents["Alpha.docx"]["id"]: documents["Alpha.docx"][
+                    "version_id"
+                ]
+            },
+            "source_element_id": source["element_id"],
+            "edit_mode": "override",
+            "targets": [
+                {
+                    "element_id": source["element_id"],
+                    "replacement_text": replacement,
+                    "delta": {
+                        "ops": [
+                            {
+                                "insert": replacement,
+                                "attributes": {"bold": True, "italic": True},
+                            },
+                            {"insert": "\n", "attributes": {"align": "center"}},
+                        ]
+                    },
+                }
+            ],
+        }
+        preview = client.post(
+            f"/api/document-sets/{workspace['id']}/editor-preview",
+            json=request,
+        )
+        assert preview.status_code == 200, preview.text
+        preview_change = preview.json()["documents"][0]["changes"][0]
+        assert preview_change["section_index"] == 0
+        assert preview_change["header_footer_type"] == "default_header"
+        assert preview_change["linked_sections"] == [0, 1]
+
+        generated = client.post(
+            f"/api/document-sets/{workspace['id']}/editor-generate",
+            json=request,
+        )
+        assert generated.status_code == 201, generated.text
+        version = generated.json()["versions"][0]
+        download = client.get(version["download_url"])
+        assert download.status_code == 200, download.text
+        updated = Document(io.BytesIO(download.content))
+        assert updated.sections[0].header.paragraphs[0].text == replacement
+        assert updated.sections[1].header.paragraphs[0].text == replacement
+        assert updated.sections[1].header.is_linked_to_previous is True
+        assert updated.sections[0].header.paragraphs[0].runs[0].bold is True
+        assert updated.sections[0].header.paragraphs[0].runs[0].italic is True
+        assert updated.sections[0].header.paragraphs[0].alignment == (
+            WD_ALIGN_PARAGRAPH.CENTER
+        )
+
+        footer_xml = updated.sections[0].footer._element.xml
+        assert "PAGE" in footer_xml
+        assert "w:drawing" in footer_xml
+        assert updated.sections[0].footer.tables[0].cell(0, 0).text == (
+            "Protected footer table"
+        )
 
 
 def test_table_paragraphs_are_individual_safe_rich_versioned_blocks(

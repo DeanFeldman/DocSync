@@ -261,7 +261,7 @@ def test_repeated_real_startup_does_not_duplicate_version_foundation(
             for table in baseline
         }
     assert after == baseline
-    assert detect_schema_version(database_path) == 3
+    assert detect_schema_version(database_path) == 4
     backups = list((data_directory / "migration-backups").glob("*.db"))
     assert len(backups) == 1
 
@@ -271,6 +271,18 @@ def _table_docx(text: str) -> bytes:
     document.add_heading("Legacy table", level=1)
     table = document.add_table(rows=1, cols=1)
     table.cell(0, 0).text = text
+    stream = io.BytesIO()
+    document.save(stream)
+    return stream.getvalue()
+
+
+def _linked_header_docx(text: str) -> bytes:
+    document = Document()
+    document.sections[0].header.paragraphs[0].text = text
+    document.add_paragraph("First section body")
+    second = document.add_section()
+    document.add_paragraph("Second section body")
+    assert second.header.is_linked_to_previous
     stream = io.BytesIO()
     document.save(stream)
     return stream.getvalue()
@@ -347,6 +359,7 @@ def test_v15_migration_regenerates_legacy_table_cells_after_verified_backup(
         assert kwargs.get("paragraphs") is not None
         assert kwargs.get("tables") is not None
         assert kwargs.get("style_name_cache") is not None
+        assert kwargs.get("header_footer_parts") is not None
         cached_revision_calls += 1
         return original_revision_values(*args, **kwargs)
 
@@ -358,7 +371,7 @@ def test_v15_migration_regenerates_legacy_table_cells_after_verified_backup(
     database.init_db()
 
     assert cached_revision_calls > 0
-    assert detect_schema_version(database_path) == 3
+    assert detect_schema_version(database_path) == 4
     backups = list((data_directory / "migration-backups").glob("*.db"))
     assert len(backups) == 1
     assert backups[0].stat().st_size > 0
@@ -378,3 +391,78 @@ def test_v15_migration_regenerates_legacy_table_cells_after_verified_backup(
         assert table_blocks[0]["text"] == "Shared legacy cell"
         assert table_blocks[0]["paragraph_index"] == 0
         assert table_blocks[0]["supported"] is True
+
+
+def test_v17_migration_backfills_linked_headers_from_immutable_docx(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    data_directory = tmp_path / "data"
+    database_path = tmp_path / "v160-workspace.db"
+    monkeypatch.setenv("DOCUMENTSYNC_DATA_DIR", str(data_directory))
+    monkeypatch.setenv("DOCUMENTSYNC_DATABASE_URL", database_url(database_path))
+    monkeypatch.setenv("DOCUMENTSYNC_SESSION_TOKEN", "")
+    monkeypatch.delenv("DOCUMENTSYNC_WEB_DIST", raising=False)
+    for module_name in list(sys.modules):
+        if module_name == "app" or module_name.startswith("app."):
+            del sys.modules[module_name]
+
+    main = importlib.import_module("app.main")
+    with TestClient(main.app) as client:
+        response = client.post(
+            "/api/document-sets",
+            data={"name": "Legacy header workspace"},
+            files=[
+                (
+                    "files",
+                    (
+                        name,
+                        _linked_header_docx("Shared linked header"),
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    ),
+                )
+                for name in ("one.docx", "two.docx")
+            ],
+        )
+        assert response.status_code == 201, response.text
+        workspace = response.json()
+
+    database = importlib.import_module("app.database")
+    with database.engine.begin() as connection:
+        connection.exec_driver_sql(
+            "DELETE FROM link_members WHERE element_id IN "
+            "(SELECT id FROM document_elements "
+            "WHERE style_name LIKE 'header_footer_order:%')"
+        )
+        connection.exec_driver_sql(
+            "DELETE FROM document_block_revisions "
+            "WHERE element_type IN ('header_paragraph', 'footer_paragraph')"
+        )
+        connection.exec_driver_sql(
+            "DELETE FROM document_elements "
+            "WHERE style_name LIKE 'header_footer_order:%'"
+        )
+        connection.exec_driver_sql(
+            "DELETE FROM docsync_schema_migrations WHERE version >= 4"
+        )
+
+    database.init_db()
+
+    assert detect_schema_version(database_path) == 4
+    backups = list((data_directory / "migration-backups").glob("*.db"))
+    assert len(backups) == 1
+    with TestClient(main.app) as client:
+        first = workspace["documents"][0]
+        content = client.get(
+            f"/api/document-versions/{first['version_id']}/editor-content"
+        )
+        assert content.status_code == 200, content.text
+        headers = [
+            block
+            for block in content.json()["blocks"]
+            if block["element_type"] == "header_paragraph"
+        ]
+        assert len(headers) == 1
+        assert headers[0]["text"] == "Shared linked header"
+        assert headers[0]["section_indexes"] == [0, 1]
+        assert headers[0]["linked_section_indexes"] == [1]

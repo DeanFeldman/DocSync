@@ -74,6 +74,11 @@ def init_db() -> None:
                 name="background_generation_status",
                 apply=_migrate_background_generation_status,
             ),
+            WorkspaceMigration(
+                version=4,
+                name="header_footer_paragraph_foundation",
+                apply=_migrate_header_footer_paragraph_foundation,
+            ),
         ),
         report_stage=report_stage,
     )
@@ -610,6 +615,7 @@ def _migrate_table_paragraph_foundation(session: Session) -> None:
 
     from .document_service import _extract_paragraphs, _rebuild_exact_link_groups
     from .editor_service import (
+        _header_footer_part_map,
         _load_docx,
         _element_location,
         _location_key,
@@ -661,6 +667,7 @@ def _migrate_table_paragraph_foundation(session: Session) -> None:
             paragraphs = list(parsed.paragraphs)
             tables = list(parsed.tables)
             style_name_cache: dict[str | None, str | None] = {}
+            header_footer_parts = _header_footer_part_map(parsed)
             previous_revisions = list(
                 session.scalars(
                     select(DocumentBlockRevision).where(
@@ -766,6 +773,7 @@ def _migrate_table_paragraph_foundation(session: Session) -> None:
                     paragraphs=paragraphs,
                     tables=tables,
                     style_name_cache=style_name_cache,
+                    header_footer_parts=header_footer_parts,
                 )
                 session.add(
                     DocumentBlockRevision(version_id=version.id, **values)
@@ -809,6 +817,19 @@ def _migrate_background_generation_status(session: Session) -> None:
         "ELSE 'queued' END "
         "WHERE stage IS NULL OR stage = ''"
     )
+
+
+def _migrate_header_footer_paragraph_foundation(session: Session) -> None:
+    """Reparse every immutable DOCX into section-aware header/footer blocks.
+
+    The shared regeneration routine already rebuilds body and table blocks from
+    the same source file. Reusing it here makes schema 4 an authoritative full
+    block-map backfill and preserves any detached/shared state by stable
+    location. The workspace migration orchestrator creates and integrity-checks
+    the timestamped SQLite backup before invoking this function.
+    """
+
+    _migrate_table_paragraph_foundation(session)
 
 
 def get_session() -> Generator[Session, None, None]:

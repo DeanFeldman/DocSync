@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import shutil
 import threading
+from types import SimpleNamespace
 import unicodedata
 from uuid import uuid4
 import zipfile
@@ -65,6 +66,18 @@ TABLE_PARAGRAPH_STYLE_PATTERN = re.compile(
 ORDERED_TABLE_PARAGRAPH_STYLE_PATTERN = re.compile(
     r"^table_paragraph_order:(\d+):(\d+):(\d+):(\d+):(\d+):(\d+)$"
 )
+HEADER_FOOTER_STYLE_PATTERN = re.compile(
+    r"^header_footer_order:(\d+):(\d+):(header|footer):(\d+):"
+    r"(default|first|even):(\d+):([^:]+)$"
+)
+HEADER_FOOTER_PART_TYPES = (
+    ("header", "default"),
+    ("header", "first"),
+    ("header", "even"),
+    ("footer", "default"),
+    ("footer", "first"),
+    ("footer", "even"),
+)
 LIST_LEVEL_SUFFIX = re.compile(r"\s+(\d+)$")
 TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]+|\s+", re.UNICODE)
 EDITOR_GENERATION_LOCK = threading.RLock()
@@ -81,7 +94,9 @@ UNSUPPORTED_XML_TAGS = {
     qn("w:pict"): "Legacy picture or text box",
     qn("w:object"): "Embedded object",
     qn("w:fldSimple"): "Word field",
+    qn("w:fldChar"): "Word field",
     qn("w:instrText"): "Word field instruction",
+    qn("w:sdt"): "Content control",
     qn("w:hyperlink"): "Hyperlink content",
     qn("w:ins"): "Tracked insertion",
     qn("w:del"): "Tracked deletion",
@@ -89,6 +104,28 @@ UNSUPPORTED_XML_TAGS = {
     qn("w:footnoteReference"): "Footnote reference",
     qn("w:endnoteReference"): "Endnote reference",
 }
+
+
+def _header_footer_type(kind: str, variant: str) -> str:
+    prefix = {"default": "default", "first": "first_page", "even": "even_page"}[
+        variant
+    ]
+    return f"{prefix}_{kind}"
+
+
+def _header_footer_paragraph_nodes(part_element) -> list:
+    paragraphs = []
+    for node in part_element.iter(qn("w:p")):
+        ancestor = node.getparent()
+        nested_in_table = False
+        while ancestor is not None and ancestor is not part_element:
+            if ancestor.tag == qn("w:tbl"):
+                nested_in_table = True
+                break
+            ancestor = ancestor.getparent()
+        if not nested_in_table:
+            paragraphs.append(node)
+    return paragraphs
 
 
 def new_id() -> str:
@@ -111,10 +148,19 @@ def normalise_editor_text(text: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", text).split()).casefold()
 
 
-def exact_match_hash(element_type: str, text: str) -> str:
+def exact_match_hash(
+    element_type: str,
+    text: str,
+    context_identity: str | None = None,
+) -> str:
     normalized = normalise_editor_text(text)
+    identity = (
+        f"{element_type}\0{context_identity}\0{normalized}"
+        if context_identity
+        else f"{element_type}\0{normalized}"
+    )
     return hashlib.sha256(
-        f"{element_type}\0{normalized}".encode("utf-8")
+        identity.encode("utf-8")
     ).hexdigest()
 
 
@@ -202,6 +248,8 @@ def current_version_for_document(
 
 
 def _display_style_name(style_name: str | None) -> str | None:
+    if HEADER_FOOTER_STYLE_PATTERN.fullmatch(style_name or ""):
+        return None
     block_match = BLOCK_BODY_STYLE_PATTERN.fullmatch(style_name or "")
     if block_match is not None:
         return block_match.group(4) or None
@@ -221,6 +269,9 @@ def _display_style_name(style_name: str | None) -> str | None:
 
 def _element_type(style_name: str | None) -> str:
     value = style_name or ""
+    header_footer = HEADER_FOOTER_STYLE_PATTERN.fullmatch(value)
+    if header_footer is not None:
+        return f"{header_footer.group(3)}_paragraph"
     if TABLE_PARAGRAPH_STYLE_PATTERN.fullmatch(
         value
     ) or ORDERED_TABLE_PARAGRAPH_STYLE_PATTERN.fullmatch(value):
@@ -239,6 +290,26 @@ def _element_type(style_name: str | None) -> str:
 
 def _element_location(element: DocumentElement) -> tuple[int, dict]:
     style_name = element.style_name or ""
+    header_footer = HEADER_FOOTER_STYLE_PATTERN.fullmatch(style_name)
+    if header_footer is not None:
+        (
+            order,
+            document_order,
+            kind,
+            source_section_index,
+            variant,
+            paragraph_index,
+            relationship_id,
+        ) = header_footer.groups()
+        return int(order), {
+            "kind": f"{kind}_paragraph",
+            "section_index": int(source_section_index),
+            "source_section_index": int(source_section_index),
+            "header_footer_type": _header_footer_type(kind, variant),
+            "paragraph_index": int(paragraph_index),
+            "part_relationship_id": relationship_id,
+            "document_order": int(document_order),
+        }
     table_paragraph = ORDERED_TABLE_PARAGRAPH_STYLE_PATTERN.fullmatch(style_name)
     if table_paragraph is not None:
         (
@@ -315,10 +386,141 @@ def _element_location(element: DocumentElement) -> tuple[int, dict]:
 
 def _location_key(location: dict | None) -> str:
     value = dict(location or {})
+    for derived_key in (
+        "section_indexes",
+        "linked_section_indexes",
+        "linked_sections",
+        "is_linked_to_previous",
+        "affected_header_footer_types",
+    ):
+        value.pop(derived_key, None)
     # paragraph_index is synthetic for cells and is not needed for write-back.
     if value.get("kind") == "table_cell":
         value.pop("paragraph_index", None)
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _header_footer_part_map(document: DocxDocument) -> dict[str, dict]:
+    """Return physical header/footer parts and every section usage.
+
+    A section without its own reference inherits the active relationship from
+    the previous section. Grouping by relationship ID makes one physical
+    paragraph one editable target even when several sections inherit it.
+    """
+
+    active_references: dict[tuple[str, str], tuple[int, str]] = {}
+    result: dict[str, dict] = {}
+    for section_index, section in enumerate(document.sections):
+        for kind, variant in HEADER_FOOTER_PART_TYPES:
+            reference_tag = qn(f"w:{kind}Reference")
+            direct_reference = next(
+                (
+                    reference
+                    for reference in section._sectPr.findall(reference_tag)
+                    if reference.get(qn("w:type"), "default") == variant
+                ),
+                None,
+            )
+            key = (kind, variant)
+            if direct_reference is not None:
+                relationship_id = direct_reference.get(qn("r:id"))
+                if not relationship_id:
+                    continue
+                active_references[key] = (section_index, relationship_id)
+            active = active_references.get(key)
+            if active is None:
+                continue
+            source_section_index, relationship_id = active
+            try:
+                part = document.part.related_parts[relationship_id]
+            except KeyError:
+                continue
+            entry = result.setdefault(
+                relationship_id,
+                {
+                    "part": part,
+                    "paragraphs": [
+                        Paragraph(node, SimpleNamespace(part=part))
+                        for node in _header_footer_paragraph_nodes(part.element)
+                    ],
+                    "usages": [],
+                },
+            )
+            entry["usages"].append(
+                {
+                    "kind": kind,
+                    "header_footer_type": _header_footer_type(kind, variant),
+                    "section_index": section_index,
+                    "source_section_index": source_section_index,
+                    "is_linked_to_previous": direct_reference is None,
+                }
+            )
+    return result
+
+
+def _enrich_header_footer_location(
+    location: dict,
+    part_map: dict[str, dict],
+) -> dict:
+    result = dict(location)
+    relationship_id = str(location.get("part_relationship_id") or "")
+    entry = part_map.get(relationship_id)
+    if entry is None:
+        return result
+    kind = str(location.get("kind") or "").removesuffix("_paragraph")
+    usages = [
+        usage
+        for usage in entry["usages"]
+        if usage["kind"] == kind
+    ]
+    section_indexes = sorted({int(usage["section_index"]) for usage in usages})
+    linked_sections = sorted(
+        {
+            int(usage["section_index"])
+            for usage in usages
+            if usage["is_linked_to_previous"]
+        }
+    )
+    result.update(
+        {
+            "section_indexes": section_indexes,
+            "linked_section_indexes": linked_sections,
+            "linked_sections": section_indexes,
+            "is_linked_to_previous": bool(linked_sections),
+            "affected_header_footer_types": sorted(
+                {str(usage["header_footer_type"]) for usage in usages}
+            ),
+        }
+    )
+    return result
+
+
+def _match_context_identity(
+    element_type: str,
+    location: dict | None,
+) -> str:
+    location = location or {}
+    if element_type in {"header_paragraph", "footer_paragraph"}:
+        return (
+            f"{location.get('header_footer_type', '')}:"
+            f"section:{location.get('section_index', '')}"
+        )
+    return ""
+
+
+def _compatible_match_context(
+    source: DocumentBlockRevision,
+    candidate: DocumentBlockRevision,
+) -> bool:
+    if source.element_type != candidate.element_type:
+        return False
+    return _match_context_identity(
+        source.element_type,
+        source.location_json,
+    ) == _match_context_identity(
+        candidate.element_type,
+        candidate.location_json,
+    )
 
 
 def _paragraph_for_element(
@@ -327,8 +529,22 @@ def _paragraph_for_element(
     *,
     paragraphs: list[Paragraph] | None = None,
     tables: list[object] | None = None,
+    header_footer_parts: dict[str, dict] | None = None,
 ) -> tuple[Paragraph | None, object | None]:
     _ordinal, location = _element_location(element)
+    if location["kind"] in {"header_paragraph", "footer_paragraph"}:
+        parts = (
+            header_footer_parts
+            if header_footer_parts is not None
+            else _header_footer_part_map(document)
+        )
+        entry = parts.get(str(location.get("part_relationship_id") or ""))
+        if entry is None:
+            return None, None
+        try:
+            return entry["paragraphs"][int(location["paragraph_index"])], None
+        except (IndexError, KeyError, TypeError, ValueError):
+            return None, None
     if location["kind"] == "body":
         index = int(location["paragraph_index"])
         body_paragraphs = (
@@ -554,12 +770,31 @@ def _unsupported_reason(
     cell: object | None,
     *,
     allow_multiple_paragraphs: bool = False,
+    header_footer_kind: str | None = None,
 ) -> str | None:
     if paragraph is not None:
         for node in paragraph._p.iter():
             reason = UNSUPPORTED_XML_TAGS.get(node.tag)
             if reason is not None:
+                if header_footer_kind is not None:
+                    return (
+                        f"This {header_footer_kind} paragraph contains "
+                        f"{reason.lower()} that DocSync cannot safely rewrite. "
+                        "The content will remain unchanged."
+                    )
                 return f"{reason} is read-only in Edit mode."
+        ancestor = paragraph._p.getparent()
+        while ancestor is not None:
+            reason = UNSUPPORTED_XML_TAGS.get(ancestor.tag)
+            if reason is not None:
+                if header_footer_kind is not None:
+                    return (
+                        f"This {header_footer_kind} paragraph is inside "
+                        f"{reason.lower()} that DocSync cannot safely rewrite. "
+                        "The content will remain unchanged."
+                    )
+                return f"{reason} is read-only in Edit mode."
+            ancestor = ancestor.getparent()
     if cell is not None:
         if getattr(cell, "tables", None):
             return (
@@ -605,27 +840,39 @@ def _revision_values(
     paragraphs: list[Paragraph] | None = None,
     tables: list[object] | None = None,
     style_name_cache: dict[str | None, str | None] | None = None,
+    header_footer_parts: dict[str, dict] | None = None,
 ) -> dict:
     ordinal, location = _element_location(element)
     element_type = _element_type(element.style_name)
+    if element_type in {"header_paragraph", "footer_paragraph"}:
+        parts = (
+            header_footer_parts
+            if header_footer_parts is not None
+            else _header_footer_part_map(document)
+        )
+        location = _enrich_header_footer_location(location, parts)
+    else:
+        parts = header_footer_parts
     style_name = _display_style_name(element.style_name)
     paragraph, cell = _paragraph_for_element(
         document,
         element,
         paragraphs=paragraphs,
         tables=tables,
+        header_footer_parts=parts,
     )
-    if (
-        element_type == "table_paragraph"
-        and paragraph is not None
-    ):
+    if element_type in {
+        "table_paragraph",
+        "header_paragraph",
+        "footer_paragraph",
+    } and paragraph is not None:
         style_name = _paragraph_style_name(paragraph, style_name_cache)
     list_type, list_level = (
         _numbering_type(document, paragraph, style_name)
         if paragraph is not None
         else (None, None)
     )
-    if element_type not in {"list_item", "table_paragraph"} and list_type is not None:
+    if element_type in {"paragraph", "heading"} and list_type is not None:
         element_type = "list_item"
     alignment = _alignment_name(paragraph)
     block_attributes = _paragraph_block_attributes(
@@ -640,7 +887,23 @@ def _revision_values(
         paragraph,
         cell,
         allow_multiple_paragraphs=element_type == "table_paragraph",
+        header_footer_kind=(
+            "header"
+            if element_type == "header_paragraph"
+            else "footer"
+            if element_type == "footer_paragraph"
+            else None
+        ),
     )
+    if (
+        reason is None
+        and paragraph is None
+        and element_type in {"header_paragraph", "footer_paragraph"}
+    ):
+        reason = (
+            "This header or footer paragraph location could not be validated "
+            "against the immutable DOCX version. The content remains unchanged."
+        )
     formatted_runs = [
         {
             "text": run.text,
@@ -658,7 +921,14 @@ def _revision_values(
     )
     structure = {
         "element_type": element_type,
-        "context": "table" if element_type == "table_paragraph" else "body",
+        "context": (
+            "table"
+            if element_type == "table_paragraph"
+            else "header_footer"
+            if element_type in {"header_paragraph", "footer_paragraph"}
+            else "body"
+        ),
+        "matching_context": _match_context_identity(element_type, location),
         "style_name": style_name,
         "list_type": list_type,
         "list_level": list_level,
@@ -673,7 +943,11 @@ def _revision_values(
         "element_type": element_type,
         "text": element.text,
         "normalized_text": normalized,
-        "exact_match_hash": exact_match_hash(element_type, element.text),
+        "exact_match_hash": exact_match_hash(
+            element_type,
+            element.text,
+            _match_context_identity(element_type, location),
+        ),
         "structure_hash": _canonical_hash(structure),
         "delta_json": delta,
         "formatting_json": formatting,
@@ -706,6 +980,7 @@ def _create_revisions_for_existing_elements(
     docx = _load_docx(source_path)
     paragraphs = list(docx.paragraphs)
     tables = list(docx.tables)
+    header_footer_parts = _header_footer_part_map(docx)
     style_name_cache: dict[str | None, str | None] = {}
     elements = list(
         session.scalars(
@@ -723,6 +998,7 @@ def _create_revisions_for_existing_elements(
                 paragraphs=paragraphs,
                 tables=tables,
                 style_name_cache=style_name_cache,
+                header_footer_parts=header_footer_parts,
             ),
         )
         for element in elements
@@ -742,6 +1018,7 @@ def initialise_original_version(
         paragraphs = list(parsed_document.paragraphs)
         tables = list(parsed_document.tables)
         style_name_cache: dict[str | None, str | None] = {}
+        header_footer_parts = _header_footer_part_map(parsed_document)
         version = DocumentVersion(
             id=document.id,
             document=document,
@@ -769,6 +1046,7 @@ def initialise_original_version(
                     paragraphs=paragraphs,
                     tables=tables,
                     style_name_cache=style_name_cache,
+                    header_footer_parts=header_footer_parts,
                 ),
             )
             for element in elements
@@ -866,6 +1144,16 @@ def _serialize_revision(
                 "row_index",
                 "column_index",
                 "paragraph_index",
+                "kind",
+                "section_index",
+                "source_section_index",
+                "header_footer_type",
+                "part_relationship_id",
+                "is_linked_to_previous",
+                "section_indexes",
+                "linked_section_indexes",
+                "linked_sections",
+                "affected_header_footer_types",
             )
             if key in location
         }
@@ -894,27 +1182,6 @@ def _document_diagnostics(path: Path) -> list[dict]:
                 "read_only": True,
             }
         )
-    for section_index, section in enumerate(document.sections):
-        if any(paragraph.text.strip() for paragraph in section.header.paragraphs):
-            diagnostics.append(
-                {
-                    "kind": "header",
-                    "element_type": "unsupported",
-                    "section_index": section_index,
-                    "reason": "Headers are preserved but read-only in Edit mode.",
-                    "read_only": True,
-                }
-            )
-        if any(paragraph.text.strip() for paragraph in section.footer.paragraphs):
-            diagnostics.append(
-                {
-                    "kind": "footer",
-                    "element_type": "unsupported",
-                    "section_index": section_index,
-                    "reason": "Footers are preserved but read-only in Edit mode.",
-                    "read_only": True,
-                }
-            )
     return diagnostics
 
 
@@ -1253,7 +1520,7 @@ def _current_candidate_revisions(
     source: DocumentBlockRevision,
     document_set_id: str,
 ) -> list[tuple[DocumentBlockRevision, DocumentRecord]]:
-    return list(
+    rows = list(
         session.execute(
             select(DocumentBlockRevision, DocumentRecord)
             .join(
@@ -1276,6 +1543,11 @@ def _current_candidate_revisions(
             )
         )
     )
+    return [
+        (candidate, record)
+        for candidate, record in rows
+        if _compatible_match_context(source, candidate)
+    ]
 
 
 def get_similar_matches(
@@ -1420,7 +1692,7 @@ def compare_elements(
                     status_code=422,
                     detail="Comparison targets must belong to the same document set.",
                 )
-            if candidate.element_type != source.element_type:
+            if not _compatible_match_context(source, candidate):
                 raise HTTPException(
                     status_code=422,
                     detail="Comparison targets must use a compatible block type.",
@@ -1545,7 +1817,7 @@ def save_match_decisions(
                 status_code=422,
                 detail="Match decisions must stay within one document set.",
             )
-        if candidate.element_type != source.element_type:
+        if not _compatible_match_context(source, candidate):
             raise HTTPException(
                 status_code=422,
                 detail="Match decisions require compatible block types.",
@@ -1794,7 +2066,7 @@ def _validate_editor_request(
                 detail=revision.unsupported_reason
                 or f"{document.original_name} contains a read-only target.",
             )
-        if revision.element_type != source.element_type:
+        if not _compatible_match_context(source, revision):
             raise HTTPException(
                 status_code=422,
                 detail="Editor targets must use a compatible block type.",
@@ -1854,7 +2126,11 @@ def _validate_editor_request(
             revision,
             target.replacement_text,
         )
-        if revision.element_type == "table_paragraph":
+        if revision.element_type in {
+            "table_paragraph",
+            "header_paragraph",
+            "footer_paragraph",
+        }:
             operations = list(delta.get("ops") or [])
             newline_attributes = (
                 operations[-1].get("attributes") or {}
@@ -1865,7 +2141,8 @@ def _validate_editor_request(
                 raise HTTPException(
                     status_code=422,
                     detail=(
-                        "Heading levels cannot be applied inside a table cell. "
+                        "Heading levels cannot be applied inside a table, header, "
+                        "or footer paragraph. "
                         "Use bold, lists, indentation, or alignment instead."
                     ),
                 )
@@ -1993,7 +2270,45 @@ def _apply_target_to_docx(
 ) -> None:
     location = revision.location_json or {}
     paragraph: Paragraph
-    if location.get("kind") in {"table_cell", "table_paragraph"}:
+    if location.get("kind") in {"header_paragraph", "footer_paragraph"}:
+        parts = _header_footer_part_map(document)
+        relationship_id = str(location.get("part_relationship_id") or "")
+        entry = parts.get(relationship_id)
+        if entry is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "The target header or footer part is no longer present in "
+                    "the selected immutable version."
+                ),
+            )
+        expected_kind = str(location.get("kind")).removesuffix("_paragraph")
+        expected_type = str(location.get("header_footer_type") or "")
+        expected_source = int(location.get("source_section_index", -1))
+        if not any(
+            usage["kind"] == expected_kind
+            and usage["header_footer_type"] == expected_type
+            and int(usage["source_section_index"]) == expected_source
+            for usage in entry["usages"]
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "The target section and header/footer relationship could not "
+                    "be validated against the selected immutable version."
+                ),
+            )
+        try:
+            paragraph = entry["paragraphs"][int(location["paragraph_index"])]
+        except (IndexError, KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="The target header or footer paragraph is no longer present.",
+            ) from exc
+        reason = _unsupported_reason(paragraph, None, header_footer_kind=expected_kind)
+        if reason is not None:
+            raise HTTPException(status_code=422, detail=reason)
+    elif location.get("kind") in {"table_cell", "table_paragraph"}:
         try:
             cell = (
                 document.tables[int(location["table_index"])]
@@ -2135,6 +2450,14 @@ def _preview_payload(
                         "table_index",
                         "row_index",
                         "column_index",
+                        "section_index",
+                        "source_section_index",
+                        "header_footer_type",
+                        "part_relationship_id",
+                        "is_linked_to_previous",
+                        "section_indexes",
+                        "linked_section_indexes",
+                        "linked_sections",
                     )
                     if key in location
                 },
@@ -2224,6 +2547,7 @@ def _replace_current_elements_and_create_revisions(
     extracted = _extract_paragraphs(docx)
     paragraphs = list(docx.paragraphs)
     tables = list(docx.tables)
+    header_footer_parts = _header_footer_part_map(docx)
     style_name_cache: dict[str | None, str | None] = {}
     previous_states = _shared_states_by_location(session, base_version_id)
     override_locations = override_locations or set()
@@ -2269,6 +2593,7 @@ def _replace_current_elements_and_create_revisions(
             paragraphs=paragraphs,
             tables=tables,
             style_name_cache=style_name_cache,
+            header_footer_parts=header_footer_parts,
         )
         revision = DocumentBlockRevision(version_id=version.id, **values)
         revisions.append(revision)

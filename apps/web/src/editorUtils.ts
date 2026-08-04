@@ -42,6 +42,24 @@ function firstBoolean(...values: unknown[]): boolean | undefined {
   return undefined;
 }
 
+function numberArray(...values: unknown[]): number[] | undefined {
+  for (const value of values) {
+    if (!Array.isArray(value)) continue;
+    return value
+      .map((item) => firstNumber(item))
+      .filter((item): item is number => item !== undefined);
+  }
+  return undefined;
+}
+
+function stringArray(...values: unknown[]): string[] | undefined {
+  for (const value of values) {
+    if (!Array.isArray(value)) continue;
+    return value.filter((item): item is string => typeof item === "string");
+  }
+  return undefined;
+}
+
 function normaliseListType(value: unknown): "ordered" | "bullet" | null {
   const lowered = String(value ?? "").toLocaleLowerCase();
   if (["ordered", "numbered", "number", "decimal"].includes(lowered)) {
@@ -163,6 +181,8 @@ function editorBlock(
     "list_item",
     "table_cell",
     "table_paragraph",
+    "header_paragraph",
+    "footer_paragraph",
   ].includes(elementType);
   const editable = firstBoolean(raw.editable);
   const supported =
@@ -224,6 +244,37 @@ function editorBlock(
       raw.document_order,
       location.document_order,
     ),
+    kind: firstString(raw.kind, location.kind),
+    section_index: firstNumber(raw.section_index, location.section_index),
+    source_section_index: firstNumber(
+      raw.source_section_index,
+      location.source_section_index,
+    ),
+    header_footer_type: firstString(
+      raw.header_footer_type,
+      location.header_footer_type,
+    ) as EditorBlock["header_footer_type"],
+    part_relationship_id: firstString(
+      raw.part_relationship_id,
+      location.part_relationship_id,
+    ),
+    is_linked_to_previous: firstBoolean(
+      raw.is_linked_to_previous,
+      location.is_linked_to_previous,
+    ),
+    section_indexes: numberArray(
+      raw.section_indexes,
+      location.section_indexes,
+    ),
+    linked_section_indexes: numberArray(
+      raw.linked_section_indexes,
+      location.linked_section_indexes,
+    ),
+    linked_sections: numberArray(raw.linked_sections, location.linked_sections),
+    affected_header_footer_types: stringArray(
+      raw.affected_header_footer_types,
+      location.affected_header_footer_types,
+    ) as EditorBlock["affected_header_footer_types"],
   };
 }
 
@@ -341,6 +392,9 @@ export function editorContentFromView(
         table_index: element.table_index,
         row_index: element.row_index,
         column_index: element.column_index,
+        section_index: element.section_index,
+        source_section_index: element.source_section_index,
+        header_footer_type: element.header_footer_type,
       };
     }),
   );
@@ -527,6 +581,20 @@ export function normaliseMatch(
       raw.document_order,
       location.document_order,
     ),
+    section_index: firstNumber(raw.section_index, location.section_index),
+    source_section_index: firstNumber(
+      raw.source_section_index,
+      location.source_section_index,
+    ),
+    header_footer_type: firstString(
+      raw.header_footer_type,
+      location.header_footer_type,
+    ) as EditorMatch["header_footer_type"],
+    is_linked_to_previous: firstBoolean(
+      raw.is_linked_to_previous,
+      location.is_linked_to_previous,
+    ),
+    linked_sections: numberArray(raw.linked_sections, location.linked_sections),
   };
 }
 

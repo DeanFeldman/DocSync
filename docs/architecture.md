@@ -66,3 +66,43 @@ before preview and checked again during write-back.
 Schema migration 2 reparses every stored version to create the same mapping for
 pre-v1.5 workspaces. The existing migration coordinator verifies a database
 backup first and restores it if any stored version cannot be regenerated.
+
+## v1.6 background operation boundary
+
+The asynchronous editor endpoint validates and records a queued
+`EditorOperation`, then returns before DOCX processing. A bounded local worker
+opens short-lived sessions, reports durable stages, revalidates every base
+version, stages and validates all files, and advances document heads only in the
+atomic completion transaction. Restart recovery marks unfinished work
+interrupted. Retrying creates a new auditable operation from the persisted
+reviewed request.
+
+The application shell owns polling and notifications so navigation does not
+cancel processing. Completion invalidates only affected version-keyed resources;
+an unrelated draft retains its version and receives a newer-version choice.
+
+## v1.7 header/footer boundary
+
+The extractor reads `w:headerReference` and `w:footerReference` values from each
+section's `sectPr`, following inherited references without materialising missing
+parts. It scans default, first-page, and even-page stories. The physical
+relationship ID is the deduplication key, while each block stores canonical
+section/type, paragraph index, document order, source section, and linked usages.
+
+```mermaid
+flowchart LR
+    S1[Section 1 reference] --> P[Physical header/footer part]
+    S2[Section 2 linked reference] --> P
+    P --> B1[Paragraph block 1]
+    P --> B2[Paragraph block 2]
+```
+
+Before mutation, the writer recreates the part map from the immutable source and
+validates section, type, relationship, and paragraph. Unsafe paragraphs are
+rejected again at write time. The part is not rebuilt, so fields, images,
+tables, settings, and Link to Previous relationships survive the round trip.
+
+Exact identity incorporates element type, story type, and source-section
+context. Search returns the same location metadata. Schema migration 4 reparses
+every immutable file through the verified-backup and automatic-restore
+coordinator.

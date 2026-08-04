@@ -148,7 +148,23 @@ function locationLabel(item: {
   table_index?: number;
   row_index?: number;
   column_index?: number;
+  section_index?: number;
+  header_footer_type?: string;
 }): string {
+  if (
+    ["header_paragraph", "footer_paragraph"].includes(item.element_type) &&
+    item.section_index !== undefined
+  ) {
+    const region = item.element_type === "header_paragraph" ? "Header" : "Footer";
+    const variant = item.header_footer_type?.startsWith("first_page")
+      ? "First page"
+      : item.header_footer_type?.startsWith("even_page")
+        ? "Even pages"
+        : "Default";
+    return `${region} · Section ${item.section_index + 1} · ${variant} · Paragraph ${
+      item.paragraph_index + 1
+    }`;
+  }
   if (
     ["table_cell", "table_paragraph"].includes(item.element_type) &&
     item.table_index !== undefined &&
@@ -166,6 +182,63 @@ function locationLabel(item: {
   return `${item.element_type.replaceAll("_", " ")} · block ${
     item.paragraph_index + 1
   }`;
+}
+
+function linkedContentExplanation(block: EditorBlock): string | null {
+  if (
+    !["header_paragraph", "footer_paragraph"].includes(block.element_type) ||
+    !block.section_indexes ||
+    block.section_indexes.length < 2
+  ) {
+    return null;
+  }
+  const region = block.element_type === "header_paragraph" ? "header" : "footer";
+  const sectionList = block.section_indexes.map((index) => index + 1).join(" and ");
+  return `This ${region} is shared with sections ${sectionList} because they use the same linked Word part. Editing it will update every listed section.`;
+}
+
+interface StructuredBlockGroup {
+  key: string;
+  label: string;
+  blocks: EditorBlock[];
+  region: "header" | "body" | "footer";
+}
+
+function groupStructuredBlocks(blocks: EditorBlock[]): StructuredBlockGroup[] {
+  const groups = new Map<string, StructuredBlockGroup>();
+  for (const block of blocks) {
+    const region =
+      block.element_type === "header_paragraph"
+        ? "header"
+        : block.element_type === "footer_paragraph"
+          ? "footer"
+          : "body";
+    const key =
+      region === "body"
+        ? "body"
+        : `${region}:${block.section_index ?? 0}:${block.header_footer_type ?? "default"}`;
+    const label =
+      region === "body"
+        ? "Document body"
+        : `${region === "header" ? "Header" : "Footer"} · Section ${
+            (block.section_index ?? 0) + 1
+          } · ${
+            block.header_footer_type?.startsWith("first_page")
+              ? "First page"
+              : block.header_footer_type?.startsWith("even_page")
+                ? "Even pages"
+                : "Default"
+          }`;
+    const group = groups.get(key) ?? { key, label, blocks: [], region };
+    group.blocks.push(block);
+    groups.set(key, group);
+  }
+  const regionOrder = { header: 0, body: 1, footer: 2 };
+  return Array.from(groups.values()).sort(
+    (left, right) =>
+      regionOrder[left.region] - regionOrder[right.region] ||
+      (left.blocks[0]?.order ?? 0) - (right.blocks[0]?.order ?? 0),
+  );
 }
 
 function formatDate(value: string | undefined): string {
@@ -297,9 +370,22 @@ const BlockCard = memo(function BlockCard({
       onKeyDown={handleKeyDown}
     >
       <div className="editor-block-meta">
-        <span>{locationLabel(block)}</span>
+        <span>
+          {["header_paragraph", "footer_paragraph"].includes(block.element_type) && (
+            <strong className="header-footer-identifier">
+              {block.element_type === "header_paragraph" ? "HEADER" : "FOOTER"}
+            </strong>
+          )}
+          {locationLabel(block)}
+        </span>
         <span className={`support-label ${isUnsupported ? "read-only" : ""}`}>
-          {isUnsupported ? "Read-only" : selected ? "Editing" : "Supported"}
+          {isUnsupported
+            ? "Read-only"
+            : block.section_indexes && block.section_indexes.length > 1
+              ? `Shared with ${block.section_indexes.length} sections`
+              : selected
+                ? "Editing"
+                : "Supported"}
         </span>
       </div>
       <div
@@ -317,6 +403,9 @@ const BlockCard = memo(function BlockCard({
       </div>
       {block.unsupported_reason && (
         <p className="editor-block-reason">{block.unsupported_reason}</p>
+      )}
+      {linkedContentExplanation(block) && (
+        <p className="editor-block-link-note">{linkedContentExplanation(block)}</p>
       )}
     </div>
   );
@@ -364,6 +453,11 @@ function LayoutFallbackBlock({
       {!editable && block.unsupported_reason && (
         <span className="layout-fallback-reason">
           {block.unsupported_reason}
+        </span>
+      )}
+      {linkedContentExplanation(block) && (
+        <span className="layout-fallback-link-note">
+          {linkedContentExplanation(block)}
         </span>
       )}
     </>
@@ -731,6 +825,13 @@ function PreviewDialog({
               {document.changes.map((change) => (
                 <div className="diff" key={change.element_id}>
                   <p className="location-label">{locationLabel(change)}</p>
+                  {change.linked_sections && change.linked_sections.length > 1 && (
+                    <p className="preview-linked-sections">
+                      Linked sections: {change.linked_sections
+                        .map((sectionIndex) => sectionIndex + 1)
+                        .join(", ")}
+                    </p>
+                  )}
                   <div className="diff-grid">
                     <div className="diff-side before">
                       <span>Before</span>
@@ -2682,7 +2783,7 @@ export default function DocumentExperience({
                 </h2>
                 <p>
                   {showLayoutStructure || !layoutView?.pdf_url
-                    ? "Choose a supported heading, paragraph, list item, or table paragraph to open its exact mapped block in Edit."
+                    ? "Choose a supported heading, body paragraph, list item, table paragraph, header paragraph, or footer paragraph to open its exact mapped block in Edit."
                     : "This view is rendered from the current DOCX. Choose Select from structure when you want to open a mapped element in the editor."}
                 </p>
               </div>
@@ -2766,20 +2867,31 @@ export default function DocumentExperience({
                         : "Supported elements open the same stable block used by Edit and search. Read-only Word structures remain protected."}
                     </span>
                   </div>
-                  {editorContent.blocks.map((block) => (
-                    <LayoutFallbackBlock
-                      block={block}
-                      selected={block.element_id === selectedElementId}
-                      onSelect={(selectedBlock) =>
-                        selectElementById(selectedBlock.element_id, {
-                          sourceVersionId:
-                            layoutView?.version_id ??
-                            editorContent.version_id,
-                          sourceLabel: "Layout element",
-                        })
-                      }
-                      key={block.element_id}
-                    />
+                  {groupStructuredBlocks(editorContent.blocks).map((group) => (
+                    <section
+                      className={`structured-block-group ${group.region}`}
+                      aria-labelledby={`layout-group-${group.key.replaceAll(":", "-")}`}
+                      key={group.key}
+                    >
+                      <h3 id={`layout-group-${group.key.replaceAll(":", "-")}`}>
+                        {group.label}
+                      </h3>
+                      {group.blocks.map((block) => (
+                        <LayoutFallbackBlock
+                          block={block}
+                          selected={block.element_id === selectedElementId}
+                          onSelect={(selectedBlock) =>
+                            selectElementById(selectedBlock.element_id, {
+                              sourceVersionId:
+                                layoutView?.version_id ??
+                                editorContent.version_id,
+                              sourceLabel: "Layout element",
+                            })
+                          }
+                          key={block.element_id}
+                        />
+                      ))}
+                    </section>
                   ))}
                 </div>
               )}
@@ -2795,8 +2907,11 @@ export default function DocumentExperience({
             {/* DOCSYNC_QUILL_REMOUNT_V2 */}
             {selectedBlock && (
               <div className="selected-block-context" role="status">
-                <strong>{document.name}</strong>
+                <strong>Document: {document.name}</strong>
                 <span>{locationLabel(selectedBlock)}</span>
+                {linkedContentExplanation(selectedBlock) && (
+                  <small>{linkedContentExplanation(selectedBlock)}</small>
+                )}
               </div>
             )}
             <QuillBlockEditor
@@ -2874,7 +2989,7 @@ export default function DocumentExperience({
             {contentStatus === "ready" &&
               editorContent?.blocks.length === 0 && (
                 <div className="editor-empty-state">
-                  <strong>No supported body blocks</strong>
+                  <strong>No editable text blocks</strong>
                   <p>
                     The document remains available in Layout. Unsupported Word
                     structures are preserved and are not rewritten.
@@ -2882,24 +2997,35 @@ export default function DocumentExperience({
                 </div>
               )}
             <div className="editor-block-list">
-              {editorContent?.blocks
-                .slice(0, visibleBlockCount)
-                .map((block) => (
-                <BlockCard
-                  block={block}
-                  selected={block.element_id === selectedElementId}
-                  searchRange={
-                    searchTarget?.document_id === document.id &&
-                    searchTarget.element_id === block.element_id
-                      ? {
-                          start: searchTarget.match_start,
-                          end: searchTarget.match_end,
-                        }
-                      : undefined
-                  }
-                  onSelect={handleBlockSelect}
-                  key={block.element_id}
-                />
+              {groupStructuredBlocks(
+                editorContent?.blocks.slice(0, visibleBlockCount) ?? [],
+              ).map((group) => (
+                <section
+                  className={`structured-block-group ${group.region}`}
+                  aria-labelledby={`edit-group-${group.key.replaceAll(":", "-")}`}
+                  key={group.key}
+                >
+                  <h3 id={`edit-group-${group.key.replaceAll(":", "-")}`}>
+                    {group.label}
+                  </h3>
+                  {group.blocks.map((block) => (
+                    <BlockCard
+                      block={block}
+                      selected={block.element_id === selectedElementId}
+                      searchRange={
+                        searchTarget?.document_id === document.id &&
+                        searchTarget.element_id === block.element_id
+                          ? {
+                              start: searchTarget.match_start,
+                              end: searchTarget.match_end,
+                            }
+                          : undefined
+                      }
+                      onSelect={handleBlockSelect}
+                      key={block.element_id}
+                    />
+                  ))}
+                </section>
               ))}
             </div>
             {editorContent &&

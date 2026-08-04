@@ -177,7 +177,11 @@ export default function QuillBlockEditor({
     });
     quillRef.current = quill;
     const readOnly = disabled || block.read_only || !block.supported;
-    const allowHeadings = block.element_type !== "table_paragraph";
+    const allowHeadings = ![
+      "table_paragraph",
+      "header_paragraph",
+      "footer_paragraph",
+    ].includes(block.element_type);
     setQuillInteractiveState(quill, toolbar, readOnly, allowHeadings);
 
     const initial = initialDeltaRef.current ?? block.delta;
@@ -290,7 +294,11 @@ export default function QuillBlockEditor({
     }
 
     const readOnly = disabled || block.read_only || !block.supported;
-    const allowHeadings = block.element_type !== "table_paragraph";
+    const allowHeadings = ![
+      "table_paragraph",
+      "header_paragraph",
+      "footer_paragraph",
+    ].includes(block.element_type);
     setQuillInteractiveState(quill, toolbar, readOnly, allowHeadings);
 
     if (readOnly) {
@@ -429,8 +437,8 @@ export default function QuillBlockEditor({
         <div ref={hostRef} className="quill-editor-host" />
       ) : (
         <div className="quill-editor-placeholder" role="status">
-          Choose a supported paragraph, heading, list item, or table paragraph from
-          the document.
+          Choose a supported heading, body paragraph, list item, table paragraph,
+          header paragraph, or footer paragraph from the document.
         </div>
       )}
 

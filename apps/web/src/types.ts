@@ -15,24 +15,38 @@ export interface LinkMember {
   document_id: string;
   document_name: string;
   paragraph_index: number;
-  element_type: "paragraph" | "heading" | "list_item" | "table_cell" | "table_paragraph";
+  element_type: "paragraph" | "heading" | "list_item" | "table_cell" | "table_paragraph" | "header_paragraph" | "footer_paragraph";
   text: string;
   style_name: string | null;
   table_index?: number;
   row_index?: number;
   column_index?: number;
+  section_index?: number;
+  source_section_index?: number;
+  header_footer_type?: HeaderFooterType;
 }
+
+export type HeaderFooterType =
+  | "default_header"
+  | "default_footer"
+  | "first_page_header"
+  | "first_page_footer"
+  | "even_page_header"
+  | "even_page_footer";
 
 export interface ViewerElement {
   id: string;
   document_id: string;
   paragraph_index: number;
-  element_type: "paragraph" | "heading" | "list_item" | "table_cell" | "table_paragraph";
+  element_type: "paragraph" | "heading" | "list_item" | "table_cell" | "table_paragraph" | "header_paragraph" | "footer_paragraph";
   text: string;
   style_name: string | null;
   table_index?: number;
   row_index?: number;
   column_index?: number;
+  section_index?: number;
+  source_section_index?: number;
+  header_footer_type?: HeaderFooterType;
   page_number: number;
 }
 
@@ -126,10 +140,13 @@ export interface GlobalSearchResult {
   document_name: string;
   version_id: string;
   paragraph_index: number;
-  element_type: "paragraph" | "heading" | "list_item" | "table_cell" | "table_paragraph";
+  element_type: "paragraph" | "heading" | "list_item" | "table_cell" | "table_paragraph" | "header_paragraph" | "footer_paragraph";
   table_index?: number;
   row_index?: number;
   column_index?: number;
+  section_index?: number;
+  source_section_index?: number;
+  header_footer_type?: HeaderFooterType;
   text: string;
   occurrence_index: number;
   match_start: number;
@@ -172,6 +189,10 @@ export interface PreviewChange {
   table_index?: number;
   row_index?: number;
   column_index?: number;
+  section_index?: number;
+  source_section_index?: number;
+  header_footer_type?: HeaderFooterType;
+  linked_sections?: number[];
   before: string;
   after: string;
 }
@@ -221,6 +242,8 @@ export type EditorElementType =
   | "list_item"
   | "table_cell"
   | "table_paragraph"
+  | "header_paragraph"
+  | "footer_paragraph"
   | "unsupported"
   | string;
 
@@ -248,6 +271,16 @@ export interface EditorBlock {
   row_index?: number;
   column_index?: number;
   document_order?: number;
+  kind?: "header_paragraph" | "footer_paragraph" | "body" | "table_paragraph" | string;
+  section_index?: number;
+  source_section_index?: number;
+  header_footer_type?: HeaderFooterType;
+  part_relationship_id?: string;
+  is_linked_to_previous?: boolean;
+  section_indexes?: number[];
+  linked_section_indexes?: number[];
+  linked_sections?: number[];
+  affected_header_footer_types?: HeaderFooterType[];
 }
 
 export interface EditorContentResponse {
@@ -303,6 +336,11 @@ export interface EditorMatch {
   row_index?: number;
   column_index?: number;
   document_order?: number;
+  section_index?: number;
+  source_section_index?: number;
+  header_footer_type?: HeaderFooterType;
+  is_linked_to_previous?: boolean;
+  linked_sections?: number[];
 }
 
 export interface SimilarMatchesResponse {
