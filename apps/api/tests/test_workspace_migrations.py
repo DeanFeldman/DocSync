@@ -261,7 +261,7 @@ def test_repeated_real_startup_does_not_duplicate_version_foundation(
             for table in baseline
         }
     assert after == baseline
-    assert detect_schema_version(database_path) == 2
+    assert detect_schema_version(database_path) == 3
     backups = list((data_directory / "migration-backups").glob("*.db"))
     assert len(backups) == 1
 
@@ -336,7 +336,7 @@ def test_v15_migration_regenerates_legacy_table_cells_after_verified_backup(
             """
         )
         connection.exec_driver_sql(
-            "DELETE FROM docsync_schema_migrations WHERE version = 2"
+            "DELETE FROM docsync_schema_migrations WHERE version >= 2"
         )
 
     original_revision_values = editor_service._revision_values
@@ -358,7 +358,7 @@ def test_v15_migration_regenerates_legacy_table_cells_after_verified_backup(
     database.init_db()
 
     assert cached_revision_calls > 0
-    assert detect_schema_version(database_path) == 2
+    assert detect_schema_version(database_path) == 3
     backups = list((data_directory / "migration-backups").glob("*.db"))
     assert len(backups) == 1
     assert backups[0].stat().st_size > 0

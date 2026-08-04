@@ -69,6 +69,11 @@ def init_db() -> None:
                 name="table_paragraph_foundation",
                 apply=_migrate_table_paragraph_foundation,
             ),
+            WorkspaceMigration(
+                version=3,
+                name="background_generation_status",
+                apply=_migrate_background_generation_status,
+            ),
         ),
         report_stage=report_stage,
     )
@@ -770,6 +775,40 @@ def _migrate_table_paragraph_foundation(session: Session) -> None:
     for document_set_id in document_set_ids:
         _rebuild_exact_link_groups(session, document_set_id)
     session.flush()
+
+
+def _migrate_background_generation_status(session: Session) -> None:
+    """Add durable job progress fields to existing SQLite workspaces."""
+
+    connection = session.connection()
+    columns = {
+        str(row[1])
+        for row in connection.exec_driver_sql(
+            "PRAGMA table_info(editor_operations)"
+        ).fetchall()
+    }
+    if "stage" not in columns:
+        connection.exec_driver_sql(
+            "ALTER TABLE editor_operations "
+            "ADD COLUMN stage VARCHAR(60) NOT NULL DEFAULT 'queued'"
+        )
+    if "updated_at" not in columns:
+        connection.exec_driver_sql(
+            "ALTER TABLE editor_operations ADD COLUMN updated_at DATETIME"
+        )
+        connection.exec_driver_sql(
+            "UPDATE editor_operations SET updated_at = created_at "
+            "WHERE updated_at IS NULL"
+        )
+    connection.exec_driver_sql(
+        "UPDATE editor_operations SET stage = CASE status "
+        "WHEN 'completed' THEN 'completed' "
+        "WHEN 'failed' THEN 'failed' "
+        "WHEN 'interrupted' THEN 'interrupted' "
+        "WHEN 'processing' THEN 'preparing_documents' "
+        "ELSE 'queued' END "
+        "WHERE stage IS NULL OR stage = ''"
+    )
 
 
 def get_session() -> Generator[Session, None, None]:

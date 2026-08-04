@@ -400,11 +400,21 @@ export interface DocumentVersionRestoreResponse {
 }
 
 export interface EditorGenerationResponse {
+  id?: string;
+  job_id?: string;
   operation_id?: string;
   generation_id: string;
-  status: string;
+  status: "queued" | "processing" | "completed" | "failed" | "interrupted" | string;
+  stage?: string;
+  submitted_at?: string;
+  updated_at?: string;
+  completed_at?: string | null;
   status_url?: string;
   error_detail?: string;
+  error?: string | null;
+  affected_document_ids?: string[];
+  affected_documents?: Array<{ id: string; name: string }>;
+  result_version_ids?: string[];
   affected_document_count?: number;
   affected_location_count?: number;
   download_url?: string;
@@ -416,4 +426,8 @@ export interface EditorGenerationResponse {
     name: string;
     download_url?: string;
   }>;
+}
+
+export interface EditorGenerationListResponse {
+  jobs: EditorGenerationResponse[];
 }

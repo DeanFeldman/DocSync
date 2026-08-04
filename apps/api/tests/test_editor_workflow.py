@@ -6,6 +6,7 @@ import importlib
 import io
 import os
 import sys
+import time
 import zipfile
 from pathlib import Path
 
@@ -798,9 +799,14 @@ def test_editor_generation_can_be_queued_and_reconciled_by_status(
         assert queued.json()["status"] == "queued"
         operation_id = queued.json()["operation_id"]
 
-        completed = client.get(f"/api/editor-operations/{operation_id}")
-        assert completed.status_code == 200, completed.text
+        for _ in range(200):
+            completed = client.get(f"/api/generation-jobs/{operation_id}")
+            assert completed.status_code == 200, completed.text
+            if completed.json()["status"] == "completed":
+                break
+            time.sleep(0.01)
         assert completed.json()["status"] == "completed"
+        assert completed.json()["stage"] == "completed"
         assert len(completed.json()["versions"]) == 2
         assert completed.json()["document_set"]["id"] == workspace["id"]
         assert completed.json()["download_url"].endswith(
@@ -812,6 +818,101 @@ def test_editor_generation_can_be_queued_and_reconciled_by_status(
             json=request,
         )
         assert stale_duplicate.status_code == 409
+
+
+def test_background_jobs_reject_overlaps_allow_unrelated_documents_and_retry(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    app = load_test_app(tmp_path, monkeypatch)
+    main_module = sys.modules["app.main"]
+    monkeypatch.setattr(main_module, "submit_editor_generation", lambda _job_id: None)
+
+    with TestClient(app) as client:
+        workspace = upload_set(
+            client,
+            {
+                "Alpha.docx": make_paragraph_docx("Alpha", ["Alpha editable text."]),
+                "Beta.docx": make_paragraph_docx("Beta", ["Beta editable text."]),
+                "Gamma.docx": make_paragraph_docx("Gamma", ["Gamma editable text."]),
+            },
+            name="Independent queues",
+        )
+        documents = documents_by_name(workspace)
+
+        def request_for(name: str, original: str, replacement: str) -> dict:
+            summary = documents[name]
+            content = read_editor_content(client, summary["version_id"])
+            source = block_with_text(content, original)
+            return {
+                "base_versions": {summary["id"]: summary["version_id"]},
+                "source_element_id": source["element_id"],
+                "edit_mode": "override",
+                "targets": [
+                    {
+                        "element_id": source["element_id"],
+                        "replacement_text": replacement,
+                    }
+                ],
+            }
+
+        alpha_request = request_for(
+            "Alpha.docx", "Alpha editable text.", "Alpha queued text."
+        )
+        alpha_job = client.post(
+            f"/api/document-sets/{workspace['id']}/editor-generate-async",
+            json=alpha_request,
+        )
+        assert alpha_job.status_code == 202, alpha_job.text
+        assert alpha_job.json()["affected_document_ids"] == [documents["Alpha.docx"]["id"]]
+
+        overlap = client.post(
+            f"/api/document-sets/{workspace['id']}/editor-generate-async",
+            json=alpha_request,
+        )
+        assert overlap.status_code == 409
+        assert "already has a background update" in overlap.json()["detail"]
+
+        beta_job = client.post(
+            f"/api/document-sets/{workspace['id']}/editor-generate-async",
+            json=request_for(
+                "Beta.docx", "Beta editable text.", "Beta queued text."
+            ),
+        )
+        assert beta_job.status_code == 202, beta_job.text
+
+        listed = client.get(
+            f"/api/document-sets/{workspace['id']}/generation-jobs"
+        )
+        assert listed.status_code == 200, listed.text
+        assert {job["job_id"] for job in listed.json()["jobs"]} == {
+            alpha_job.json()["job_id"],
+            beta_job.json()["job_id"],
+        }
+
+        editor_service = importlib.import_module("app.editor_service")
+        database = importlib.import_module("app.database")
+        with database.SessionLocal() as session:
+            assert editor_service.fail_interrupted_editor_generations(session) == 2
+
+        interrupted = client.get(
+            f"/api/generation-jobs/{alpha_job.json()['job_id']}"
+        )
+        assert interrupted.json()["status"] == "interrupted"
+        assert interrupted.json()["stage"] == "interrupted"
+        recoverable = client.get("/api/generation-jobs")
+        assert recoverable.status_code == 200, recoverable.text
+        assert {job["job_id"] for job in recoverable.json()["jobs"]} == {
+            alpha_job.json()["job_id"],
+            beta_job.json()["job_id"],
+        }
+
+        retried = client.post(
+            f"/api/generation-jobs/{alpha_job.json()['job_id']}/retry"
+        )
+        assert retried.status_code == 202, retried.text
+        assert retried.json()["job_id"] != alpha_job.json()["job_id"]
+        assert retried.json()["status"] == "queued"
 
 
 def test_match_decisions_persist_and_control_near_match_targets(

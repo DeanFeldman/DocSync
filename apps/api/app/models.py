@@ -415,6 +415,7 @@ class EditorOperation(Base):
     )
     operation_type: Mapped[str] = mapped_column(String(40))
     status: Mapped[str] = mapped_column(String(30), default="previewed")
+    stage: Mapped[str] = mapped_column(String(60), default="queued")
     source_element_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     link_group_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     replacement_text: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -423,6 +424,11 @@ class EditorOperation(Base):
     error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_by: Mapped[str | None] = mapped_column(String(120), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        onupdate=utc_now,
+    )
     completed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
