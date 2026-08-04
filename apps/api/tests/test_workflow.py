@@ -750,7 +750,7 @@ def test_global_search_returns_every_occurrence_across_all_current_documents(
         assert literal.json()["results"][0]["matched_text"] == "%_"
 
 
-def test_table_cells_are_extracted_matched_and_edited(tmp_path: Path) -> None:
+def test_table_paragraphs_are_extracted_matched_and_edited(tmp_path: Path) -> None:
     shared = "Monthly compliance review"
     replacement = "Quarterly compliance review"
     originals = {
@@ -782,7 +782,7 @@ def test_table_cells_are_extracted_matched_and_edited(tmp_path: Path) -> None:
             item
             for item in workspace["link_groups"]
             if item["representative_text"] == shared
-            and item["members"][0]["element_type"] == "table_cell"
+            and item["members"][0]["element_type"] == "table_paragraph"
         )
         assert group["document_count"] == 2
         assert all(member["table_index"] == 0 for member in group["members"])
@@ -796,7 +796,7 @@ def test_table_cells_are_extracted_matched_and_edited(tmp_path: Path) -> None:
             element
             for page in view.json()["pages"]
             for element in page["elements"]
-            if element["element_type"] == "table_cell"
+            if element["element_type"] == "table_paragraph"
         ]
         assert any(element["text"] == shared for element in table_elements)
 
@@ -807,7 +807,7 @@ def test_table_cells_are_extracted_matched_and_edited(tmp_path: Path) -> None:
         assert search.status_code == 200
         assert search.json()["result_count"] == 2
         assert all(
-            result["element_type"] == "table_cell"
+            result["element_type"] == "table_paragraph"
             for result in search.json()["results"]
         )
 

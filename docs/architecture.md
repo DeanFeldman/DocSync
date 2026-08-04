@@ -49,3 +49,20 @@ A generated edit may only target `DocumentElement` rows that belong to the selec
 The visual tab is a PDF exported by the installed Microsoft Word engine, so it uses Word's fonts, pagination, tables, images, headers, and footers. The separate Select text tab derives deterministic logical pages from extracted body elements and provides stable, keyboard-accessible element selection. Direct selection over the PDF awaits an element-to-render coordinate map.
 
 Each `DocumentRecord` is a stable logical document. Its uploaded DOCX remains immutable. A confirmed edit creates a `GeneratedVersion`; the newest completed version becomes that document's current source for rendering, further edits, and downloads. The element rows and exact-match groups are refreshed transactionally after each applied edit, while `GenerationTarget` rows preserve the before/after audit trail.
+
+## v1.5 table-paragraph boundary
+
+The extractor walks direct document-body children so normal paragraphs and
+top-level tables retain logical order. Each physical table cell is visited once,
+then each non-empty direct paragraph becomes an immutable `table_paragraph`
+block with table, row, column, paragraph, and document-order metadata.
+
+The writer resolves that full location against the same immutable DOCX version
+and mutates only the selected paragraph's runs and supported paragraph
+properties. It never rebuilds the table or assigns `cell.text`. Merged cells,
+nested tables, and cells with unsupported Word objects are classified read-only
+before preview and checked again during write-back.
+
+Schema migration 2 reparses every stored version to create the same mapping for
+pre-v1.5 workspaces. The existing migration coordinator verifies a database
+backup first and restores it if any stored version cannot be regenerated.

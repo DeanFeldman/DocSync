@@ -11,6 +11,7 @@ from pathlib import Path
 
 from docx import Document
 from docx.enum.style import WD_STYLE_TYPE
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 from fastapi.testclient import TestClient
 
 
@@ -95,10 +96,54 @@ def make_read_only_table_docx(shared_text: str) -> bytes:
     document = Document()
     document.add_heading("Read-only structures", level=1)
     document.add_paragraph(shared_text)
-    table = document.add_table(rows=1, cols=1)
+    table = document.add_table(rows=1, cols=2)
+    cell = table.cell(0, 0).merge(table.cell(0, 1))
+    cell.paragraphs[0].text = "Read-only merged content"
+    return save_docx(document)
+
+
+def make_expanded_table_docx(
+    title: str,
+    shared_text: str,
+    secondary_text: str,
+) -> bytes:
+    document = Document()
+    document.add_heading(title, level=1)
+    document.add_paragraph("Body content before the table.")
+    # The same words in body context must not become a table match target.
+    document.add_paragraph(shared_text)
+    table = document.add_table(rows=1, cols=2)
     cell = table.cell(0, 0)
-    cell.paragraphs[0].text = "Read-only first line"
-    cell.add_paragraph("Read-only second line")
+    cell.paragraphs[0].text = ""
+    primary_run = cell.paragraphs[0].add_run(shared_text)
+    primary_run.bold = True
+    secondary = cell.add_paragraph(style="List Bullet")
+    secondary_run = secondary.add_run(secondary_text)
+    secondary_run.italic = True
+    secondary.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    table.cell(0, 1).text = f"{title} untouched value"
+    document.add_paragraph("Body content after the table.")
+    return save_docx(document)
+
+
+def make_unsupported_table_structures_docx() -> bytes:
+    document = Document()
+    document.add_heading("Unsupported table structures", level=1)
+    table = document.add_table(rows=2, cols=2)
+    merged = table.cell(0, 0).merge(table.cell(0, 1))
+    merged.text = "Merged content appears once"
+
+    nested_cell = table.cell(1, 0)
+    nested_cell.text = "Outer text beside a nested table"
+    nested = nested_cell.add_table(rows=1, cols=1)
+    nested.cell(0, 0).text = "Nested content"
+
+    object_cell = table.cell(1, 1)
+    object_cell.text = "Caption with an unsupported image"
+    object_cell.paragraphs[0].add_run().add_picture(
+        str(API_DIR.parents[1] / "build" / "icon.png")
+    )
+    object_cell.add_paragraph("")
     return save_docx(document)
 
 
@@ -149,6 +194,310 @@ def version_count(client: TestClient, document_id: str) -> int:
     response = client.get(f"/api/documents/{document_id}/versions")
     assert response.status_code == 200, response.text
     return len(response.json()["versions"])
+
+
+def test_table_paragraphs_are_individual_safe_rich_versioned_blocks(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    shared = "Annual resident safety assessment"
+    alpha_secondary = "Review emergency contacts every quarter"
+    beta_secondary = "Review emergency contact details every quarter"
+    originals = {
+        "Alpha.docx": make_expanded_table_docx(
+            "Alpha",
+            shared,
+            alpha_secondary,
+        ),
+        "Beta.docx": make_expanded_table_docx(
+            "Beta",
+            shared,
+            beta_secondary,
+        ),
+    }
+
+    app = load_test_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        workspace = upload_set(client, originals, name="Expanded table editing")
+        documents = documents_by_name(workspace)
+        alpha_content = read_editor_content(
+            client,
+            documents["Alpha.docx"]["version_id"],
+        )
+        beta_content = read_editor_content(
+            client,
+            documents["Beta.docx"]["version_id"],
+        )
+
+        alpha_table = [
+            block
+            for block in alpha_content["blocks"]
+            if block["element_type"] == "table_paragraph"
+            and block["column_index"] == 0
+        ]
+        assert [block["paragraph_index"] for block in alpha_table] == [0, 1]
+        assert [block["text"] for block in alpha_table] == [
+            shared,
+            alpha_secondary,
+        ]
+        assert all(block["supported"] for block in alpha_table)
+        assert alpha_table[0]["delta"]["ops"][0]["attributes"] == {"bold": True}
+        assert alpha_table[1]["list_type"] == "bullet"
+        assert alpha_table[1]["alignment"] == "right"
+        assert alpha_table[1]["delta"]["ops"][0]["attributes"] == {
+            "italic": True
+        }
+        assert (
+            block_with_text(alpha_content, "Body content before the table.")["order"]
+            < alpha_table[0]["order"]
+            < alpha_table[1]["order"]
+            < block_with_text(alpha_content, "Body content after the table.")["order"]
+        )
+
+        source = alpha_table[0]
+        beta_source = next(
+            block
+            for block in beta_content["blocks"]
+            if block["element_type"] == "table_paragraph"
+            and block["text"] == shared
+        )
+        exact = client.get(
+            f"/api/document-elements/{source['element_id']}/matches"
+        )
+        assert exact.status_code == 200, exact.text
+        assert [
+            item["element_id"] for item in exact.json()["exact_matches"]
+        ] == [beta_source["element_id"]]
+        assert all(
+            item["element_type"] == "table_paragraph"
+            for item in exact.json()["exact_matches"]
+        )
+
+        near_source = alpha_table[1]
+        near = client.get(
+            f"/api/document-elements/{near_source['element_id']}/similar-matches",
+            params={"threshold": 0.5},
+        )
+        assert near.status_code == 200, near.text
+        assert any(
+            item["text"] == beta_secondary
+            and item["element_type"] == "table_paragraph"
+            and 0.5 <= item["similarity_score"] < 1
+            and item["difference_spans"]
+            for item in near.json()["matches"]
+        )
+
+        heading_attempt = client.post(
+            f"/api/document-sets/{workspace['id']}/editor-preview",
+            json={
+                "base_versions": current_versions(workspace, ["Alpha.docx"]),
+                "source_element_id": source["element_id"],
+                "edit_mode": "override",
+                "targets": [
+                    {
+                        "element_id": source["element_id"],
+                        "replacement_text": shared,
+                        "delta": {
+                            "ops": [
+                                {"insert": shared},
+                                {"insert": "\n", "attributes": {"header": 2}},
+                            ]
+                        },
+                    }
+                ],
+            },
+        )
+        assert heading_attempt.status_code == 422
+        assert "Heading levels cannot be applied" in heading_attempt.json()["detail"]
+
+        payload = {
+            "base_versions": current_versions(
+                workspace,
+                ["Alpha.docx", "Beta.docx"],
+            ),
+            "source_element_id": source["element_id"],
+            "edit_mode": "per_document",
+            "targets": [
+                {
+                    "element_id": source["element_id"],
+                    "replacement_text": "Alpha annual safety review",
+                },
+                {
+                    "element_id": beta_source["element_id"],
+                    "replacement_text": "Beta annual safety review",
+                },
+            ],
+        }
+        preview = client.post(
+            f"/api/document-sets/{workspace['id']}/editor-preview",
+            json=payload,
+        )
+        assert preview.status_code == 200, preview.text
+        assert preview.json()["writes_performed"] is False
+        assert preview.json()["edit_mode"] == "per_document"
+        assert all(
+            change["element_type"] == "table_paragraph"
+            and change["table_index"] == 0
+            and change["row_index"] == 0
+            and change["column_index"] == 0
+            and change["paragraph_index"] == 0
+            for document_preview in preview.json()["documents"]
+            for change in document_preview["changes"]
+        )
+
+        generated = client.post(
+            f"/api/document-sets/{workspace['id']}/editor-generate",
+            json=payload,
+        )
+        assert generated.status_code == 201, generated.text
+        versions = {
+            item["document_name"]: item
+            for item in generated.json()["versions"]
+        }
+        for document_name, replacement in (
+            ("Alpha.docx", "Alpha annual safety review"),
+            ("Beta.docx", "Beta annual safety review"),
+        ):
+            downloaded = client.get(versions[document_name]["download_url"])
+            assert downloaded.status_code == 200
+            result = Document(io.BytesIO(downloaded.content))
+            cell = result.tables[0].cell(0, 0)
+            assert [paragraph.text for paragraph in cell.paragraphs] == [
+                replacement,
+                alpha_secondary
+                if document_name == "Alpha.docx"
+                else beta_secondary,
+            ]
+            assert cell.paragraphs[0].runs[0].bold is True
+            assert cell.paragraphs[1].runs[0].italic is True
+            assert cell.paragraphs[1].alignment == WD_ALIGN_PARAGRAPH.RIGHT
+            assert result.tables[0].cell(0, 1).text == (
+                f"{Path(document_name).stem} untouched value"
+            )
+            current_content = read_editor_content(
+                client,
+                versions[document_name]["version_id"],
+            )
+            current_cell = [
+                block
+                for block in current_content["blocks"]
+                if block["element_type"] == "table_paragraph"
+                and block.get("table_index") == 0
+                and block.get("row_index") == 0
+                and block.get("column_index") == 0
+            ]
+            assert [block["text"] for block in current_cell] == [
+                replacement,
+                alpha_secondary
+                if document_name == "Alpha.docx"
+                else beta_secondary,
+            ]
+
+        alpha_current = read_editor_content(
+            client,
+            versions["Alpha.docx"]["version_id"],
+        )
+        alpha_list = next(
+            block
+            for block in alpha_current["blocks"]
+            if block["element_type"] == "table_paragraph"
+            and block.get("table_index") == 0
+            and block.get("row_index") == 0
+            and block.get("column_index") == 0
+            and block["paragraph_index"] == 1
+        )
+        list_replacement = "Updated ordered contact checklist"
+        list_update = client.post(
+            f"/api/document-sets/{workspace['id']}/editor-generate",
+            json={
+                "base_versions": {
+                    documents["Alpha.docx"]["id"]: versions["Alpha.docx"][
+                        "version_id"
+                    ]
+                },
+                "source_element_id": alpha_list["element_id"],
+                "edit_mode": "override",
+                "targets": [
+                    {
+                        "element_id": alpha_list["element_id"],
+                        "replacement_text": list_replacement,
+                        "delta": {
+                            "ops": [
+                                {
+                                    "insert": list_replacement,
+                                    "attributes": {"italic": True},
+                                },
+                                {
+                                    "insert": "\n",
+                                    "attributes": {
+                                        "list": "ordered",
+                                        "indent": 1,
+                                        "align": "center",
+                                    },
+                                },
+                            ]
+                        },
+                    }
+                ],
+            },
+        )
+        assert list_update.status_code == 201, list_update.text
+        updated_version = list_update.json()["versions"][0]
+        updated_download = client.get(updated_version["download_url"])
+        assert updated_download.status_code == 200
+        updated_docx = Document(io.BytesIO(updated_download.content))
+        updated_cell = updated_docx.tables[0].cell(0, 0)
+        assert [paragraph.text for paragraph in updated_cell.paragraphs] == [
+            "Alpha annual safety review",
+            list_replacement,
+        ]
+        assert updated_cell.paragraphs[1].style.name.startswith("List Number")
+        assert updated_cell.paragraphs[1].alignment == WD_ALIGN_PARAGRAPH.CENTER
+        assert updated_cell.paragraphs[1].runs[0].italic is True
+
+
+def test_unsafe_table_structures_are_visible_once_and_read_only(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    app = load_test_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        workspace = upload_set(
+            client,
+            {
+                "Unsafe.docx": make_unsupported_table_structures_docx(),
+                "Control.docx": make_paragraph_docx("Control", ["Safe body text"]),
+            },
+        )
+        unsafe = documents_by_name(workspace)["Unsafe.docx"]
+        content = read_editor_content(client, unsafe["version_id"])
+        table_blocks = [
+            block
+            for block in content["blocks"]
+            if block["element_type"] == "table_paragraph"
+        ]
+
+        assert [
+            block["text"]
+            for block in table_blocks
+            if block["text"] == "Merged content appears once"
+        ] == ["Merged content appears once"]
+        by_text = {block["text"]: block for block in table_blocks}
+        assert "merged structure" in by_text[
+            "Merged content appears once"
+        ]["unsupported_reason"]
+        assert "nested structure" in by_text[
+            "Outer text beside a nested table"
+        ]["unsupported_reason"]
+        assert "Drawing or floating object" in by_text[
+            "Caption with an unsupported image"
+        ]["unsupported_reason"]
+        assert all(
+            block["read_only"] and not block["supported"]
+            for block in table_blocks
+        )
+        assert all(block["text"] for block in table_blocks)
+        assert content["unsupported_count"] >= 3
 
 
 def test_document_view_exposes_safe_optional_layout_region_contract(
@@ -846,11 +1195,11 @@ def test_invalid_delta_and_unsupported_block_leave_no_version_or_operation(
         read_only = next(
             block
             for block in alpha["blocks"]
-            if block["element_type"] == "table_cell"
+            if block["element_type"] == "table_paragraph"
         )
         assert read_only["supported"] is False
         assert read_only["read_only"] is True
-        assert "multiple paragraphs" in read_only["unsupported_reason"]
+        assert "merged structure" in read_only["unsupported_reason"]
 
         invalid_delta = client.post(
             f"/api/document-sets/{workspace['id']}/editor-generate",
@@ -887,7 +1236,7 @@ def test_invalid_delta_and_unsupported_block_leave_no_version_or_operation(
             },
         )
         assert unsupported.status_code == 422
-        assert "multiple paragraphs" in unsupported.json()["detail"]
+        assert "merged structure" in unsupported.json()["detail"]
 
         for document in documents.values():
             versions = client.get(

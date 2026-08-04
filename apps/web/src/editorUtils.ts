@@ -162,6 +162,7 @@ function editorBlock(
     "heading",
     "list_item",
     "table_cell",
+    "table_paragraph",
   ].includes(elementType);
   const editable = firstBoolean(raw.editable);
   const supported =
@@ -219,6 +220,10 @@ function editorBlock(
     table_index: firstNumber(raw.table_index, location.table_index),
     row_index: firstNumber(raw.row_index, location.row_index),
     column_index: firstNumber(raw.column_index, location.column_index),
+    document_order: firstNumber(
+      raw.document_order,
+      location.document_order,
+    ),
   };
 }
 
@@ -518,6 +523,10 @@ export function normaliseMatch(
     table_index: firstNumber(raw.table_index, location.table_index),
     row_index: firstNumber(raw.row_index, location.row_index),
     column_index: firstNumber(raw.column_index, location.column_index),
+    document_order: firstNumber(
+      raw.document_order,
+      location.document_order,
+    ),
   };
 }
 

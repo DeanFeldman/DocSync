@@ -1289,7 +1289,8 @@ textarea:focus-visible {
 }
 
 /* Table-cell extraction and editing */
-.document-element.table_cell {
+.document-element.table_cell,
+.document-element.table_paragraph {
   display: grid;
   gap: 7px;
   padding: calc(12px * var(--page-zoom));
@@ -1302,12 +1303,15 @@ textarea:focus-visible {
 }
 
 .document-element.table_cell:hover,
-.document-element.table_cell:focus-visible {
+.document-element.table_cell:focus-visible,
+.document-element.table_paragraph:hover,
+.document-element.table_paragraph:focus-visible {
   border-color: #6f9fc5;
   background: #f1f7fc;
 }
 
-.document-element.table_cell.selected {
+.document-element.table_cell.selected,
+.document-element.table_paragraph.selected {
   border-color: var(--teal);
   box-shadow: 0 0 0 3px rgba(24, 142, 132, 0.12);
 }
@@ -1321,7 +1325,8 @@ textarea:focus-visible {
   text-transform: uppercase;
 }
 
-.document-element.table_cell > span:last-child {
+.document-element.table_cell > span:last-child,
+.document-element.table_paragraph > span:last-child {
   display: block;
 }
 
@@ -2072,6 +2077,29 @@ button.layout-fallback-block.editable:focus-visible {
   box-shadow:
     0 1px 0 rgba(255, 255, 255, 0.96),
     0 12px 28px rgba(26, 44, 68, 0.14);
+}
+
+.selected-block-context {
+  margin-bottom: 8px;
+  padding: 8px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  color: var(--muted);
+  background: var(--surface-2);
+  font-size: 0.68rem;
+}
+
+.selected-block-context strong {
+  color: var(--ink);
+}
+
+.quill-block-editor.table_paragraph .ql-header,
+.quill-block-editor.table_paragraph .ql-picker.ql-header {
+  display: none;
 }
 
 .quill-editor-heading {
@@ -3260,6 +3288,12 @@ button.layout-fallback-block.editable:focus-visible {
 :root[data-theme="dark"] .structure-safety-note,
 :root[data-theme="dark"] .editor-empty-state {
   color: var(--ink);
+  background: var(--surface-2);
+  border-color: var(--line);
+}
+
+:root[data-theme="dark"] .selected-block-context {
+  color: var(--muted);
   background: var(--surface-2);
   border-color: var(--line);
 }

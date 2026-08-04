@@ -48,11 +48,25 @@ function setQuillInteractiveState(
   quill: Quill,
   toolbar: HTMLDivElement | null,
   readOnly: boolean,
+  allowHeadings: boolean,
 ) {
   const editable = !readOnly;
 
   quill.enable(editable);
   toolbarControls(toolbar, readOnly);
+  const headingControl = toolbar?.querySelector<HTMLSelectElement>(
+    "select.ql-header",
+  );
+  if (headingControl) {
+    headingControl.disabled = readOnly || !allowHeadings;
+    headingControl.setAttribute(
+      "aria-disabled",
+      String(readOnly || !allowHeadings),
+    );
+    headingControl.title = allowHeadings
+      ? "Heading level"
+      : "Heading levels are unavailable inside table cells";
+  }
   quill.container.classList.toggle("ql-disabled", readOnly);
   quill.root.setAttribute("contenteditable", String(editable));
   quill.root.toggleAttribute("aria-readonly", readOnly);
@@ -163,11 +177,12 @@ export default function QuillBlockEditor({
     });
     quillRef.current = quill;
     const readOnly = disabled || block.read_only || !block.supported;
-    setQuillInteractiveState(quill, toolbar, readOnly);
+    const allowHeadings = block.element_type !== "table_paragraph";
+    setQuillInteractiveState(quill, toolbar, readOnly, allowHeadings);
 
     const initial = initialDeltaRef.current ?? block.delta;
     quill.setContents(initial as never, "silent");
-    setQuillInteractiveState(quill, toolbar, readOnly);
+    setQuillInteractiveState(quill, toolbar, readOnly, allowHeadings);
     quill.history.clear();
     quill.root.dataset.editorElementId = block.element_id;
     quill.root.setAttribute(
@@ -229,7 +244,12 @@ export default function QuillBlockEditor({
       ? null
       : window.requestAnimationFrame(() => {
           if (quillRef.current !== quill || !quill.root.isConnected) return;
-          setQuillInteractiveState(quill, toolbarRef.current, false);
+          setQuillInteractiveState(
+            quill,
+            toolbarRef.current,
+            false,
+            allowHeadings,
+          );
           quill.focus();
         });
 
@@ -270,7 +290,8 @@ export default function QuillBlockEditor({
     }
 
     const readOnly = disabled || block.read_only || !block.supported;
-    setQuillInteractiveState(quill, toolbar, readOnly);
+    const allowHeadings = block.element_type !== "table_paragraph";
+    setQuillInteractiveState(quill, toolbar, readOnly, allowHeadings);
 
     if (readOnly) {
       return;
@@ -281,7 +302,12 @@ export default function QuillBlockEditor({
         return;
       }
 
-      setQuillInteractiveState(quill, toolbarRef.current, false);
+      setQuillInteractiveState(
+        quill,
+        toolbarRef.current,
+        false,
+        allowHeadings,
+      );
 
       try {
         quill.root.focus({ preventScroll: true });
@@ -299,7 +325,7 @@ export default function QuillBlockEditor({
         !block || disabled || block.read_only || !block.supported
           ? "is-disabled"
           : ""
-      }`}
+      } ${block?.element_type ?? "no-block"}`}
       aria-labelledby="quill-editor-title"
     >
       <div className="quill-editor-heading">
@@ -403,7 +429,7 @@ export default function QuillBlockEditor({
         <div ref={hostRef} className="quill-editor-host" />
       ) : (
         <div className="quill-editor-placeholder" role="status">
-          Choose a supported paragraph, heading, list item, or table cell from
+          Choose a supported paragraph, heading, list item, or table paragraph from
           the document.
         </div>
       )}

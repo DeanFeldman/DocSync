@@ -84,6 +84,7 @@ function readableBytes(bytes: number): string {
 function elementLabel(elementType: string): string {
   if (elementType === "list_item") return "List item";
   if (elementType === "table_cell") return "Table cell";
+  if (elementType === "table_paragraph") return "Table paragraph";
   return elementType.charAt(0).toUpperCase() + elementType.slice(1);
 }
 
@@ -97,13 +98,17 @@ type ElementLocation = {
 
 function elementLocation(element: ElementLocation): string {
   if (
-    element.element_type === "table_cell" &&
+    ["table_cell", "table_paragraph"].includes(element.element_type) &&
     element.table_index !== undefined &&
     element.row_index !== undefined &&
     element.column_index !== undefined
   ) {
     return `Table ${element.table_index + 1} · Row ${element.row_index + 1} · Column ${
       element.column_index + 1
+    }${
+      element.element_type === "table_paragraph"
+        ? ` · Paragraph ${element.paragraph_index + 1}`
+        : ""
     }`;
   }
 
@@ -998,7 +1003,7 @@ async function handleUpload(event: FormEvent) {
         aria-label={`Select ${elementLabel(element.element_type)}: ${element.text}`}
       >
         <span className="selection-marker" aria-hidden="true">Edit</span>
-        {element.element_type === "table_cell" && (
+        {["table_cell", "table_paragraph"].includes(element.element_type) && (
           <small className="table-cell-location">
             {elementLocation(element)}
           </small>
@@ -1620,7 +1625,7 @@ const canUpload = files.length >= 2 && !busyAction;
                 <div className="sidebar-empty">
                   <span aria-hidden="true">T</span>
                   <h3>{viewMode === "visual" ? "Viewing the Word layout" : "Select text in the document"}</h3>
-                  <p>{viewMode === "visual" ? "This view uses Microsoft Word’s own layout. Switch to Select text when you are ready to choose content to edit." : "Supported paragraphs, headings, list items, and table cells highlight as you hover or focus them."}</p>
+                  <p>{viewMode === "visual" ? "This view uses Microsoft Word’s own layout. Switch to Select text when you are ready to choose content to edit." : "Supported paragraphs, headings, list items, and table paragraphs highlight as you hover or focus them."}</p>
                   {viewMode === "visual" && viewer?.pdf_url && <button type="button" className="quiet-button" onClick={() => setViewMode("select")}>Switch to Select text</button>}
                 </div>
               ) : (

@@ -41,6 +41,43 @@ Returns the Microsoft Word-generated PDF inline for the high-fidelity layout tab
 
 Returns render status, the pagination mode, the support notice, and logical pages containing selectable elements with stable IDs, types, styles, and paragraph locations.
 
+Table content is returned one non-empty paragraph at a time. A supported block
+uses `element_type: "table_paragraph"` and includes:
+
+```json
+{
+  "document_order": 4,
+  "table_index": 0,
+  "row_index": 2,
+  "column_index": 1,
+  "paragraph_index": 0,
+  "supported": true,
+  "read_only": false,
+  "unsupported_reason": null
+}
+```
+
+## Structured editor endpoints
+
+```text
+GET  /document-versions/{version_id}/editor-content
+GET  /document-elements/{element_id}/matches
+GET  /document-elements/{element_id}/similar-matches
+POST /document-elements/{element_id}/compare
+POST /document-elements/{element_id}/match-decisions
+POST /document-sets/{document_set_id}/editor-preview
+POST /document-sets/{document_set_id}/editor-generate
+POST /document-sets/{document_set_id}/editor-generate-async
+GET  /editor-operations/{operation_id}
+```
+
+Editor preview/generation requests provide a current immutable version for every
+target document in `base_versions`. A stale head returns `409 Conflict` before
+any version is saved. `targets` may carry one replacement/Delta per document.
+Table-paragraph preview changes include the exact table location and source
+version; preview performs the DOCX round-trip in memory and writes no file or
+database row.
+
 ## `GET /documents/{document_id}/download`
 
 Downloads the current working DOCX for one logical document. Before any edit this is the immutable upload; after edits it is the latest applied generated version.

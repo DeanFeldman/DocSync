@@ -149,13 +149,17 @@ function locationLabel(item: {
   column_index?: number;
 }): string {
   if (
-    item.element_type === "table_cell" &&
+    ["table_cell", "table_paragraph"].includes(item.element_type) &&
     item.table_index !== undefined &&
     item.row_index !== undefined &&
     item.column_index !== undefined
   ) {
-    return `Table ${item.table_index + 1} · row ${item.row_index + 1} · column ${
+    return `Table ${item.table_index + 1} · Row ${item.row_index + 1} · Column ${
       item.column_index + 1
+    }${
+      item.element_type === "table_paragraph"
+        ? ` · Paragraph ${item.paragraph_index + 1}`
+        : ""
     }`;
   }
   return `${item.element_type.replaceAll("_", " ")} · block ${
@@ -716,6 +720,10 @@ function PreviewDialog({
                   <p>
                     {document.changes.length} targeted block
                     {document.changes.length === 1 ? "" : "s"}
+                    {document.version_id
+                      ? ` · Source version ${document.version_id.slice(0, 8)}`
+                      : ""}
+                    {` · ${preview.edit_mode.replaceAll("_", " ")}`}
                   </p>
                 </div>
               </header>
@@ -2694,7 +2702,7 @@ export default function DocumentExperience({
                 </h2>
                 <p>
                   {showLayoutStructure || !layoutView?.pdf_url
-                    ? "Choose a supported heading, paragraph, list item, or table cell to open its exact mapped block in Edit."
+                    ? "Choose a supported heading, paragraph, list item, or table paragraph to open its exact mapped block in Edit."
                     : "This view is rendered from the current DOCX. Choose Select from structure when you want to open a mapped element in the editor."}
                 </p>
               </div>
@@ -2805,6 +2813,12 @@ export default function DocumentExperience({
             className="editor-mode-panel edit-mode-panel"
           >
             {/* DOCSYNC_QUILL_REMOUNT_V2 */}
+            {selectedBlock && (
+              <div className="selected-block-context" role="status">
+                <strong>{document.name}</strong>
+                <span>{locationLabel(selectedBlock)}</span>
+              </div>
+            )}
             <QuillBlockEditor
               key={`${selectedBlock?.element_id ?? "empty"}:${editorResetToken}`}
               block={selectedBlock}
