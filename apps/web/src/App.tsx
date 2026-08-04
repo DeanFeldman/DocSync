@@ -701,7 +701,6 @@ const [setNameTouched, setSetNameTouched] = useState(false);
     if (
       updatedActiveDocument &&
       currentActiveDocument &&
-      editorDirty &&
       (updatedActiveDocument.current_version_id ?? updatedActiveDocument.version_id) !==
         (currentActiveDocument.current_version_id ?? currentActiveDocument.version_id)
     ) {
@@ -728,7 +727,7 @@ const [setNameTouched, setSetNameTouched] = useState(false);
           ...updated,
           documents: current.documents.map((item) => {
             const replacement = updatedById.get(item.id) ?? item;
-            return editorDirty && item.id === activeDocumentIdRef.current && affectedIds.has(item.id)
+            return item.id === activeDocumentIdRef.current && affectedIds.has(item.id)
               ? item
               : replacement;
           }),
@@ -754,7 +753,7 @@ const [setNameTouched, setSetNameTouched] = useState(false);
       id: `${job.generation_id}:completed`,
       kind: "success",
       title: "Processing complete",
-      message: `${count} document${count === 1 ? " was" : "s were"} updated successfully. New Word previews are rendering in the background.`,
+      message: `${count} document${count === 1 ? " was" : "s were"} updated successfully. New versions are now available.`,
     });
   }
 
