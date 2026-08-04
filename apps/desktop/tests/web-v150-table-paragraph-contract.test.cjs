@@ -45,8 +45,7 @@ test("the one-paragraph Quill boundary resets history and blocks structure edits
   assert.match(editor, /quill\.history\.clear\(\)/);
   assert.match(editor, /quill\.history\.undo\(\)/);
   assert.match(editor, /quill\.history\.redo\(\)/);
-  assert.match(editor, /block\.element_type !== "table_paragraph"/);
-  assert.match(editor, /Heading levels are unavailable inside table cells/);
+  assert.match(editor, /"table_paragraph",[\s\S]*"header_paragraph",[\s\S]*"footer_paragraph"/);
 });
 
 test("table paragraph active and read-only states remain explicit in dark mode", () => {

@@ -5,9 +5,10 @@ DocSync uses two complementary document surfaces:
 - **Layout** renders the current immutable DOCX version through Microsoft Word when
   Word is available. It is read-only and remains the source of truth for pagination
   and unsupported Word objects.
-- **Edit** exposes supported headings, paragraphs, list items, and individual
-  paragraphs in supported top-level table cells as version-scoped structured
-  blocks. One selected block is edited with the locally bundled Quill 2 editor.
+- **Edit** exposes supported headings, body paragraphs, list items, individual
+  paragraphs in supported top-level table cells, and safely mapped header and
+  footer paragraphs as version-scoped structured blocks. One selected block is
+  edited with the locally bundled Quill 2 editor.
 - **Compare** reviews exact and near matches, highlights word-level differences,
   chooses target documents, and prepares a shared, per-document, or full-override
   operation.
@@ -42,11 +43,45 @@ Every version owns immutable `DocumentBlockRevision` snapshots. A snapshot recor
 - element type, original and normalised text, and exact/structure hashes;
 - Quill Delta and supported inline/paragraph formatting;
 - list type and level;
-- body-paragraph or table/row/column/in-cell-paragraph write-back location;
+- body, table/row/column/in-cell-paragraph, or section-aware header/footer
+  write-back location;
 - supported/read-only state and an actionable reason where applicable.
 
 Generated versions receive new current element IDs. Historical snapshots retain
 their original IDs for audit and download purposes.
+
+## Header/footer paragraph mapping
+
+The extractor walks default, first-page, and even-page headers and footers for
+every Word section. It follows OOXML references without creating missing parts.
+One mapped paragraph becomes `header_paragraph` or `footer_paragraph` and stores:
+
+```json
+{
+  "kind": "header_paragraph",
+  "section_index": 0,
+  "source_section_index": 0,
+  "header_footer_type": "default_header",
+  "paragraph_index": 0,
+  "part_relationship_id": "rId8",
+  "document_order": 0,
+  "is_linked_to_previous": true,
+  "section_indexes": [0, 1],
+  "linked_section_indexes": [1]
+}
+```
+
+Sections inherited through Link to Previous resolve to the active relationship.
+Blocks are deduplicated by physical relationship and paragraph. The writer
+rebuilds the relationship map from the exact immutable source version and
+validates region, type, source section, relationship, and paragraph index before
+changing runs.
+
+Header/footer paragraphs containing fields, drawings, embedded objects,
+content controls, tracked changes, or comments remain visible and read-only.
+Nested header/footer tables are excluded from editing. Sibling paragraphs,
+fields, images, tables, settings, margins, distances, and link relationships
+remain untouched.
 
 ## Table-paragraph mapping
 
@@ -103,6 +138,10 @@ whitespace collapsing. Element type is part of the exact-match identity, so a
 `table_paragraph` never automatically targets an unrelated body paragraph with
 the same text.
 
+For header/footer blocks, candidate identity also requires the same story type
+and source-section context. Identical body text or an unrelated
+first/even/default story cannot become an automatic target.
+
 Near matching is bounded and configurable. It combines text similarity with element
 type, relative document position, and neighbouring-block context. Near matches are
 never automatic edit targets. They must be explicitly confirmed and their decision
@@ -129,9 +168,10 @@ DOCUMENTSYNC_NEAR_MATCH_CANDIDATE_LIMIT
    creates no file, version, or operation record.
 6. Generate using the same base version IDs. If any document head changed after the
    preview, generation fails with `409 Conflict`.
-7. DocSync writes staged DOCX files, validates them, records the operation and
-   version lineage, advances document heads, refreshes current block mappings and
-   exact groups, and commits the batch atomically.
+7. DocSync queues a durable background operation, writes staged DOCX files,
+   validates them, records version lineage, advances document heads, refreshes
+   affected block mappings and exact groups, and commits atomically. Navigation
+   and unrelated drafts remain available.
 
 The original upload is never overwritten. A failed generation rolls back database
 state and removes staged output.
@@ -151,6 +191,8 @@ POST /api/document-elements/{element_id}/compare
 POST /api/document-elements/{element_id}/match-decisions
 POST /api/document-sets/{document_set_id}/editor-preview
 POST /api/document-sets/{document_set_id}/editor-generate
+POST /api/document-sets/{document_set_id}/editor-generate-async
+GET  /api/editor-operations/{operation_id}
 GET  /api/documents/{document_id}/versions
 POST /api/documents/{document_id}/versions/{target_version_id}/restore
 GET  /api/document-versions/{version_id}/download
@@ -169,7 +211,10 @@ Supported:
 - non-empty paragraphs in top-level table cells where a stable
   table/row/column/paragraph location exists;
 - ordered and unordered list metadata and supported indentation in those table
-  paragraphs. Heading levels remain unavailable inside table cells.
+  paragraphs. Heading levels remain unavailable inside table cells;
+- safely mapped default, first-page, and even-page header/footer paragraphs,
+  including supported bold, italic, underline, alignment, indentation, and
+  list formatting. Heading levels remain unavailable in these story blocks.
 
 Read-only or diagnostic-only:
 

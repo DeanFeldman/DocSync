@@ -17,6 +17,7 @@ from uuid import uuid4
 
 from docx import Document
 from docx.document import Document as DocxDocument
+from docx.oxml.ns import qn
 from docx.text.paragraph import Paragraph
 from fastapi import HTTPException, UploadFile, status
 from sqlalchemy import delete, func, select
@@ -64,6 +65,55 @@ BLOCK_ORDERED_BODY_STYLE_PATTERN = re.compile(
     r"^body_block_order:(\d+):(\d+):(\d+):(.*)$",
     re.DOTALL,
 )
+HEADER_FOOTER_STYLE_PATTERN = re.compile(
+    r"^header_footer_order:(\d+):(\d+):(header|footer):(\d+):"
+    r"(default|first|even):(\d+):([^:]+)$"
+)
+HEADER_FOOTER_PART_TYPES = (
+    ("header", "default"),
+    ("header", "first"),
+    ("header", "even"),
+    ("footer", "default"),
+    ("footer", "first"),
+    ("footer", "even"),
+)
+HEADER_FOOTER_UNSUPPORTED_TAGS = {
+    qn("w:drawing"),
+    qn("w:pict"),
+    qn("w:object"),
+    qn("w:fldSimple"),
+    qn("w:fldChar"),
+    qn("w:instrText"),
+    qn("w:sdt"),
+    qn("w:hyperlink"),
+    qn("w:ins"),
+    qn("w:del"),
+    qn("w:commentReference"),
+}
+
+
+def _header_footer_type(kind: str, variant: str) -> str:
+    prefix = {"default": "default", "first": "first_page", "even": "even_page"}[
+        variant
+    ]
+    return f"{prefix}_{kind}"
+
+
+def _header_footer_paragraph_nodes(part_element) -> list:
+    paragraphs = []
+    for node in part_element.iter(qn("w:p")):
+        ancestor = node.getparent()
+        nested_in_table = False
+        while ancestor is not None and ancestor is not part_element:
+            if ancestor.tag == qn("w:tbl"):
+                nested_in_table = True
+                break
+            ancestor = ancestor.getparent()
+        if not nested_in_table:
+            paragraphs.append(node)
+    return paragraphs
+
+
 PAGE_LAYOUT_UNITS = 18
 WORD_RENDER_LOCK = threading.Lock()
 LARGE_SET_LINK_GROUP_LIMIT = 100
@@ -152,7 +202,35 @@ def body_paragraph_location(style_name: str | None) -> int | None:
     return int(match.group(3)) if match is not None else None
 
 
+def header_footer_location(style_name: str | None) -> dict | None:
+    match = HEADER_FOOTER_STYLE_PATTERN.fullmatch(style_name or "")
+    if match is None:
+        return None
+    (
+        block_order,
+        document_order,
+        kind,
+        source_section_index,
+        variant,
+        paragraph_index,
+        relationship_id,
+    ) = match.groups()
+    return {
+        "kind": f"{kind}_paragraph",
+        "document_order": int(document_order),
+        "section_index": int(source_section_index),
+        "source_section_index": int(source_section_index),
+        "header_footer_type": _header_footer_type(kind, variant),
+        "paragraph_index": int(paragraph_index),
+        "part_relationship_id": relationship_id,
+        "block_order": int(block_order),
+    }
+
+
 def mapped_paragraph_index(element: DocumentElement) -> int:
+    header_footer = header_footer_location(element.style_name)
+    if header_footer is not None:
+        return int(header_footer["paragraph_index"])
     table_location = table_paragraph_location(element.style_name)
     if table_location is not None:
         return table_location[3]
@@ -162,6 +240,12 @@ def mapped_paragraph_index(element: DocumentElement) -> int:
 
 def element_document_order(element: DocumentElement) -> tuple[int, int, int, int]:
     style_name = element.style_name or ""
+
+    header_footer = header_footer_location(style_name)
+    if header_footer is not None:
+        return int(header_footer["block_order"]), -1, -1, int(
+            header_footer["paragraph_index"]
+        )
 
     table_paragraph = ORDERED_TABLE_PARAGRAPH_STYLE_PATTERN.fullmatch(style_name)
     if table_paragraph is not None:
@@ -188,6 +272,8 @@ def element_document_order(element: DocumentElement) -> tuple[int, int, int, int
 
 
 def display_style_name(style_name: str | None) -> str | None:
+    if header_footer_location(style_name) is not None:
+        return None
     block_match = BLOCK_ORDERED_BODY_STYLE_PATTERN.fullmatch(style_name or "")
     if block_match is not None:
         return block_match.group(4) or None
@@ -198,6 +284,10 @@ def display_style_name(style_name: str | None) -> str | None:
 
 
 def element_location_payload(style_name: str | None) -> dict:
+    header_footer = header_footer_location(style_name)
+    if header_footer is not None:
+        header_footer.pop("block_order", None)
+        return header_footer
     location = table_paragraph_location(style_name)
     if location is None:
         return {}
@@ -211,6 +301,9 @@ def element_location_payload(style_name: str | None) -> dict:
 
 
 def element_type_for_style(style_name: str | None) -> str:
+    header_footer = header_footer_location(style_name)
+    if header_footer is not None:
+        return str(header_footer["kind"])
     if table_paragraph_location(style_name) is not None:
         return "table_paragraph"
 
@@ -270,7 +363,7 @@ def _validate_docx_payload(filename: str, payload: bytes) -> None:
 def _extract_paragraphs(
     document: DocxDocument,
 ) -> list[tuple[int, str, str | None]]:
-    elements: list[tuple[int, str, str | None]] = []
+    body_elements: list[tuple[int, str, str | None]] = []
     body_paragraph_index = 0
     table_index = 0
     document_order = 0
@@ -305,7 +398,7 @@ def _extract_paragraphs(
                 )
                 style_id = paragraph_style.val if paragraph_style is not None else ""
                 style_name = style_names.get(style_id, style_id)
-                elements.append(
+                body_elements.append(
                     (
                         block_order,
                         text,
@@ -336,7 +429,7 @@ def _extract_paragraphs(
                     text = paragraph.text.strip()
                     if not text:
                         continue
-                    elements.append(
+                    body_elements.append(
                         (
                             block_order,
                             text,
@@ -351,6 +444,147 @@ def _extract_paragraphs(
 
         table_index += 1
         document_order += 1
+
+    # Resolve references directly from each section's sectPr. Accessing a
+    # python-docx header/footer proxy can create a missing definition as a side
+    # effect, which would make a read-only extraction mutate the package model.
+    # Following the OOXML relationships also gives us the stable physical-part
+    # identity required to deduplicate linked sections.
+    active_references: dict[tuple[str, str], tuple[int, str]] = {}
+    usages_by_part: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for section_index, section in enumerate(document.sections):
+        for kind, variant in HEADER_FOOTER_PART_TYPES:
+            reference_tag = qn(f"w:{kind}Reference")
+            direct_reference = next(
+                (
+                    reference
+                    for reference in section._sectPr.findall(reference_tag)
+                    if reference.get(qn("w:type"), "default") == variant
+                ),
+                None,
+            )
+            key = (kind, variant)
+            if direct_reference is not None:
+                relationship_id = direct_reference.get(qn("r:id"))
+                if not relationship_id:
+                    continue
+                active_references[key] = (section_index, relationship_id)
+            inherited = active_references.get(key)
+            if inherited is None:
+                continue
+            source_section_index, relationship_id = inherited
+            usages_by_part[(kind, relationship_id)].append(
+                {
+                    "kind": kind,
+                    "variant": variant,
+                    "section_index": section_index,
+                    "source_section_index": source_section_index,
+                    "part_relationship_id": relationship_id,
+                    "is_linked_to_previous": direct_reference is None,
+                }
+            )
+
+    header_blocks: list[tuple[str, str, int, str, int, str]] = []
+    footer_blocks: list[tuple[str, str, int, str, int, str]] = []
+    for (kind, relationship_id), usages in sorted(
+        usages_by_part.items(),
+        key=lambda item: (
+            min(usage["section_index"] for usage in item[1]),
+            0 if item[0][0] == "header" else 1,
+            min(
+                HEADER_FOOTER_PART_TYPES.index(
+                    (usage["kind"], usage["variant"])
+                )
+                for usage in item[1]
+            ),
+            item[0][1],
+        ),
+    ):
+        canonical = min(
+            usages,
+            key=lambda usage: (
+                usage["section_index"],
+                HEADER_FOOTER_PART_TYPES.index(
+                    (usage["kind"], usage["variant"])
+                ),
+            ),
+        )
+        try:
+            part = document.part.related_parts[relationship_id]
+            paragraph_nodes = _header_footer_paragraph_nodes(part.element)
+        except (AttributeError, KeyError):
+            continue
+        target = header_blocks if kind == "header" else footer_blocks
+        for paragraph_index, paragraph_node in enumerate(paragraph_nodes):
+            paragraph = Paragraph(paragraph_node, part.element)
+            text = paragraph.text.strip()
+            has_unsupported_content = any(
+                node.tag in HEADER_FOOTER_UNSUPPORTED_TAGS
+                for node in paragraph._p.iter()
+            )
+            ancestor = paragraph._p.getparent()
+            while ancestor is not None and ancestor is not part.element:
+                if ancestor.tag in HEADER_FOOTER_UNSUPPORTED_TAGS:
+                    has_unsupported_content = True
+                    break
+                ancestor = ancestor.getparent()
+            if not text and not has_unsupported_content:
+                continue
+            target.append(
+                (
+                    text,
+                    kind,
+                    int(canonical["source_section_index"]),
+                    str(canonical["variant"]),
+                    paragraph_index,
+                    relationship_id,
+                )
+            )
+
+    elements: list[tuple[int, str, str | None]] = []
+    for text, kind, source_section, variant, paragraph_index, relationship_id in (
+        header_blocks
+    ):
+        order = len(elements)
+        elements.append(
+            (
+                order,
+                text,
+                f"header_footer_order:{order}:{order}:{kind}:"
+                f"{source_section}:{variant}:{paragraph_index}:{relationship_id}",
+            )
+        )
+
+    body_offset = len(elements)
+    for _old_order, text, style_name in body_elements:
+        if style_name is None:
+            rewritten = None
+        else:
+            rewritten = re.sub(
+                r"^(body_block_order|table_paragraph_order):(\d+):",
+                lambda match: (
+                    f"{match.group(1)}:{int(match.group(2)) + body_offset}:"
+                ),
+                style_name,
+                count=1,
+            )
+        order = len(elements)
+        elements.append((order, text, rewritten))
+
+    footer_document_order = document_order + len(header_blocks)
+    for text, kind, source_section, variant, paragraph_index, relationship_id in (
+        footer_blocks
+    ):
+        order = len(elements)
+        elements.append(
+            (
+                order,
+                text,
+                f"header_footer_order:{order}:{footer_document_order}:{kind}:"
+                f"{source_section}:{variant}:{paragraph_index}:{relationship_id}",
+            )
+        )
+        footer_document_order += 1
 
     return elements
 
@@ -816,6 +1050,15 @@ def search_document_set(
                             "table_index",
                             "row_index",
                             "column_index",
+                            "kind",
+                            "section_index",
+                            "source_section_index",
+                            "header_footer_type",
+                            "part_relationship_id",
+                            "is_linked_to_previous",
+                            "section_indexes",
+                            "linked_section_indexes",
+                            "linked_sections",
                         )
                         if key in location
                     },
@@ -1131,9 +1374,9 @@ def serialize_document_view(document: DocumentRecord) -> dict:
         "pagination": "estimated",
         "page_count": len(pages),
         "notice": (
-            "Structured browser preview. Paragraphs, headings, list items, and non-empty "
-            "top-level table paragraphs are selectable. Page grouping is estimated; the original "
-            "DOCX remains the source of truth."
+            "Structured browser preview. Body, table, header, and footer paragraphs "
+            "with safe stable mappings are selectable. Page grouping is estimated; "
+            "the original DOCX remains the source of truth."
         ),
         "pages": pages,
         # Coordinate overlays are optional. The current renderer does not emit
@@ -1477,6 +1720,41 @@ def generate_versions(
             record = elements[0].document
             docx = _load_source_document(session, record)
             for element in sorted(elements, key=lambda item: item.paragraph_index):
+                header_footer = header_footer_location(element.style_name)
+                if header_footer is not None:
+                    from .editor_service import (
+                        _header_footer_part_map,
+                        _unsupported_reason,
+                    )
+
+                    part = _header_footer_part_map(docx).get(
+                        str(header_footer["part_relationship_id"])
+                    )
+                    try:
+                        paragraph = part["paragraphs"][
+                            int(header_footer["paragraph_index"])
+                        ]
+                    except (IndexError, KeyError, TypeError) as exc:
+                        raise HTTPException(
+                            status_code=500,
+                            detail=(
+                                "Header/footer paragraph location is no longer "
+                                f"valid for {record.original_name}."
+                            ),
+                        ) from exc
+                    reason = _unsupported_reason(
+                        paragraph,
+                        None,
+                        header_footer_kind=(
+                            "header"
+                            if header_footer["kind"] == "header_paragraph"
+                            else "footer"
+                        ),
+                    )
+                    if reason is not None:
+                        raise HTTPException(status_code=422, detail=reason)
+                    _replace_paragraph_text(paragraph, replacement_text)
+                    continue
                 table_location = table_paragraph_location(element.style_name)
                 if table_location is not None:
                     (

@@ -12,6 +12,29 @@ Returns API status.
 }
 ```
 
+## Header/footer block shape
+
+Header and footer content is returned one mapped physical paragraph at a time.
+Linked sections using the same physical part are deduplicated. Example:
+
+```json
+{
+  "element_type": "header_paragraph",
+  "kind": "header_paragraph",
+  "section_index": 0,
+  "source_section_index": 0,
+  "header_footer_type": "default_header",
+  "paragraph_index": 0,
+  "part_relationship_id": "rId8",
+  "is_linked_to_previous": true,
+  "section_indexes": [0, 1],
+  "linked_section_indexes": [1],
+  "supported": true,
+  "read_only": false,
+  "unsupported_reason": null
+}
+```
+
 ## `POST /document-sets`
 
 Creates a document set from multipart form data.
@@ -69,14 +92,25 @@ POST /document-sets/{document_set_id}/editor-preview
 POST /document-sets/{document_set_id}/editor-generate
 POST /document-sets/{document_set_id}/editor-generate-async
 GET  /editor-operations/{operation_id}
+GET  /generation-jobs/{job_id}
+GET  /document-sets/{document_set_id}/generation-jobs
+POST /generation-jobs/{job_id}/retry
 ```
 
 Editor preview/generation requests provide a current immutable version for every
 target document in `base_versions`. A stale head returns `409 Conflict` before
 any version is saved. `targets` may carry one replacement/Delta per document.
-Table-paragraph preview changes include the exact table location and source
-version; preview performs the DOCX round-trip in memory and writes no file or
-database row.
+Table-paragraph preview changes include the exact table location. Header/footer
+changes include section, part type, paragraph, relationship, and linked
+sections. Preview resolves the source version and performs the DOCX round-trip
+in memory without writing a file or database row.
+
+The asynchronous generation endpoint returns `202 Accepted` with an operation
+ID, status URL, stage, and affected-document summary. Poll the operation or job
+endpoint until `completed`, `failed`, or `interrupted`. Stages are `queued`,
+`preparing_documents`, `applying_changes`, `validating_files`,
+`saving_versions`, `refreshing_workspace`, and a terminal status. A retry
+creates a new operation from the stored reviewed request.
 
 ## `GET /documents/{document_id}/download`
 
