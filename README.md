@@ -31,6 +31,27 @@ DocSync-Setup-latest.exe
 
 ---
 
+## Version 1.8.0
+
+DocSync `v1.8.0` adds direct, confidence-gated selection to the high-fidelity
+Microsoft Word preview. After Word exports the immutable version to PDF,
+DocSync prepares a versioned coordinate map in the background. Reliable body,
+heading, list, table, header, and footer regions can be clicked or activated
+with Enter or Space to open the exact block in Edit.
+
+Coordinates are normalised to each page and remain aligned during zoom,
+fit-to-width, fit-to-page, scrolling, window resizing, and sidebar resizing.
+Hover, focus, selected, read-only, and **Show selectable areas** states expose
+the map without permanently obscuring the document. Ambiguous or low-confidence
+matches never become editable; the PDF stays visible and **Select from
+structure** remains available when a map is partial or fails.
+
+See [the v1.8.0 release notes](docs/v1.8.0-release-notes.md),
+[preview-overlay requirements](docs/v1.8.0-preview-overlay-requirements.md),
+[manual test plan](docs/v1.8.0-manual-testing.md),
+[architecture](docs/architecture.md), and
+[editable editor design](docs/editable-document-editor.md).
+
 ## Version 1.7.0
 
 DocSync `v1.7.0` adds safe, section-aware editing for Microsoft Word header
@@ -179,6 +200,12 @@ DocSync provides three document workspace modes.
 - Generates a read-only Microsoft Word preview only after the explicit
   **Load Word Preview** action.
 - Reuses the Word preview for the same immutable document version.
+- Selects reliably mapped body, list, table, header, and footer blocks directly
+  from the high-fidelity Word preview.
+- Keeps normalised overlays aligned during zoom, fitting, scrolling, and
+  viewer or sidebar resizing.
+- Supports mouse, Tab, Shift+Tab, Enter, and Space selection with accessible
+  editable/read-only labels.
 - Opens supported structured Layout blocks directly in the editor.
 - Shows unsupported or preserved Word structures as read-only with a reason.
 - Uses the selectable structured view as the safe fallback when reliable
@@ -272,9 +299,10 @@ DocSync is designed around controlled document editing.
 1. Create a document set.
 2. Upload related Microsoft Word documents.
 3. Open a document in **Layout** or **Edit**.
-4. In **Layout**, choose **Select from document structure** when a Word-rendered
-   preview is shown.
-5. Select one supported block; DocSync opens and focuses it in **Edit**.
+4. In **Layout**, load the Word preview and select a reliably mapped region, or
+   choose **Select from structure** when a coordinate is unavailable.
+5. DocSync validates the displayed immutable version, opens the exact supported
+   block, and focuses it in **Edit**.
 6. Edit the block in the structured editor.
 7. Review exact and near matches in **Compare**.
 8. Choose the editing mode.
@@ -292,6 +320,7 @@ DocSync is designed around controlled document editing.
 - **Frontend:** React, TypeScript, Vite, and Quill 2
 - **Backend:** FastAPI and Python
 - **Document processing:** `python-docx`
+- **PDF coordinate mapping:** PyMuPDF
 - **Database:** SQLAlchemy with SQLite
 - **Backend packaging:** PyInstaller
 - **Automation:** GitHub Actions
@@ -493,7 +522,7 @@ The workflow reads the application version from the Git tag, so the source `pack
 From the repository root:
 
 ```powershell
-$version = "1.7.0"
+$version = "1.8.0"
 
 git switch main
 git pull origin main
@@ -607,9 +636,12 @@ http://localhost:8001/docs
   and other complex fields remain preserved and read-only.
 - Header/footer images, logos, watermarks, shapes, text boxes, content controls,
   and nested tables remain preserved and read-only.
-- Direct selection is available in the structured Layout view. The
-  high-fidelity Word/PDF preview remains read-only until the renderer can
-  provide reliable page-relative element coordinates.
+- Direct preview selection depends on reliable PDF text-coordinate extraction.
+  Complex, ambiguous, or unmatched Word content may remain unmapped.
+- The PDF is a selection surface, not an in-place editor. All changes continue
+  through the structured editor, preview, and immutable generation flow.
+- Unsupported objects remain visible and read-only even when their PDF text can
+  be located.
 - Authentication, PostgreSQL, hosted cloud storage, and multi-device synchronisation are not yet part of the local desktop release.
 - The Windows installer is not yet commercially code-signed.
 
@@ -619,7 +651,6 @@ http://localhost:8001/docs
 
 Planned work includes:
 
-- Reliable high-fidelity preview coordinate overlays
 - Additional complex Word structures
 - Linux and macOS feasibility
 - Commercial code signing

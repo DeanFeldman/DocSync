@@ -3314,15 +3314,13 @@ def generate_editor_versions(
             from .document_service import (
                 _rebuild_exact_link_groups,
                 get_document_set_or_404,
-                rendered_pdf_path,
                 serialize_document_set,
             )
 
             _rebuild_exact_link_groups(session, document_set_id)
-            for item in staged.values():
-                # Remove legacy document-ID render cache. True-version renders
-                # use their own cache name.
-                rendered_pdf_path(item["document"]).unlink(missing_ok=True)
+            # Render caches are keyed by immutable version. Advancing a head
+            # creates a fresh key and must not remove a historical preview that
+            # a background coordinate worker or version-history view is using.
             session.commit()
             committed = True
 
@@ -3538,7 +3536,6 @@ def restore_document_version(
             from .document_service import (
                 _rebuild_exact_link_groups,
                 get_document_set_or_404,
-                rendered_pdf_path,
                 serialize_document_set,
             )
 
@@ -3547,7 +3544,8 @@ def restore_document_version(
             refreshed = serialize_document_set(
                 get_document_set_or_404(session, document.document_set_id)
             )
-            rendered_pdf_path(document).unlink(missing_ok=True)
+            # The restored descendant has a new version/render key. Preserve
+            # historical immutable-version previews and their coordinate maps.
             session.commit()
             committed = True
 

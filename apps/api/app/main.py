@@ -74,6 +74,7 @@ from .schemas import (
     MatchDecisionBatchRequest,
     VersionRestoreRequest,
 )
+from .render_map_service import render_page_path, request_render_map
 
 
 from .audit_logger import AuditLogger
@@ -99,7 +100,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="DocumentSync API",
-    version="1.7.0",
+    version="1.8.0",
     description="DocSync structured DOCX viewing and controlled editing service.",
     lifespan=lifespan,
 )
@@ -279,11 +280,37 @@ def read_rendered_document(
     path = rendered_pdf_path(document, version.id)
     if not path.exists():
         render_document_with_word(session, document, version)
+    else:
+        request_render_map(session, version.id)
     return FileResponse(
         path,
         media_type="application/pdf",
         filename=f"{document.original_name.removesuffix('.docx')}-preview.pdf",
         content_disposition_type="inline",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/document-versions/{version_id}/render-map")
+def read_document_render_map(
+    version_id: str,
+    session: Session = Depends(get_session),
+) -> dict:
+    return request_render_map(session, version_id)
+
+
+@app.get(
+    "/api/document-versions/{version_id}/render-pages/{render_id}/{page_number}.png"
+)
+def read_document_render_page(
+    version_id: str,
+    render_id: str,
+    page_number: int,
+    session: Session = Depends(get_session),
+) -> FileResponse:
+    return FileResponse(
+        render_page_path(session, version_id, render_id, page_number),
+        media_type="image/png",
         headers={"Cache-Control": "no-store"},
     )
 
