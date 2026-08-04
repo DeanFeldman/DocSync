@@ -296,6 +296,45 @@ class DocumentHead(Base):
     )
 
 
+class PreviewRenderJob(Base):
+    """Durable, version-bound Microsoft Word preview work item."""
+
+    __tablename__ = "preview_render_jobs"
+    __table_args__ = (
+        Index(
+            "ix_preview_render_job_version_created",
+            "version_id",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    document_id: Mapped[str] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), index=True
+    )
+    version_id: Mapped[str] = mapped_column(
+        ForeignKey("document_versions.id", ondelete="CASCADE"), index=True
+    )
+    status: Mapped[str] = mapped_column(String(30), default="queued", index=True)
+    stage: Mapped[str] = mapped_column(String(60), default="queued")
+    pdf_ready: Mapped[bool] = mapped_column(Boolean, default=False)
+    render_map_ready: Mapped[bool] = mapped_column(Boolean, default=False)
+    render_map_status: Mapped[str] = mapped_column(
+        String(30), default="not_requested"
+    )
+    cache_hit: Mapped[bool] = mapped_column(Boolean, default=False)
+    error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 class DocumentBlockRevision(Base):
     """Immutable editor/write-back snapshot for one block in one version."""
 

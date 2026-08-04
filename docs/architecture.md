@@ -116,6 +116,43 @@ context. Search returns the same location metadata. Schema migration 4 reparses
 every immutable file through the verified-backup and automatic-restore
 coordinator.
 
+## v1.8 preview and inline-layout boundary
+
+The browser never edits a PDF. A durable `PreviewRenderJob` binds one Word
+export to one immutable `DocumentVersion`. The single-worker preview executor
+publishes `pdf_ready` separately from `render_map_ready`; exact-version PDF
+caches bypass Word. Schema migration 5 creates the job table and restart
+recovery fails interrupted jobs with a safe retry message.
+
+```mermaid
+sequenceDiagram
+    participant UI as Layout UI
+    participant API as FastAPI
+    participant W as Word worker
+    participant M as PyMuPDF mapper
+    UI->>API: POST version preview job
+    API-->>UI: 202 queued
+    W->>W: Export immutable DOCX to PDF
+    W-->>API: pdf_ready
+    API-->>UI: Controlled page images become visible
+    M->>M: Extract geometry and context-map blocks
+    M-->>UI: Normalized safe/read-only regions
+    UI->>UI: Inline Quill shares operation draft/sidebar
+```
+
+PyMuPDF writes controlled page images and publishes their page dimensions
+before contextual text matching finishes. Regions are normalized within their
+page. The map cache is valid only when version, document, source hash, PDF
+fingerprint, engine, and mapper version match. Text, type, header/footer zone,
+document order, and collision ownership contribute to resolution. A mapping
+below `0.90`, unresolved duplicate, or overlapping range is non-interactive.
+
+Layout mounts a single restricted Quill editor over the selected block. It
+does not create a second editing model: the versioned Delta, current draft,
+match decisions, target replacements, preview signature, and generation
+request remain owned by `DocumentExperience`. Generation retains the existing
+atomic head-advance boundary. Only after commit are result-version preview jobs
+queued; a preview failure cannot roll back a committed DOCX version.
 ## v1.8 preview-coordinate boundary
 
 ```mermaid

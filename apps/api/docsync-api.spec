@@ -11,6 +11,7 @@ a = Analysis(
     binaries=collect_dynamic_libs("pymupdf"),
     datas=collect_data_files("docx") + collect_data_files("pymupdf"),
     hiddenimports=[
+        "pymupdf",
         "sqlalchemy.dialects.sqlite",
         "pymupdf",
         "uvicorn.lifespan.on",

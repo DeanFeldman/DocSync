@@ -258,6 +258,34 @@ Read-only or diagnostic-only:
 
 Unsupported content remains in the source DOCX and stays visible in Layout mode.
 
+## v1.8 inline Layout editor
+
+The Word-layout surface now uses controlled page images and normalized HTML
+regions rather than a native PDF iframe. A reliable region selects the exact
+versioned `element_id` while Layout stays active. All regions for that block are
+highlighted and a single restricted Quill instance covers the clicked page
+region. Its initial selection is estimated from clicked line and horizontal
+position.
+
+The inline instance consumes and publishes the same `QuillDraft` as structured
+Edit. Formatting commands in the operation sidebar are sent to the active
+instance; Quill then publishes the resulting Delta back to the shared draft.
+Changing a block resets history, while Escape pauses inline typing and restores
+focus to the selected region.
+
+Structural safeguards remain identical to the structured editor: Enter is
+rejected, multiline paste is flattened, unsupported attributes are sanitized
+by the backend, and generation revalidates every element/version/head. The PDF
+is explicitly a fixed snapshot. Longer drafts warn about possible wrapping,
+and only a generated DOCX plus fresh Word render supplies authoritative final
+pagination.
+
+The Layout sidebar exposes source/version/location context, formatting,
+Undo/Redo, exact targets, near-match score/differences/decisions, editing modes,
+preview, and background generation. If coordinates are missing or uncertain,
+**Select from structure** opens the established structured fallback instead of
+guessing.
+
 ## Validation
 
 From the repository root:

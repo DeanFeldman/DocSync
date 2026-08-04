@@ -94,6 +94,7 @@ export interface RenderMapPage {
 export interface RenderMapRegion extends LayoutElementRegion {
   region_id: string;
   region_index: number;
+  render_id?: string | null;
   element_type: string;
   text_preview: string;
   location: Record<string, unknown>;
@@ -135,6 +136,37 @@ export interface RenderMapResponse {
     reason: string;
   }>;
   generated_at?: string | null;
+}
+
+export type PreviewRenderStage =
+  | "queued"
+  | "starting_microsoft_word"
+  | "opening_document"
+  | "rendering_pdf"
+  | "displaying_document"
+  | "preparing_selectable_text"
+  | "ready_to_edit"
+  | "failed"
+  | string;
+
+export interface PreviewRenderJobResponse {
+  job_id: string;
+  document_id: string;
+  version_id: string;
+  status: "queued" | "processing" | "completed" | "failed" | string;
+  stage: PreviewRenderStage;
+  pdf_ready: boolean;
+  render_map_ready: boolean;
+  render_map_status: RenderMapStatus;
+  cache_hit: boolean;
+  created_at: string;
+  updated_at: string;
+  completed_at?: string | null;
+  error?: string | null;
+  status_url: string;
+  preview_url: string;
+  render_map_url: string;
+  retry_allowed: boolean;
 }
 
 export interface DocumentView {

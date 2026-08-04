@@ -10,6 +10,7 @@ from fastapi import (
     FastAPI,
     File,
     Form,
+    HTTPException,
     Query,
     Request,
     Response,
@@ -75,6 +76,12 @@ from .schemas import (
     VersionRestoreRequest,
 )
 from .render_map_service import render_page_path, request_render_map
+from .preview_job_service import (
+    create_preview_job,
+    fail_interrupted_preview_jobs,
+    get_preview_job,
+    preview_for_version,
+)
 
 
 from .audit_logger import AuditLogger
@@ -91,6 +98,7 @@ async def lifespan(_: FastAPI):
     logger.warning("docsync.startup.stage=storage_initialization")
     with SessionLocal() as session:
         fail_interrupted_editor_generations(session)
+        fail_interrupted_preview_jobs(session)
     DocumentStorageService.init_storage()
     logger.warning("docsync.startup.stage=temporary_file_cleanup")
     DocumentStorageService.cleanup_stale_temp_files()
@@ -279,6 +287,8 @@ def read_rendered_document(
     document, version = resolve_document_identifier(session, version_id)
     path = rendered_pdf_path(document, version.id)
     if not path.exists():
+        raise HTTPException(status_code=404, detail="The Word preview is not ready yet.")
+    request_render_map(session, version.id)
         render_document_with_word(session, document, version)
     else:
         request_render_map(session, version.id)
@@ -289,6 +299,33 @@ def read_rendered_document(
         content_disposition_type="inline",
         headers={"Cache-Control": "no-store"},
     )
+
+
+@app.post(
+    "/api/document-versions/{version_id}/preview-jobs",
+    status_code=202,
+)
+def queue_document_preview(
+    version_id: str,
+    session: Session = Depends(get_session),
+) -> dict:
+    return create_preview_job(session, version_id)
+
+
+@app.get("/api/preview-jobs/{job_id}")
+def read_preview_job(
+    job_id: str,
+    session: Session = Depends(get_session),
+) -> dict:
+    return get_preview_job(session, job_id)
+
+
+@app.get("/api/document-versions/{version_id}/preview")
+def read_document_preview(
+    version_id: str,
+    session: Session = Depends(get_session),
+) -> dict:
+    return preview_for_version(session, version_id)
 
 
 @app.get("/api/document-versions/{version_id}/render-map")
