@@ -6,7 +6,6 @@ import secrets
 from time import perf_counter
 
 from fastapi import (
-    BackgroundTasks,
     Depends,
     FastAPI,
     File,
@@ -54,15 +53,18 @@ from .editor_service import (
     get_editor_matches,
     get_similar_matches,
     get_version_or_404,
+    list_editor_generation_jobs,
+    list_recoverable_editor_generation_jobs,
     preview_editor_edit,
-    process_queued_editor_generation,
     queue_editor_generation,
+    retry_editor_generation,
     resolve_document_identifier,
     save_match_decisions,
     serialize_document_versions,
     serialize_editor_content,
     serialize_editor_generation_status,
     serialize_version_document_view,
+    submit_editor_generation,
     restore_document_version,
 )
 from .schemas import (
@@ -97,7 +99,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="DocumentSync API",
-    version="1.5.0",
+    version="1.6.0",
     description="DocSync structured DOCX viewing and controlled editing service.",
     lifespan=lifespan,
 )
@@ -468,14 +470,10 @@ def generate_document_set_editor_edit(
 def queue_document_set_editor_edit(
     document_set_id: str,
     request: EditorEditRequest,
-    background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
 ) -> dict:
     queued = queue_editor_generation(session, document_set_id, request)
-    background_tasks.add_task(
-        process_queued_editor_generation,
-        queued["operation_id"],
-    )
+    submit_editor_generation(queued["operation_id"])
     return queued
 
 
@@ -485,6 +483,42 @@ def read_editor_operation_status(
     session: Session = Depends(get_session),
 ) -> dict:
     return serialize_editor_generation_status(session, operation_id)
+
+
+@app.get("/api/generation-jobs/{job_id}")
+def read_generation_job_status(
+    job_id: str,
+    session: Session = Depends(get_session),
+) -> dict:
+    return serialize_editor_generation_status(session, job_id)
+
+
+@app.get("/api/generation-jobs")
+def read_recoverable_generation_jobs(
+    limit: int = Query(default=50, ge=1, le=100),
+    session: Session = Depends(get_session),
+) -> dict:
+    return {"jobs": list_recoverable_editor_generation_jobs(session, limit=limit)}
+
+
+@app.get("/api/document-sets/{document_set_id}/generation-jobs")
+def read_document_set_generation_jobs(
+    document_set_id: str,
+    limit: int = Query(default=50, ge=1, le=100),
+    session: Session = Depends(get_session),
+) -> dict:
+    jobs = list_editor_generation_jobs(session, document_set_id, limit=limit)
+    return {"jobs": jobs}
+
+
+@app.post("/api/generation-jobs/{job_id}/retry", status_code=202)
+def retry_generation_job(
+    job_id: str,
+    session: Session = Depends(get_session),
+) -> dict:
+    queued = retry_editor_generation(session, job_id)
+    submit_editor_generation(queued["operation_id"])
+    return queued
 
 
 @app.get("/api/document-sets/{document_set_id}/history")

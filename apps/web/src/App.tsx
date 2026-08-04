@@ -16,10 +16,14 @@ import {
   fetchDocumentSet,
   fetchDocumentSets,
   fetchDocumentView,
+  fetchEditorGeneration,
+  fetchEditorGenerationJobs,
+  fetchRecoverableEditorGenerationJobs,
   fetchElementMatches,
   generateEdit,
   previewEdit,
   removeDocumentFromSet,
+  retryEditorGeneration,
   searchDocumentSet,
   uploadDocumentSet,
 } from "./api";
@@ -72,6 +76,18 @@ type CreationStage =
   | "workspace"
   | null;
 
+type ProcessingNotification = {
+  id: string;
+  kind: "accepted" | "success" | "error";
+  title: string;
+  message: string;
+};
+
+type NewerVersionNotice = {
+  document: DocumentSummary;
+  jobId: string;
+};
+
 const INITIAL_VISIBLE_PAGES = 8;
 const VISIBLE_PAGE_BATCH = 8;
 
@@ -86,6 +102,34 @@ function elementLabel(elementType: string): string {
   if (elementType === "table_cell") return "Table cell";
   if (elementType === "table_paragraph") return "Table paragraph";
   return elementType.charAt(0).toUpperCase() + elementType.slice(1);
+}
+
+function generationStageLabel(stage?: string): string {
+  const labels: Record<string, string> = {
+    queued: "Queued",
+    preparing_documents: "Preparing documents",
+    applying_changes: "Applying changes",
+    validating_generated_files: "Validating generated files",
+    saving_new_versions: "Saving new versions",
+    refreshing_workspace: "Refreshing workspace",
+    completed: "Completed",
+    failed: "Failed",
+    interrupted: "Interrupted",
+  };
+  return labels[stage ?? ""] ?? "Processing";
+}
+
+function mergeGenerationJobs(
+  current: EditorGenerationResponse[],
+  incoming: EditorGenerationResponse[],
+): EditorGenerationResponse[] {
+  const merged = new Map(current.map((job) => [job.generation_id, job]));
+  for (const job of incoming) merged.set(job.generation_id, job);
+  return Array.from(merged.values())
+    .sort((left, right) =>
+      (right.submitted_at ?? "").localeCompare(left.submitted_at ?? ""),
+    )
+    .slice(0, 20);
 }
 
 type ElementLocation = {
@@ -183,6 +227,18 @@ function readableDate(value: string): string {
   });
 }
 
+function readableDateTime(value?: string): string {
+  if (!value) return "Submitted just now";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "Submitted recently";
+  return date.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
 function App() {
   const [theme, setTheme] = useState<AppTheme>(() => initialTheme());
 const [setName, setSetName] = useState("");
@@ -204,6 +260,7 @@ const [setNameTouched, setSetNameTouched] = useState(false);
     truncated: false,
   });
   const [globalSearchLoading, setGlobalSearchLoading] = useState(false);
+  const [globalSearchRefreshToken, setGlobalSearchRefreshToken] = useState(0);
   const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
   const [documentSearchTarget, setDocumentSearchTarget] =
     useState<DocumentSearchTarget | null>(null);
@@ -225,11 +282,27 @@ const [setNameTouched, setSetNameTouched] = useState(false);
   const [visiblePageCount, setVisiblePageCount] = useState(INITIAL_VISIBLE_PAGES);
   const [viewMode, setViewMode] = useState<"visual" | "select">("visual");
   const [editorDirty, setEditorDirty] = useState(false);
+  const [generationJobs, setGenerationJobs] = useState<
+    EditorGenerationResponse[]
+  >([]);
+  const [processingOpen, setProcessingOpen] = useState(false);
+  const [processingNotifications, setProcessingNotifications] = useState<
+    ProcessingNotification[]
+  >([]);
+  const [newerVersionNotice, setNewerVersionNotice] =
+    useState<NewerVersionNotice | null>(null);
+  const [deferredDocumentUpdates, setDeferredDocumentUpdates] = useState<
+    Record<string, DocumentSummary>
+  >({});
   const viewerScrollRef = useRef<HTMLDivElement>(null);
   const addDocumentsInputRef = useRef<HTMLInputElement>(null);
   const globalSearchInputRef = useRef<HTMLInputElement>(null);
   const globalSearchContainerRef = useRef<HTMLDivElement>(null);
   const documentSearchRequestRef = useRef(0);
+  const activeDocumentIdRef = useRef(activeDocumentId);
+  const handledGenerationJobsRef = useRef(new Set<string>());
+
+  activeDocumentIdRef.current = activeDocumentId;
 
   useEffect(() => {
     applyTheme(theme);
@@ -335,6 +408,91 @@ const [setNameTouched, setSetNameTouched] = useState(false);
     };
   }, []);
 
+  useEffect(() => {
+    const controller = new AbortController();
+    void fetchRecoverableEditorGenerationJobs(controller.signal)
+      .then((response) => {
+        setGenerationJobs((current) =>
+          mergeGenerationJobs(current, response.jobs),
+        );
+      })
+      .catch(() => {
+        // Startup recovery status is supplementary to the saved workspace list.
+      });
+    return () => controller.abort();
+  }, []);
+
+  useEffect(() => {
+    if (!documentSet?.id) return;
+    const controller = new AbortController();
+    void fetchEditorGenerationJobs(documentSet.id, controller.signal)
+      .then((response) => {
+        const relevant = response.jobs.filter((job) => {
+          if (["completed", "failed"].includes(job.status)) {
+            handledGenerationJobsRef.current.add(job.generation_id);
+            return false;
+          }
+          return true;
+        });
+        setGenerationJobs((current) =>
+          mergeGenerationJobs(current, relevant),
+        );
+      })
+      .catch(() => {
+        // The workspace remains usable if historical job status is unavailable.
+      });
+    return () => controller.abort();
+  }, [documentSet?.id]);
+
+  const activeGenerationJobKey = generationJobs
+    .filter((job) => ["queued", "processing"].includes(job.status))
+    .map((job) => job.generation_id)
+    .sort()
+    .join("|");
+
+  useEffect(() => {
+    const activeJobIds = activeGenerationJobKey
+      ? activeGenerationJobKey.split("|")
+      : [];
+    if (!activeJobIds.length) return;
+    let cancelled = false;
+    const controller = new AbortController();
+
+    async function poll() {
+      const results = await Promise.allSettled(
+        activeJobIds.map((jobId) =>
+          fetchEditorGeneration(jobId, controller.signal),
+        ),
+      );
+      if (cancelled) return;
+      const updates = results.flatMap((result) =>
+        result.status === "fulfilled" ? [result.value] : [],
+      );
+      if (updates.length) {
+        setGenerationJobs((current) =>
+          mergeGenerationJobs(current, updates),
+        );
+      }
+    }
+
+    void poll();
+    const interval = window.setInterval(() => void poll(), 750);
+    return () => {
+      cancelled = true;
+      controller.abort();
+      window.clearInterval(interval);
+    };
+  }, [activeGenerationJobKey]);
+
+  useEffect(() => {
+    for (const job of generationJobs) {
+      if (["queued", "processing"].includes(job.status)) continue;
+      if (handledGenerationJobsRef.current.has(job.generation_id)) continue;
+      handledGenerationJobsRef.current.add(job.generation_id);
+      handleGenerationJobSettled(job);
+    }
+  }, [generationJobs]);
+
 
   useEffect(() => {
     const query = globalSearchQuery.trim();
@@ -398,7 +556,12 @@ const [setNameTouched, setSetNameTouched] = useState(false);
       controller.abort();
       window.clearTimeout(timeout);
     };
-  }, [documentSet?.id, globalSearchQuery, globalSearchScopeKey]);
+  }, [
+    documentSet?.id,
+    globalSearchQuery,
+    globalSearchRefreshToken,
+    globalSearchScopeKey,
+  ]);
 
   useEffect(() => {
     setSearchCursor(-1);
@@ -485,6 +648,159 @@ const [setNameTouched, setSetNameTouched] = useState(false);
     setPreview(null);
   }
 
+  function pushProcessingNotification(
+    notification: ProcessingNotification,
+  ) {
+    setProcessingNotifications((current) => [
+      notification,
+      ...current.filter((item) => item.id !== notification.id),
+    ].slice(0, 4));
+  }
+
+  function handleGenerationQueued(job: EditorGenerationResponse) {
+    handledGenerationJobsRef.current.delete(job.generation_id);
+    setGenerationJobs((current) => mergeGenerationJobs(current, [job]));
+    pushProcessingNotification({
+      id: `${job.generation_id}:accepted`,
+      kind: "accepted",
+      title: "Changes submitted",
+      message:
+        "DocSync is creating the updated document versions in the background. You may continue working.",
+    });
+  }
+
+  function handleGenerationJobSettled(job: EditorGenerationResponse) {
+    if (job.status !== "completed") {
+      pushProcessingNotification({
+        id: `${job.generation_id}:${job.status}`,
+        kind: "error",
+        title:
+          job.status === "interrupted"
+            ? "Processing interrupted"
+            : "Processing failed",
+        message:
+          job.error_detail ??
+          job.error ??
+          "No document versions were changed. Open processing details to review the error.",
+      });
+      return;
+    }
+
+    const updated = job.document_set;
+    const affectedIds = new Set(
+      job.affected_document_ids ??
+        job.versions?.map((version) => version.document_id) ??
+        [],
+    );
+    const updatedActiveDocument = updated?.documents.find(
+      (item) => item.id === activeDocumentIdRef.current && affectedIds.has(item.id),
+    );
+    const currentActiveDocument = documentSet?.documents.find(
+      (item) => item.id === activeDocumentIdRef.current,
+    );
+    if (
+      updatedActiveDocument &&
+      currentActiveDocument &&
+      (updatedActiveDocument.current_version_id ?? updatedActiveDocument.version_id) !==
+        (currentActiveDocument.current_version_id ?? currentActiveDocument.version_id)
+    ) {
+      setDeferredDocumentUpdates((current) => ({
+        ...current,
+        [updatedActiveDocument.id]: updatedActiveDocument,
+      }));
+      setNewerVersionNotice({
+        document: updatedActiveDocument,
+        jobId: job.generation_id,
+      });
+    }
+
+    if (updated) {
+      for (const documentId of affectedIds) {
+        invalidateDocumentHeadResources(updated.id, documentId);
+      }
+      setDocumentSet((current) => {
+        if (!current || current.id !== updated.id) return current;
+        const updatedById = new Map(
+          updated.documents.map((item) => [item.id, item]),
+        );
+        return {
+          ...updated,
+          documents: current.documents.map((item) => {
+            const replacement = updatedById.get(item.id) ?? item;
+            return item.id === activeDocumentIdRef.current && affectedIds.has(item.id)
+              ? item
+              : replacement;
+          }),
+        };
+      });
+      setSavedSets((current) =>
+        current.map((item) =>
+          item.id === updated.id
+            ? {
+                ...item,
+                name: updated.name,
+                document_count: updated.documents.length,
+                edit_count: item.edit_count + 1,
+              }
+            : item,
+        ),
+      );
+      setGlobalSearchRefreshToken((current) => current + 1);
+    }
+
+    const count = job.affected_document_ids?.length ?? job.versions?.length ?? 0;
+    pushProcessingNotification({
+      id: `${job.generation_id}:completed`,
+      kind: "success",
+      title: "Processing complete",
+      message: `${count} document${count === 1 ? " was" : "s were"} updated successfully. New versions are now available.`,
+    });
+  }
+
+  async function handleRetryGeneration(job: EditorGenerationResponse) {
+    try {
+      handleGenerationQueued(await retryEditorGeneration(job.generation_id));
+    } catch (caught) {
+      pushProcessingNotification({
+        id: `${job.generation_id}:retry-error`,
+        kind: "error",
+        title: "Retry was not accepted",
+        message:
+          caught instanceof Error
+            ? caught.message
+            : "Reload the latest versions and review the change before retrying.",
+      });
+    }
+  }
+
+  function openNewerVersion(notice: NewerVersionNotice) {
+    if (
+      editorDirty &&
+      !window.confirm(
+        "Open the new version and discard the current uncommitted draft?",
+      )
+    ) {
+      return;
+    }
+    setDocumentSet((current) =>
+      current
+        ? {
+            ...current,
+            documents: current.documents.map((item) =>
+              item.id === notice.document.id ? notice.document : item,
+            ),
+          }
+        : current,
+    );
+    setDeferredDocumentUpdates((current) => {
+      const next = { ...current };
+      delete next[notice.document.id];
+      return next;
+    });
+    setNewerVersionNotice(null);
+    setEditorDirty(false);
+  }
+
   function resetWorkspace(updateHistory = true) {
     if (
       updateHistory &&
@@ -524,6 +840,8 @@ const [setNameTouched, setSetNameTouched] = useState(false);
     setGlobalSearchOpen(false);
     setDocumentSearchTarget(null);
     setEditorDirty(false);
+    setNewerVersionNotice(null);
+    setDeferredDocumentUpdates({});
     setError("");
     clearSelection();
   }
@@ -569,6 +887,8 @@ const [setNameTouched, setSetNameTouched] = useState(false);
     setDocumentSearchTarget(null);
     setGeneration(null);
     setEditorDirty(false);
+    setNewerVersionNotice(null);
+    setDeferredDocumentUpdates({});
     clearSelection();
   }
 
@@ -790,6 +1110,25 @@ async function handleUpload(event: FormEvent) {
       );
     }
 
+    const deferredDocument = deferredDocumentUpdates[document.id];
+    if (deferredDocument) {
+      setDocumentSet((current) =>
+        current
+          ? {
+              ...current,
+              documents: current.documents.map((item) =>
+                item.id === deferredDocument.id ? deferredDocument : item,
+              ),
+            }
+          : current,
+      );
+      setDeferredDocumentUpdates((current) => {
+        const next = { ...current };
+        delete next[document.id];
+        return next;
+      });
+    }
+
     setEditorDirty(false);
     setError("");
     setDocumentSearchTarget(
@@ -805,7 +1144,7 @@ async function handleUpload(event: FormEvent) {
           }
         : null,
     );
-    setActiveDocumentId(document.id);
+    setActiveDocumentId((deferredDocument ?? document).id);
     setViewer(null);
     setCurrentPage(1);
     setSearchQuery("");
@@ -1015,6 +1354,9 @@ async function handleUpload(event: FormEvent) {
 
 
 const canUpload = files.length >= 2 && !busyAction;
+  const activeGenerationJobs = generationJobs.filter((job) =>
+    ["queued", "processing"].includes(job.status),
+  );
   const canPreview = Boolean(
     documentSet &&
       discovery?.link_group &&
@@ -1046,6 +1388,79 @@ const canUpload = files.length >= 2 && !busyAction;
               </p> */}
 
         <div className="topbar-actions">
+          {generationJobs.length > 0 && (
+            <div
+              className="processing-center"
+              onBlur={(event) => {
+                if (
+                  !event.currentTarget.contains(
+                    event.relatedTarget as Node | null,
+                  )
+                ) {
+                  setProcessingOpen(false);
+                }
+              }}
+            >
+              <button
+                type="button"
+                className={`processing-indicator ${
+                  activeGenerationJobs.length ? "active" : ""
+                }`}
+                onClick={() => setProcessingOpen((current) => !current)}
+                aria-expanded={processingOpen}
+                aria-controls="processing-job-list"
+              >
+                {activeGenerationJobs.length > 0 ? (
+                  <>
+                    <span className="processing-dot" aria-hidden="true" />
+                    Processing {activeGenerationJobs.length} change
+                    {activeGenerationJobs.length === 1 ? "" : "s"}…
+                  </>
+                ) : (
+                  "Recent processing"
+                )}
+              </button>
+              {processingOpen && (
+                <section
+                  id="processing-job-list"
+                  className="processing-popover"
+                  aria-label="Background processing jobs"
+                >
+                  <header>
+                    <strong>Background processing</strong>
+                    <span>Work continues while you navigate.</span>
+                  </header>
+                  <div className="processing-job-list">
+                    {generationJobs.slice(0, 8).map((job) => (
+                      <article className={`processing-job ${job.status}`} key={job.generation_id}>
+                        <div className="processing-job-heading">
+                          <strong>{generationStageLabel(job.stage)}</strong>
+                          <span>{job.status}</span>
+                        </div>
+                        <p>
+                          {job.affected_documents?.map((item) => item.name).join(", ") ||
+                            `${job.affected_document_count ?? 0} document${
+                              job.affected_document_count === 1 ? "" : "s"
+                            }`}
+                        </p>
+                        <small>{readableDateTime(job.submitted_at)}</small>
+                        {job.error_detail && <p className="processing-job-error">{job.error_detail}</p>}
+                        {["failed", "interrupted"].includes(job.status) && (
+                          <button
+                            type="button"
+                            className="quiet-button"
+                            onClick={() => void handleRetryGeneration(job)}
+                          >
+                            Retry safely
+                          </button>
+                        )}
+                      </article>
+                    ))}
+                  </div>
+                </section>
+              )}
+            </div>
+          )}
           <span
             className="version-badge"
             aria-label={`DocSync version ${__DOCSYNC_VERSION__}`}
@@ -1431,6 +1846,32 @@ const canUpload = files.length >= 2 && !busyAction;
             <ErrorAlert message={error} onDismiss={() => setError("")} />
           )}
 
+          {newerVersionNotice &&
+            newerVersionNotice.document.id === activeDocumentId && (
+              <section className="newer-version-notice" role="status" aria-live="polite">
+                <div>
+                  <strong>A newer version of this document is available.</strong>
+                  <span>Your current view and any draft were left unchanged.</span>
+                </div>
+                <div>
+                  <button
+                    type="button"
+                    className="primary-button"
+                    onClick={() => openNewerVersion(newerVersionNotice)}
+                  >
+                    Open new version
+                  </button>
+                  <button
+                    type="button"
+                    className="quiet-button"
+                    onClick={() => setNewerVersionNotice(null)}
+                  >
+                    Continue viewing current version
+                  </button>
+                </div>
+              </section>
+            )}
+
           <div className="document-workspace">
             <aside className="file-rail" aria-labelledby="files-title">
               <div className="rail-heading">
@@ -1504,6 +1945,8 @@ const canUpload = files.length >= 2 && !busyAction;
               fallbackView={viewer}
               searchTarget={documentSearchTarget}
               onGenerated={handleEditorGenerated}
+              generationJobs={generationJobs}
+              onGenerationQueued={handleGenerationQueued}
               onDirtyChange={setEditorDirty}
             />
 
@@ -1748,6 +2191,34 @@ const canUpload = files.length >= 2 && !busyAction;
               <div><button type="button" className="quiet-button" onClick={() => setPreview(null)} disabled={busyAction === "generate"}>Back to edit</button><button type="button" className="primary-button" onClick={() => void handleGenerate()} disabled={busyAction === "generate"}>{busyAction === "generate" ? "Applying changes…" : "Apply changes and continue"}</button></div>
             </footer>
           </section>
+        </div>
+      )}
+
+      {processingNotifications.length > 0 && (
+        <div className="processing-notifications" aria-live="polite" aria-label="Processing notifications">
+          {processingNotifications.map((notification) => (
+            <section
+              className={`processing-notification ${notification.kind}`}
+              key={notification.id}
+              role={notification.kind === "error" ? "alert" : "status"}
+            >
+              <div>
+                <strong>{notification.title}</strong>
+                <p>{notification.message}</p>
+              </div>
+              <button
+                type="button"
+                onClick={() =>
+                  setProcessingNotifications((current) =>
+                    current.filter((item) => item.id !== notification.id),
+                  )
+                }
+                aria-label={`Dismiss ${notification.title}`}
+              >
+                ×
+              </button>
+            </section>
+          ))}
         </div>
       )}
     </div>

@@ -7,6 +7,7 @@ import type {
   DocumentSetResponse,
   EditorContentResponse,
   EditorGenerationResponse,
+  EditorGenerationListResponse,
   EditorOperationRequest,
   EditorPreviewResponse,
   GenerationResponse,
@@ -308,8 +309,37 @@ export async function fetchEditorGeneration(
   signal?: AbortSignal,
 ): Promise<EditorGenerationResponse> {
   const response = await fetch(
-    `${API_URL}/editor-operations/${operationId}`,
+    `${API_URL}/generation-jobs/${operationId}`,
     { signal },
+  );
+  return parseResponse<EditorGenerationResponse>(response);
+}
+
+export async function fetchEditorGenerationJobs(
+  documentSetId: string,
+  signal?: AbortSignal,
+): Promise<EditorGenerationListResponse> {
+  const response = await fetch(
+    `${API_URL}/document-sets/${documentSetId}/generation-jobs`,
+    { signal },
+  );
+  return parseResponse<EditorGenerationListResponse>(response);
+}
+
+export async function fetchRecoverableEditorGenerationJobs(
+  signal?: AbortSignal,
+): Promise<EditorGenerationListResponse> {
+  const response = await fetch(`${API_URL}/generation-jobs`, { signal });
+  return parseResponse<EditorGenerationListResponse>(response);
+}
+
+export async function retryEditorGeneration(
+  operationId: string,
+  signal?: AbortSignal,
+): Promise<EditorGenerationResponse> {
+  const response = await fetch(
+    `${API_URL}/generation-jobs/${operationId}/retry`,
+    { method: "POST", signal },
   );
   return parseResponse<EditorGenerationResponse>(response);
 }

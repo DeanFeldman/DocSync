@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from io import BytesIO
@@ -67,6 +68,11 @@ ORDERED_TABLE_PARAGRAPH_STYLE_PATTERN = re.compile(
 LIST_LEVEL_SUFFIX = re.compile(r"\s+(\d+)$")
 TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]+|\s+", re.UNICODE)
 EDITOR_GENERATION_LOCK = threading.RLock()
+EDITOR_QUEUE_LOCK = threading.RLock()
+EDITOR_GENERATION_EXECUTOR = ThreadPoolExecutor(
+    max_workers=4,
+    thread_name_prefix="docsync-generation",
+)
 MATCH_ALGORITHM_VERSION = "nfkc-sequence-v1"
 ALLOWED_INLINE_ATTRIBUTES = {"bold", "italic", "underline"}
 ALLOWED_BLOCK_ATTRIBUTES = {"header", "list", "indent", "align"}
@@ -1916,20 +1922,62 @@ def _set_list_format(
     paragraph: Paragraph,
     list_type: object,
     level: object,
+    *,
+    existing_list_type: str | None = None,
 ) -> None:
     if list_type not in {"ordered", "bullet"}:
         return
-    level_value = int(level or 0)
+
+    level_value = max(0, int(level or 0))
+
+    # Preserve an existing custom or localised Word list style.
+    if existing_list_type == list_type:
+        properties = paragraph._p.get_or_add_pPr()
+        num_properties = properties.numPr
+
+        if num_properties is not None:
+            level_node = num_properties.get_or_add_ilvl()
+            level_node.val = level_value
+
+        return
+
     base_style = "List Number" if list_type == "ordered" else "List Bullet"
-    requested_style = f"{base_style} {level_value + 1}" if level_value else base_style
+    requested_style = (
+        f"{base_style} {level_value + 1}"
+        if level_value
+        else base_style
+    )
+
     style_names = {style.name for style in document.styles}
-    paragraph.style = requested_style if requested_style in style_names else base_style
+
+    selected_style = next(
+        (
+            style_name
+            for style_name in (requested_style, base_style)
+            if style_name in style_names
+        ),
+        None,
+    )
+
+    if selected_style is None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "This document does not contain a compatible Word list style. "
+                "The existing custom list formatting was preserved, but DocSync "
+                "cannot change this paragraph to a different list type."
+            ),
+        )
+
+    paragraph.style = selected_style
+
     properties = paragraph._p.get_or_add_pPr()
     num_properties = properties.numPr
+
     if num_properties is not None:
         level_node = num_properties.get_or_add_ilvl()
         level_node.val = level_value
-
+        
 
 def _clear_numbering(paragraph: Paragraph) -> None:
     properties = paragraph._p.pPr
@@ -2023,6 +2071,7 @@ def _apply_target_to_docx(
             paragraph,
             newline_attributes.get("list"),
             newline_attributes.get("indent", 0),
+            existing_list_type=existing_list_type,
         )
     if "align" in newline_attributes:
         _set_alignment(paragraph, newline_attributes["align"])
@@ -2259,28 +2308,65 @@ def queue_editor_generation(
     session: Session,
     document_set_id: str,
     request: EditorEditRequest,
+    *,
+    retry_of_operation_id: str | None = None,
 ) -> dict:
-    with EDITOR_GENERATION_LOCK:
-        pending = session.scalar(
-            select(EditorOperation)
-            .where(
-                EditorOperation.document_set_id == document_set_id,
-                EditorOperation.status.in_(("queued", "processing")),
-            )
-            .order_by(EditorOperation.created_at.desc())
-        )
-        if pending is not None:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    "This workspace already has an update in progress. "
-                    "Wait for it to finish before generating again."
-                ),
-            )
-
+    with EDITOR_QUEUE_LOCK:
         _source, _source_document, _base_context, validated_targets = (
             _validate_editor_request(session, document_set_id, request)
         )
+        affected_documents = sorted(
+            {
+                item[2].id: item[2].original_name
+                for item in validated_targets
+            }.items(),
+            key=lambda item: item[1].casefold(),
+        )
+        affected_document_ids = [item[0] for item in affected_documents]
+        affected_document_names = [item[1] for item in affected_documents]
+        pending_operations = list(
+            session.scalars(
+                select(EditorOperation)
+                .where(
+                    EditorOperation.document_set_id == document_set_id,
+                    EditorOperation.status.in_(("queued", "processing")),
+                )
+                .order_by(EditorOperation.created_at.desc())
+            )
+        )
+        requested_documents = set(affected_document_ids)
+        for pending in pending_operations:
+            pending_envelope = pending.preview_json or {}
+            pending_document_ids = set(
+                pending_envelope.get("affected_document_ids", [])
+                if isinstance(pending_envelope, dict)
+                else []
+            )
+            if not pending_document_ids and isinstance(pending_envelope, dict):
+                pending_request = pending_envelope.get("request", {})
+                if isinstance(pending_request, dict):
+                    pending_document_ids = set(
+                        (pending_request.get("base_versions") or {}).keys()
+                    )
+            overlap = requested_documents & pending_document_ids
+            if overlap:
+                names = ", ".join(
+                    name
+                    for document_id, name in zip(
+                        affected_document_ids,
+                        affected_document_names,
+                    )
+                    if document_id in overlap
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        f"{names or 'A selected document'} already has a background "
+                        "update in progress. Wait for it to finish, then reload and "
+                        "review this change against the latest version."
+                    ),
+                )
+
         preview = _preview_payload(
             document_set_id,
             request,
@@ -2291,6 +2377,7 @@ def queue_editor_generation(
             document_set_id=document_set_id,
             operation_type=request.edit_mode,
             status="queued",
+            stage="queued",
             source_element_id=request.source_element_id,
             replacement_text=(
                 validated_targets[0][0].replacement_text
@@ -2300,14 +2387,32 @@ def queue_editor_generation(
             preview_json={
                 "request": request.model_dump(mode="json"),
                 "preview": preview,
+                "affected_document_ids": affected_document_ids,
+                "affected_document_names": affected_document_names,
+                "retry_of_operation_id": retry_of_operation_id,
             },
         )
         session.add(operation)
         session.commit()
         return {
+            "id": operation.id,
+            "job_id": operation.id,
             "operation_id": operation.id,
             "generation_id": operation.id,
             "status": "queued",
+            "stage": "queued",
+            "submitted_at": utc_isoformat(operation.created_at),
+            "completed_at": None,
+            "affected_document_ids": affected_document_ids,
+            "affected_documents": [
+                {"id": document_id, "name": document_name}
+                for document_id, document_name in zip(
+                    affected_document_ids,
+                    affected_document_names,
+                )
+            ],
+            "result_version_ids": [],
+            "error": None,
             "edit_mode": request.edit_mode,
             "affected_document_count": preview["affected_document_count"],
             "affected_location_count": preview["affected_location_count"],
@@ -2323,26 +2428,67 @@ def serialize_editor_generation_status(
     if operation is None:
         raise HTTPException(status_code=404, detail="Editor operation not found.")
 
+    preview_envelope = operation.preview_json or {}
+    preview = (
+        preview_envelope.get("preview", {})
+        if isinstance(preview_envelope, dict)
+        else {}
+    )
+    affected_document_ids = list(
+        preview_envelope.get("affected_document_ids", [])
+        if isinstance(preview_envelope, dict)
+        else []
+    )
+    affected_document_names = list(
+        preview_envelope.get("affected_document_names", [])
+        if isinstance(preview_envelope, dict)
+        else []
+    )
+    if not affected_document_ids and isinstance(preview, dict):
+        affected_document_ids = [
+            str(item.get("document_id"))
+            for item in preview.get("documents", [])
+            if item.get("document_id")
+        ]
+        affected_document_names = [
+            str(item.get("document_name", "Document"))
+            for item in preview.get("documents", [])
+            if item.get("document_id")
+        ]
     payload = {
+        "id": operation.id,
+        "job_id": operation.id,
         "operation_id": operation.id,
         "generation_id": operation.id,
         "status": operation.status,
+        "stage": operation.stage,
+        "submitted_at": utc_isoformat(operation.created_at),
+        "updated_at": utc_isoformat(operation.updated_at),
+        "completed_at": (
+            utc_isoformat(operation.completed_at)
+            if operation.completed_at is not None
+            else None
+        ),
+        "affected_document_ids": affected_document_ids,
+        "affected_documents": [
+            {"id": document_id, "name": document_name}
+            for document_id, document_name in zip(
+                affected_document_ids,
+                affected_document_names,
+            )
+        ],
+        "result_version_ids": [version.id for version in operation.versions],
+        "error": operation.error_detail,
         "edit_mode": operation.operation_type,
         "status_url": f"/api/editor-operations/{operation.id}",
     }
-    if operation.status == "failed":
+    if operation.status in {"failed", "interrupted"}:
         payload["error_detail"] = (
             operation.error_detail
             or "The background document update failed."
         )
         return payload
     if operation.status != "completed":
-        preview_envelope = operation.preview_json or {}
-        preview = (
-            preview_envelope.get("preview", {})
-            if isinstance(preview_envelope, dict)
-            else {}
-        )
         payload.update(
             {
                 "affected_document_count": preview.get(
@@ -2427,12 +2573,14 @@ def process_queued_editor_generation(operation_id: str) -> None:
         )
         if not isinstance(request_payload, dict):
             operation.status = "failed"
+            operation.stage = "failed"
             operation.error_detail = "The queued editor request is missing."
             operation.completed_at = utc_now()
             session.commit()
             return
 
         operation.status = "processing"
+        operation.stage = "preparing_documents"
         session.commit()
         try:
             request = EditorEditRequest.model_validate(request_payload)
@@ -2447,6 +2595,7 @@ def process_queued_editor_generation(operation_id: str) -> None:
             failed = session.get(EditorOperation, operation_id)
             if failed is not None:
                 failed.status = "failed"
+                failed.stage = "failed"
                 failed.error_detail = (
                     str(exc.detail)
                     if isinstance(exc, HTTPException)
@@ -2465,15 +2614,114 @@ def fail_interrupted_editor_generations(session: Session) -> int:
         )
     )
     for operation in interrupted:
-        operation.status = "failed"
+        operation.status = "interrupted"
+        operation.stage = "interrupted"
         operation.error_detail = (
             "DocSync restarted before this background update finished. "
-            "Review the current document and generate again."
+            "No document versions were changed. Review the current document "
+            "and retry the update when ready."
         )
         operation.completed_at = utc_now()
+        generated_root = settings.data_dir / "generated" / operation.document_set_id
+        shutil.rmtree(generated_root / f".{operation.id}.staging", ignore_errors=True)
+        shutil.rmtree(generated_root / operation.id, ignore_errors=True)
     if interrupted:
         session.commit()
     return len(interrupted)
+
+
+def submit_editor_generation(operation_id: str) -> None:
+    """Start a durable queued operation without extending the request lifetime."""
+
+    EDITOR_GENERATION_EXECUTOR.submit(process_queued_editor_generation, operation_id)
+
+
+def _commit_editor_generation_stage(
+    session: Session,
+    operation_id: str | None,
+    stage: str,
+) -> None:
+    if operation_id is None:
+        return
+    operation = session.get(EditorOperation, operation_id)
+    if operation is None:
+        raise HTTPException(status_code=404, detail="Generation job not found.")
+    operation.stage = stage
+    session.commit()
+
+
+def retry_editor_generation(session: Session, operation_id: str) -> dict:
+    operation = session.get(EditorOperation, operation_id)
+    if operation is None:
+        raise HTTPException(status_code=404, detail="Generation job not found.")
+    if operation.status not in {"failed", "interrupted"}:
+        raise HTTPException(
+            status_code=409,
+            detail="Only failed or interrupted generation jobs can be retried.",
+        )
+    envelope = operation.preview_json or {}
+    request_payload = envelope.get("request") if isinstance(envelope, dict) else None
+    if not isinstance(request_payload, dict):
+        raise HTTPException(
+            status_code=409,
+            detail="This generation job does not contain a safe retry request.",
+        )
+    request = EditorEditRequest.model_validate(request_payload)
+    return queue_editor_generation(
+        session,
+        operation.document_set_id,
+        request,
+        retry_of_operation_id=operation.id,
+    )
+
+
+def list_editor_generation_jobs(
+    session: Session,
+    document_set_id: str,
+    *,
+    limit: int = 50,
+) -> list[dict]:
+    if session.get(DocumentSet, document_set_id) is None:
+        raise HTTPException(status_code=404, detail="Document set not found.")
+    operation_ids = list(
+        session.scalars(
+            select(EditorOperation.id)
+            .where(
+                EditorOperation.document_set_id == document_set_id,
+                EditorOperation.operation_type != "version_restore",
+            )
+            .order_by(EditorOperation.created_at.desc())
+            .limit(limit)
+        )
+    )
+    return [
+        serialize_editor_generation_status(session, operation_id)
+        for operation_id in operation_ids
+    ]
+
+
+def list_recoverable_editor_generation_jobs(
+    session: Session,
+    *,
+    limit: int = 50,
+) -> list[dict]:
+    """Return jobs that still need global UI attention after startup."""
+
+    operation_ids = list(
+        session.scalars(
+            select(EditorOperation.id)
+            .where(
+                EditorOperation.status.in_(("queued", "processing", "interrupted")),
+                EditorOperation.operation_type != "version_restore",
+            )
+            .order_by(EditorOperation.created_at.desc())
+            .limit(limit)
+        )
+    )
+    return [
+        serialize_editor_generation_status(session, operation_id)
+        for operation_id in operation_ids
+    ]
 
 
 def generate_editor_versions(
@@ -2507,6 +2755,11 @@ def generate_editor_versions(
                     detail="An editor generation storage collision occurred. Try again.",
                 )
             staging_directory.mkdir(parents=False, exist_ok=False)
+            _commit_editor_generation_stage(
+                session,
+                queued_operation_id,
+                "applying_changes",
+            )
 
             by_document: dict[
                 str,
@@ -2551,6 +2804,12 @@ def generate_editor_versions(
                     "checksum": _sha256(payload),
                 }
 
+            _commit_editor_generation_stage(
+                session,
+                queued_operation_id,
+                "validating_generated_files",
+            )
+
             zip_path = staging_directory / "current-documents.zip"
             with zipfile.ZipFile(
                 zip_path,
@@ -2577,8 +2836,19 @@ def generate_editor_versions(
                         arcname=safe_download_name(document.original_name),
                     )
 
+            _commit_editor_generation_stage(
+                session,
+                queued_operation_id,
+                "saving_new_versions",
+            )
+
             staging_directory.replace(final_directory)
             staging_directory = None
+            _commit_editor_generation_stage(
+                session,
+                queued_operation_id,
+                "refreshing_workspace",
+            )
 
             operation = (
                 session.get(EditorOperation, operation_id)
@@ -2596,6 +2866,7 @@ def generate_editor_versions(
                     document_set_id=document_set_id,
                     operation_type=request.edit_mode,
                     status="completed",
+                    stage="completed",
                     source_element_id=request.source_element_id,
                     replacement_text=(
                         validated_targets[0][0].replacement_text
@@ -2608,6 +2879,7 @@ def generate_editor_versions(
                 session.add(operation)
             else:
                 operation.status = "completed"
+                operation.stage = "completed"
                 operation.preview_json = preview
                 operation.error_detail = None
                 operation.completed_at = utc_now()
@@ -2890,6 +3162,7 @@ def restore_document_version(
                 document_set_id=document.document_set_id,
                 operation_type="version_restore",
                 status="completed",
+                stage="completed",
                 expected_head_revision=head.revision,
                 preview_json={
                     "document_id": document.id,

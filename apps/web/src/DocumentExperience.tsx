@@ -18,7 +18,6 @@ import {
   fetchDocumentVersions,
   fetchDocumentView,
   fetchEditorContent,
-  fetchEditorGeneration,
   fetchElementMatches,
   fetchSimilarMatches,
   generateEdit,
@@ -85,6 +84,8 @@ interface DocumentExperienceProps {
   fallbackView: DocumentView | null;
   searchTarget: DocumentSearchTarget | null;
   onGenerated: (result: EditorGenerationResponse) => void;
+  generationJobs: EditorGenerationResponse[];
+  onGenerationQueued: (job: EditorGenerationResponse) => void;
   onDirtyChange: (dirty: boolean) => void;
 }
 
@@ -773,6 +774,8 @@ export default function DocumentExperience({
   fallbackView,
   searchTarget,
   onGenerated,
+  generationJobs,
+  onGenerationQueued,
   onDirtyChange,
 }: DocumentExperienceProps) {
   const activeVersionId =
@@ -855,14 +858,16 @@ export default function DocumentExperience({
   const matchRequestRef = useRef(0);
   const editorActionRequestRef = useRef(0);
   const editorActionAbortRef = useRef<AbortController | null>(null);
-  const generationPollAbortRef = useRef<AbortController | null>(null);
-  const onGeneratedRef = useRef(onGenerated);
+  const queuedGenerationSnapshotRef = useRef<{
+    jobId: string;
+    documentId: string;
+    content: EditorContentResponse | null;
+  } | null>(null);
   const selectBlockRef = useRef<
     (block: EditorBlock, skipDiscardConfirmation?: boolean) => void
   >(() => undefined);
 
   activeDocumentIdRef.current = document?.id ?? "";
-  onGeneratedRef.current = onGenerated;
   if (documentContextRef.current.documentId !== activeDocumentIdRef.current) {
     documentContextRef.current = {
       documentId: activeDocumentIdRef.current,
@@ -878,10 +883,35 @@ export default function DocumentExperience({
       editorActionRequestRef.current += 1;
       editorActionAbortRef.current?.abort();
       editorActionAbortRef.current = null;
-      generationPollAbortRef.current?.abort();
-      generationPollAbortRef.current = null;
     };
   }, []);
+
+  useEffect(() => {
+    if (!pendingGenerationId) return;
+    const job = generationJobs.find(
+      (candidate) => candidate.generation_id === pendingGenerationId,
+    );
+    if (!job) return;
+    setLastGeneration(job);
+    if (["queued", "processing"].includes(job.status)) return;
+
+    setPendingGenerationId("");
+    const snapshot = queuedGenerationSnapshotRef.current;
+    queuedGenerationSnapshotRef.current = null;
+    if (
+      ["failed", "interrupted"].includes(job.status) &&
+      snapshot?.jobId === job.generation_id &&
+      documentContextRef.current.documentId === snapshot.documentId
+    ) {
+      setEditorContent(snapshot.content);
+      setRefreshToken((current) => current + 1);
+      setLocalError(
+        job.error_detail ??
+          job.error ??
+          "Processing failed. No document versions were changed.",
+      );
+    }
+  }, [generationJobs, pendingGenerationId]);
 
   const selectedBlock = useMemo(
     () =>
@@ -953,6 +983,11 @@ export default function DocumentExperience({
     }
     setShowLayoutStructure(true);
   }, [activeViewStateKey, activeVersionId, document?.id, documentSet.id]);
+
+  useEffect(() => {
+    setPendingGenerationId("");
+    queuedGenerationSnapshotRef.current = null;
+  }, [document?.id]);
 
   useEffect(() => {
     if (!document) {
@@ -2050,12 +2085,17 @@ export default function DocumentExperience({
           : {}),
       };
     });
+    const targetDocumentIds = new Set(
+      chosenMatches.map((match) => match.document_id),
+    );
     return {
       base_versions: Object.fromEntries(
-        documentSet.documents.map((item) => [
-          item.id,
-          item.current_version_id ?? item.version_id,
-        ]),
+        documentSet.documents
+          .filter((item) => targetDocumentIds.has(item.id))
+          .map((item) => [
+            item.id,
+            item.current_version_id ?? item.version_id,
+          ]),
       ),
       source_element_id: selectedBlock.element_id,
       edit_mode: editMode,
@@ -2090,7 +2130,6 @@ export default function DocumentExperience({
       validTargets &&
       hasChangedOperation &&
       matchStatus === "ready" &&
-      !pendingGenerationId &&
       !action,
   );
   const canGenerate = Boolean(
@@ -2199,12 +2238,17 @@ export default function DocumentExperience({
         }
 
         const previousEditorContent = editorContent;
-        const documentContextToken = documentContextRef.current.token;
         const optimisticTarget = operation.targets.find(
           (target) => target.element_id === selectedBlock.element_id,
         );
         setPendingGenerationId(queued.generation_id);
         setLastGeneration(queued);
+        queuedGenerationSnapshotRef.current = {
+          jobId: queued.generation_id,
+          documentId: documentContextRef.current.documentId,
+          content: previousEditorContent,
+        };
+        onGenerationQueued(queued);
         setPreview(null);
         setPreviewOpen(false);
         setPreviewSignature("");
@@ -2234,11 +2278,6 @@ export default function DocumentExperience({
               : current,
           );
         }
-        void reconcileQueuedGeneration(
-          queued.generation_id,
-          previousEditorContent,
-          documentContextToken,
-        );
         return;
       } catch (error) {
         if (controller.signal.aborted) return;
@@ -2303,10 +2342,10 @@ export default function DocumentExperience({
         return;
       }
       if (error instanceof ApiError && error.status === 409) {
-        setLocalError(
-          `${document?.name ?? "Document"} changed before generation. No version was created. The latest version is being reloaded.`,
-        );
-        setRefreshToken((current) => current + 1);
+        setLocalError(error.message);
+        if (!error.message.includes("background update in progress")) {
+          setRefreshToken((current) => current + 1);
+        }
       } else {
         setLocalError(
           `${document?.name ?? "Document"} · ${locationLabel(
@@ -2324,65 +2363,6 @@ export default function DocumentExperience({
         }
         setAction(null);
       }
-    }
-  }
-
-  async function reconcileQueuedGeneration(
-    generationId: string,
-    previousEditorContent: EditorContentResponse | null,
-    documentContextToken: number,
-  ) {
-    generationPollAbortRef.current?.abort();
-    const controller = new AbortController();
-    generationPollAbortRef.current = controller;
-
-    while (!controller.signal.aborted && mountedRef.current) {
-      await new Promise<void>((resolve) => {
-        window.setTimeout(resolve, 500);
-      });
-      if (controller.signal.aborted || !mountedRef.current) return;
-
-      let result: EditorGenerationResponse;
-      try {
-        result = await fetchEditorGeneration(
-          generationId,
-          controller.signal,
-        );
-      } catch (error) {
-        if (controller.signal.aborted) return;
-        // A transient polling failure must not turn a safely queued update
-        // into a user-visible failure. Keep reconciling in the background.
-        continue;
-      }
-
-      if (result.status === "queued" || result.status === "processing") {
-        setLastGeneration(result);
-        continue;
-      }
-
-      setPendingGenerationId("");
-      generationPollAbortRef.current = null;
-      if (result.status === "completed") {
-        setLastGeneration(result);
-        onGeneratedRef.current(result);
-        if (documentContextRef.current.token === documentContextToken) {
-          setSelectedElementId("");
-          setDraft(null);
-          setMatches([]);
-          setIncludedElementIds(new Set());
-          setRefreshToken((current) => current + 1);
-        }
-      } else {
-        if (documentContextRef.current.token === documentContextToken) {
-          setEditorContent(previousEditorContent);
-        }
-        setLastGeneration(result);
-        setLocalError(
-          result.error_detail ??
-            "The update could not be completed. Your documents were not changed.",
-        );
-      }
-      return;
     }
   }
 
@@ -2824,7 +2804,7 @@ export default function DocumentExperience({
               block={selectedBlock}
               value={draft?.delta ?? null}
               resetToken={editorResetToken}
-              disabled={Boolean(pendingGenerationId)}
+              disabled={action === "generate"}
               onChange={handleDraftChange}
             />
             <div className="structured-document-heading">
@@ -3383,9 +3363,9 @@ export default function DocumentExperience({
                   disabled={!canGenerate}
                 >
                   {action === "generate"
-                    ? "Accepting update…"
+                    ? "Submitting…"
                     : pendingGenerationId
-                      ? "Update accepted — processing…"
+                      ? "Processing in background"
                       : "Generate new versions"}
                 </button>
               </div>

@@ -85,17 +85,21 @@ test("large editor lists render progressively with memoized cards", () => {
   assert.match(experience, /Show next/);
 });
 
-test("generation is accepted optimistically and reconciled in the background", () => {
+test("generation is accepted immediately and reconciled by the application shell", () => {
   const experience = read("apps/web/src/DocumentExperience.tsx");
+  const app = read("apps/web/src/App.tsx");
   const api = read("apps/web/src/api.ts");
 
   assert.match(api, /editor-generate-async/);
-  assert.match(api, /editor-operations\/\$\{operationId\}/);
+  assert.match(api, /generation-jobs\/\$\{operationId\}/);
+  assert.match(api, /document-sets\/\$\{documentSetId\}\/generation-jobs/);
   assert.match(experience, /await queueEditorEdit\(/);
   assert.match(experience, /setPendingGenerationId\(queued\.generation_id\)/);
   assert.match(experience, /optimisticTarget\.replacement_text/);
-  assert.match(experience, /reconcileQueuedGeneration/);
-  assert.match(experience, /fetchEditorGeneration\(/);
+  assert.match(experience, /onGenerationQueued\(queued\)/);
+  assert.match(app, /fetchEditorGeneration\(jobId/);
+  assert.match(app, /processing-indicator/);
+  assert.match(app, /A newer version of this document is available/);
   assert.match(experience, /Update accepted/);
   assert.match(experience, /creating and validating the Word versions in the background/);
 });
