@@ -7,6 +7,7 @@ from difflib import SequenceMatcher
 from io import BytesIO
 import hashlib
 import json
+import logging
 import math
 from pathlib import Path
 import re
@@ -49,6 +50,9 @@ from .schemas import (
     QuillDelta,
     VersionRestoreRequest,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 BODY_STYLE_PATTERN = re.compile(r"^body_order:(\d+):(.*)$", re.DOTALL)
@@ -104,6 +108,22 @@ UNSUPPORTED_XML_TAGS = {
     qn("w:footnoteReference"): "Footnote reference",
     qn("w:endnoteReference"): "Endnote reference",
 }
+
+
+def _queue_previews_safely(session: Session, version_ids: list[str]) -> list[dict]:
+    """Preview failure must never roll back a committed immutable version."""
+
+    try:
+        from .preview_job_service import queue_generated_version_previews
+
+        return queue_generated_version_previews(session, version_ids)
+    except Exception:
+        session.rollback()
+        logger.exception(
+            "docsync.post_generation_preview_queue.failed versions=%s",
+            ",".join(version_ids),
+        )
+        return []
 
 
 def _header_footer_type(kind: str, variant: str) -> str:
@@ -3326,6 +3346,11 @@ def generate_editor_versions(
             session.commit()
             committed = True
 
+            preview_jobs = _queue_previews_safely(
+                session,
+                [item["version_id"] for item in response_versions],
+            )
+
             refreshed = serialize_document_set(
                 get_document_set_or_404(session, document_set_id)
             )
@@ -3350,6 +3375,7 @@ def generate_editor_versions(
                 "download_url": (
                     f"/api/editor-operations/{operation.id}/download"
                 ),
+                "preview_jobs": preview_jobs,
                 "document_set": refreshed,
             }
         except Exception:
@@ -3551,6 +3577,8 @@ def restore_document_version(
             session.commit()
             committed = True
 
+            preview_jobs = _queue_previews_safely(session, [version.id])
+
             return {
                 "operation_id": operation.id,
                 "generation_id": operation.id,
@@ -3585,6 +3613,7 @@ def restore_document_version(
                     "element_ids_by_location": location_to_element,
                 },
                 "download_url": f"/api/editor-operations/{operation.id}/download",
+                "preview_jobs": preview_jobs,
                 "document_set": refreshed,
             }
         except Exception:

@@ -79,6 +79,11 @@ def init_db() -> None:
                 name="header_footer_paragraph_foundation",
                 apply=_migrate_header_footer_paragraph_foundation,
             ),
+            WorkspaceMigration(
+                version=5,
+                name="durable_preview_render_jobs",
+                apply=_migrate_preview_render_jobs,
+            ),
         ),
         report_stage=report_stage,
     )
@@ -830,6 +835,23 @@ def _migrate_header_footer_paragraph_foundation(session: Session) -> None:
     """
 
     _migrate_table_paragraph_foundation(session)
+
+
+def _migrate_preview_render_jobs(session: Session) -> None:
+    """Normalise durable preview jobs created by pre-release v1.8 builds."""
+
+    connection = session.connection()
+    table_exists = connection.exec_driver_sql(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'preview_render_jobs'"
+    ).first()
+    if table_exists is None:
+        return
+    connection.exec_driver_sql(
+        "UPDATE preview_render_jobs SET status = 'failed', stage = 'failed', "
+        "error_detail = 'DocSync restarted before this preview finished. Retry the preview.' "
+        "WHERE status IN ('queued', 'processing')"
+    )
 
 
 def get_session() -> Generator[Session, None, None]:

@@ -11,6 +11,7 @@ a = Analysis(
     binaries=[],
     datas=collect_data_files("docx"),
     hiddenimports=[
+        "pymupdf",
         "sqlalchemy.dialects.sqlite",
         "uvicorn.lifespan.on",
         "uvicorn.logging",

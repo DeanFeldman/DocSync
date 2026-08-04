@@ -57,6 +57,9 @@ class Settings:
     session_token: str
     near_match_threshold: float
     near_match_candidate_limit: int
+    render_map_confidence_threshold: float
+    render_map_dpi: int
+    render_map_max_pages: int
 
 
 def _build_settings() -> Settings:
@@ -113,6 +116,24 @@ def _build_settings() -> Settings:
             25,
             minimum=1,
             maximum=500,
+        ),
+        render_map_confidence_threshold=_bounded_float_env(
+            "DOCUMENTSYNC_RENDER_MAP_CONFIDENCE_THRESHOLD",
+            0.90,
+            minimum=0.5,
+            maximum=1.0,
+        ),
+        render_map_dpi=_bounded_int_env(
+            "DOCUMENTSYNC_RENDER_MAP_DPI",
+            144,
+            minimum=72,
+            maximum=300,
+        ),
+        render_map_max_pages=_bounded_int_env(
+            "DOCUMENTSYNC_RENDER_MAP_MAX_PAGES",
+            500,
+            minimum=1,
+            maximum=2000,
         ),
     )
 

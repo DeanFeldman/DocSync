@@ -68,6 +68,107 @@ export interface LayoutElementRegion {
   confidence?: number;
 }
 
+export type RenderMapStatus =
+  | "not_requested"
+  | "queued"
+  | "processing"
+  | "completed"
+  | "partial"
+  | "failed";
+
+export interface RenderMapPage {
+  page_id: string;
+  page_number: number;
+  page_width: number;
+  page_height: number;
+  width: number;
+  height: number;
+  aspect_ratio: number;
+  image_width: number;
+  image_height: number;
+  image_url: string;
+  coordinate_unit: "normalised";
+  render_version: string;
+}
+
+export interface RenderMapRegion extends LayoutElementRegion {
+  region_id: string;
+  region_index: number;
+  render_id?: string | null;
+  element_type: string;
+  text_preview: string;
+  location: Record<string, unknown>;
+  confidence: number;
+  mapping_method: string;
+  interactive: boolean;
+  supported: boolean;
+  read_only: boolean;
+  reason?: string | null;
+  read_only_reason?: string | null;
+}
+
+export interface RenderMapResponse {
+  schema_version: number;
+  version_id: string;
+  document_id: string;
+  document_set_id: string;
+  status: RenderMapStatus;
+  status_detail: string;
+  map_engine: string;
+  mapper: string;
+  mapper_version: string;
+  pdf_engine: string;
+  coordinate_unit: "normalised";
+  source_sha256?: string | null;
+  pdf_sha256?: string | null;
+  interactive_threshold: number;
+  render_id?: string | null;
+  render_version?: string | null;
+  page_count: number;
+  pages: RenderMapPage[];
+  regions: RenderMapRegion[];
+  mapped_element_count: number;
+  interactive_element_count: number;
+  total_element_count: number;
+  unmapped: Array<{
+    element_id: string;
+    element_type: string;
+    reason: string;
+  }>;
+  generated_at?: string | null;
+}
+
+export type PreviewRenderStage =
+  | "queued"
+  | "starting_microsoft_word"
+  | "opening_document"
+  | "rendering_pdf"
+  | "displaying_document"
+  | "preparing_selectable_text"
+  | "ready_to_edit"
+  | "failed"
+  | string;
+
+export interface PreviewRenderJobResponse {
+  job_id: string;
+  document_id: string;
+  version_id: string;
+  status: "queued" | "processing" | "completed" | "failed" | string;
+  stage: PreviewRenderStage;
+  pdf_ready: boolean;
+  render_map_ready: boolean;
+  render_map_status: RenderMapStatus;
+  cache_hit: boolean;
+  created_at: string;
+  updated_at: string;
+  completed_at?: string | null;
+  error?: string | null;
+  status_url: string;
+  preview_url: string;
+  render_map_url: string;
+  retry_allowed: boolean;
+}
+
 export interface DocumentView {
   document_id: string;
   version_id: string;
@@ -79,6 +180,8 @@ export interface DocumentView {
   page_count: number;
   notice: string;
   pdf_url?: string;
+  render_map_status?: RenderMapStatus;
+  render_map_url?: string;
   pages: ViewerPage[];
   layout_regions?: LayoutElementRegion[];
 }
