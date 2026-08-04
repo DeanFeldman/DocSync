@@ -39,7 +39,7 @@ test("structured Layout selection uses the central version-safe editor path", ()
     experience,
     /options\.sourceVersionId !== editorContent\.version_id/,
   );
-  assert.match(experience, /selectBlock\(\s*block,/);
+  assert.match(experience, /selectBlock\(block,/);
   assert.match(experience, /aria-pressed=\{selected\}/);
   assert.match(experience, /setWorkspaceMode\("edit"\)/);
   assert.match(experience, /focusEditorForElement\(block\.element_id\)/);

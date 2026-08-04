@@ -52,55 +52,15 @@ Returns the current document set, its documents, extracted-element counts, and e
 
 Each document includes a `version_id` and `view_url` for the immutable uploaded version.
 
-## Preview-render endpoints
+## `POST /documents/{document_id}/render`
 
-```text
-POST /document-versions/{version_id}/preview-jobs
-GET  /preview-jobs/{job_id}
-GET  /document-versions/{version_id}/preview
-GET  /document-versions/{version_id}/rendered-file
-GET  /document-versions/{version_id}/render-map
-GET  /document-versions/{version_id}/render-pages/{render_id}/{page_number}.png
-```
 Exports the current immutable DOCX version to a cached PDF through Microsoft
 Word, queues coordinate extraction, and returns the PDF URL, render-map status
 and URL, and structured element payload. PDF viewing does not wait for the map.
 
-The POST returns `202 Accepted` before Word conversion. A representative job is:
+## `GET /document-versions/{version_id}/rendered-file`
 
-```json
-{
-  "job_id": "uuid",
-  "document_id": "uuid",
-  "version_id": "uuid",
-  "status": "processing",
-  "stage": "rendering_pdf",
-  "pdf_ready": false,
-  "render_map_ready": false,
-  "render_map_status": "not_requested",
-  "cache_hit": false,
-  "error": null
-}
-```
-
-Stages are `queued`, `starting_microsoft_word`, `opening_document`,
-`rendering_pdf`, `displaying_document`, `preparing_selectable_text`,
-`ready_to_edit`, and `failed`. `pdf_ready` permits the client to fetch the
-preview immediately; it must not wait for `render_map_ready`.
-
-The render map reports normalized page regions with render/version/element
-identity, type, text preview, location, confidence, mapping method,
-`interactive`, `read_only`, and reason fields. During `processing`, `pages` may
-already contain controlled PNG URLs while `regions` is still empty. Completed
-and partial maps may contain both interactive and explained read-only regions.
-
-`GET rendered-file` never starts Word. It returns the cached immutable PDF only
-after a background job has created it. The legacy synchronous render endpoint
-is retained for compatibility, but v1.8 Layout uses preview jobs.
-
-## `POST /documents/{document_id}/render` (compatibility)
-
-Exports the current working DOCX version to a cached PDF through Microsoft Word and returns both the PDF URL and the structured element payload. Applying an edit invalidates the affected PDF cache before the browser refreshes it.
+Returns the Microsoft Word-generated PDF inline for the high-fidelity layout tab.
 
 ## `GET /document-versions/{version_id}/render-map`
 

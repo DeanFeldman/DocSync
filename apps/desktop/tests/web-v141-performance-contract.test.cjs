@@ -55,16 +55,14 @@ test("Word preview, near matching, and version history are explicit lazy resourc
     "function setWorkspaceMode",
   );
 
-  assert.match(wordPreviewHandler, /createPreviewJob\(activeVersionId/);
-  assert.match(wordPreviewHandler, /fetchPreviewJob\(job\.job_id/);
-  assert.match(wordPreviewHandler, /fetchWordPreview\(activeVersionId/);
+  assert.match(wordPreviewHandler, /renderDocumentView\(activeVersionId\)/);
   assert.match(experience, /Load Word Preview/);
   assert.match(experience, /Retry Word Preview/);
   assert.match(experience, /onToggle=\{\(event\) =>/);
   assert.match(experience, /setHistoryRequested\(true\)/);
   assert.match(
     experience,
-    /loadNearMatches\s*\?\s*loadWorkspaceResource\(/,
+    /mode === "compare"\s*\?\s*loadWorkspaceResource\(/,
   );
   assert.match(experience, /fetchSimilarMatches\(selectedBlock!/);
   assert.doesNotMatch(experience, /compareDocumentElements/);

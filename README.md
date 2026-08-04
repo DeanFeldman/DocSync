@@ -33,32 +33,6 @@ DocSync-Setup-latest.exe
 
 ## Version 1.8.0
 
-DocSync `v1.8.0` turns the high-fidelity Word layout into a controlled inline
-editing workspace. **Load Word Preview** now creates a durable background job
-and returns control immediately. Microsoft Word rendering is serialized for COM
-safety, immutable-version PDF caches are reused, controlled page images appear
-before coordinate matching finishes, and visible or nearby pages are mounted
-first.
-
-Reliable page-relative regions can be focused or clicked without leaving
-**Layout**. A restricted Quill editor appears over the selected paragraph and
-places its caret near the activation point. Its draft, formatting, Undo/Redo,
-exact and near matches, edit mode, targets, preview, and background generation
-all use the existing operation state in the right sidebar. The loaded PDF is a
-fixed snapshot; Microsoft Word recalculates final wrapping and pagination after
-generation, then DocSync queues a fresh preview and render map for the new
-immutable version.
-
-Ambiguous mappings are deliberately not interactive. Fields, drawings, images,
-text boxes, watermarks, and other unsafe structures remain preserved and
-read-only. **Select from structure** and the structured **Edit** view remain the
-safe fallback and advanced diagnostic surface.
-
-See [the v1.8.0 release notes](docs/v1.8.0-release-notes.md),
-[inline-layout requirements](docs/v1.8.0-inline-layout-editing-requirements.md),
-and [manual test plan](docs/v1.8.0-manual-testing.md).
-
----
 DocSync `v1.8.0` adds direct, confidence-gated selection to the high-fidelity
 Microsoft Word preview. After Word exports the immutable version to PDF,
 DocSync prepares a versioned coordinate map in the background. Reliable body,
@@ -223,14 +197,9 @@ DocSync provides three document workspace modes.
 #### Layout
 
 - Displays the selectable structured document immediately.
-- Queues Microsoft Word rendering after **Load Word Preview** and keeps the
-  workspace responsive while named stages progress.
+- Generates a read-only Microsoft Word preview only after the explicit
+  **Load Word Preview** action.
 - Reuses the Word preview for the same immutable document version.
-- Displays controlled PDF page images before selectable coordinates finish.
-- Lets users click supported text, place a cursor, and edit the paragraph
-  directly without leaving Layout.
-- Reuses the complete operation sidebar for formatting, exact and near matches,
-  target selection, preview, and generation.
 - Selects reliably mapped body, list, table, header, and footer blocks directly
   from the high-fidelity Word preview.
 - Keeps normalised overlays aligned during zoom, fitting, scrolling, and
@@ -239,7 +208,8 @@ DocSync provides three document workspace modes.
   editable/read-only labels.
 - Opens supported structured Layout blocks directly in the editor.
 - Shows unsupported or preserved Word structures as read-only with a reason.
-- Provides **Select from structure** when a coordinate is missing or uncertain.
+- Uses the selectable structured view as the safe fallback when reliable
+  rendered-page coordinates are unavailable.
 - Preserves the original document as the authoritative layout reference.
 
 #### Edit
@@ -249,7 +219,6 @@ DocSync provides three document workspace modes.
 - Labels header/footer blocks by section, part type, and paragraph and explains
   when linked sections share the same physical Word part.
 - Uses Quill 2 for structured rich-text editing.
-- Remains available as a safe fallback and advanced mapping diagnostic view.
 - Supports selected formatting metadata, including:
   - bold
   - italic
@@ -329,15 +298,6 @@ DocSync is designed around controlled document editing.
 
 1. Create a document set.
 2. Upload related Microsoft Word documents.
-3. Open a document in **Layout** and choose **Load Word Preview**.
-4. Continue working while Microsoft Word renders in the background.
-5. Click a reliable selectable area and edit it directly over the Word layout.
-6. Use the right sidebar to format text and review exact and near matches.
-7. Choose the editing mode and intended targets.
-8. Preview the complete result.
-9. Generate new immutable versions in the background.
-10. Review the rerendered Word layout, or use structured **Edit** as a fallback.
-11. Download or restore versions when needed.
 3. Open a document in **Layout** or **Edit**.
 4. In **Layout**, load the Word preview and select a reliably mapped region, or
    choose **Select from structure** when a coordinate is unavailable.
@@ -359,7 +319,6 @@ DocSync is designed around controlled document editing.
 - **Installer:** Electron Builder and NSIS
 - **Frontend:** React, TypeScript, Vite, and Quill 2
 - **Backend:** FastAPI and Python
-- **Document processing:** `python-docx` and PyMuPDF
 - **Document processing:** `python-docx`
 - **PDF coordinate mapping:** PyMuPDF
 - **Database:** SQLAlchemy with SQLite
@@ -401,9 +360,6 @@ The backend reads configuration from environment variables.
 | `DOCUMENTSYNC_MAX_FILES_PER_SET` | `20` | Maximum documents in a set |
 | `DOCUMENTSYNC_NEAR_MATCH_THRESHOLD` | `0.82` | Minimum near-match similarity score |
 | `DOCUMENTSYNC_NEAR_MATCH_CANDIDATE_LIMIT` | `25` | Maximum near-match candidates inspected |
-| `DOCUMENTSYNC_RENDER_MAP_CONFIDENCE_THRESHOLD` | `0.90` | Minimum confidence for an interactive layout region |
-| `DOCUMENTSYNC_RENDER_MAP_DPI` | `144` | Controlled preview page-image resolution |
-| `DOCUMENTSYNC_RENDER_MAP_MAX_PAGES` | `500` | Maximum pages accepted by one render-map job |
 | `DOCUMENTSYNC_CORS_ORIGINS` | Local Vite origins | Allowed browser-development origins |
 
 See [`.env.example`](.env.example) for a local development template.
@@ -416,9 +372,8 @@ not rerun the version/block-revision backfill. No manual migration command is
 normally required.
 
 Schema migration 2 introduced paragraph-level table mappings, schema migration
-3 added durable background-job progress fields, schema migration 4 reparses all
-immutable versions to add deduplicated, section-aware header/footer blocks, and
-schema migration 5 adds durable preview-render jobs.
+3 added durable background-job progress fields, and schema migration 4 reparses
+all immutable versions to add deduplicated, section-aware header/footer blocks.
 
 If migration fails, the active database is restored automatically and the
 startup dialog shows the workspace and recovery-backup paths. Do not move or
@@ -675,18 +630,12 @@ http://localhost:8001/docs
 - High-fidelity layout rendering works best when Microsoft Word desktop is installed.
 - High-fidelity Word rendering is intentionally on demand; the structured
   Layout view remains available when Word is missing or a preview fails.
-- The PDF is a fixed visual snapshot and is never modified. Final Word line
-  wrapping and pagination appear after a new version is generated and rerendered.
-- Low-confidence or ambiguous PDF text mappings remain unavailable for inline
-  editing rather than risking selection of the wrong block.
 - Header and footer text is editable only when its physical Word paragraph can
   be mapped and rewritten safely.
 - Page numbers, page counts, dates, document-property fields, cross-references,
   and other complex fields remain preserved and read-only.
 - Header/footer images, logos, watermarks, shapes, text boxes, content controls,
   and nested tables remain preserved and read-only.
-- Direct inline editing is limited to reliable mapped paragraphs. Adding,
-  deleting, splitting, merging, or moving paragraphs is not supported.
 - Direct preview selection depends on reliable PDF text-coordinate extraction.
   Complex, ambiguous, or unmatched Word content may remain unmapped.
 - The PDF is a selection surface, not an in-place editor. All changes continue
@@ -709,7 +658,6 @@ Planned work includes:
 - Hosted authentication
 - PostgreSQL
 - Cloud storage and synchronisation
--- find and replace
 ---
 
 ## Contributing
