@@ -65,7 +65,14 @@ def cached_word_preview(
     cache = _cache(session, version)
     if cache is None:
         return None, "legacy"
+
     payload = _payload(cache.word_preview_json)
+
+    # A structured-preview cache entry may exist before the first Word preview
+    # is stored. Treat an existing valid PDF as a legacy preview so it can be
+    # parsed and cached without requiring Microsoft Word to render it again.
+    if payload is None:
+        return None, "legacy"
     try:
         identity = source_identity(version)
         pdf_stat = pdf_path.stat()
