@@ -2,9 +2,11 @@
 
 DocSync uses two complementary document surfaces:
 
-- **Layout** renders the current immutable DOCX version through Microsoft Word when
-  Word is available. It is read-only and remains the source of truth for pagination
-  and unsupported Word objects.
+- **Layout** renders the current immutable DOCX version through Microsoft Word
+  when Word is available. It remains the source of truth for pagination and
+  unsupported Word objects. Reliably mapped text regions form a selection-only
+  overlay; edits still occur exclusively in Edit. Structured selection remains
+  available when the map is partial, failed, or unavailable.
 - **Edit** exposes supported headings, body paragraphs, list items, individual
   paragraphs in supported top-level table cells, and safely mapped header and
   footer paragraphs as version-scoped structured blocks. One selected block is
@@ -49,6 +51,32 @@ Every version owns immutable `DocumentBlockRevision` snapshots. A snapshot recor
 
 Generated versions receive new current element IDs. Historical snapshots retain
 their original IDs for audit and download purposes.
+
+## High-fidelity preview selection
+
+After Microsoft Word exports the selected immutable version to PDF, DocSync
+queues a PyMuPDF worker. It extracts words, line bounds, page dimensions, and
+page images, then matches immutable block revisions using full-line text,
+element/story context, page band, duplicate cardinality, document order, and
+overlap rejection. The JSON result is bound to the version, source and PDF
+hashes, render/mapper engines, page count, and render ID.
+
+Page-relative coordinates are normalised. A wrapped or cross-page block owns
+several regions with the same element ID. The controlled viewer renders each
+region as a keyboard-focusable HTML button over the exact page-image box, so
+zoom and responsive resizing change the page and region geometry together.
+Visible/nearby pages are mounted first.
+
+Only a supported match at or above
+`DOCUMENTSYNC_RENDER_MAP_CONFIDENCE_THRESHOLD` (default `0.90`) is interactive.
+Reliably located unsupported blocks retain a focusable read-only region and
+reason. Ambiguous, overlapping, or missing candidates have no clickable target.
+The Word PDF remains visible while mapping runs or if it fails.
+
+Region activation calls the same `selectElementById` path as structured Layout
+and search. That path validates the displayed version, document ID, immutable
+block membership, and supported state, then runs normal draft protection before
+switching to Edit and focusing Quill. No mutation occurs in the PDF surface.
 
 ## Header/footer paragraph mapping
 
@@ -185,6 +213,8 @@ version intact.
 
 ```text
 GET  /api/document-versions/{version_id}/editor-content
+GET  /api/document-versions/{version_id}/render-map
+GET  /api/document-versions/{version_id}/render-pages/{render_id}/{page}.png
 GET  /api/document-elements/{element_id}/matches
 GET  /api/document-elements/{element_id}/similar-matches
 POST /api/document-elements/{element_id}/compare
@@ -227,34 +257,6 @@ Read-only or diagnostic-only:
 - structural block insertion, deletion, split, merge, and reorder operations.
 
 Unsupported content remains in the source DOCX and stays visible in Layout mode.
-
-## v1.8 inline Layout editor
-
-The Word-layout surface now uses controlled page images and normalized HTML
-regions rather than a native PDF iframe. A reliable region selects the exact
-versioned `element_id` while Layout stays active. All regions for that block are
-highlighted and a single restricted Quill instance covers the clicked page
-region. Its initial selection is estimated from clicked line and horizontal
-position.
-
-The inline instance consumes and publishes the same `QuillDraft` as structured
-Edit. Formatting commands in the operation sidebar are sent to the active
-instance; Quill then publishes the resulting Delta back to the shared draft.
-Changing a block resets history, while Escape pauses inline typing and restores
-focus to the selected region.
-
-Structural safeguards remain identical to the structured editor: Enter is
-rejected, multiline paste is flattened, unsupported attributes are sanitized
-by the backend, and generation revalidates every element/version/head. The PDF
-is explicitly a fixed snapshot. Longer drafts warn about possible wrapping,
-and only a generated DOCX plus fresh Word render supplies authoritative final
-pagination.
-
-The Layout sidebar exposes source/version/location context, formatting,
-Undo/Redo, exact targets, near-match score/differences/decisions, editing modes,
-preview, and background generation. If coordinates are missing or uncertain,
-**Select from structure** opens the established structured fallback instead of
-guessing.
 
 ## Validation
 

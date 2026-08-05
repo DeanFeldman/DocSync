@@ -27,7 +27,6 @@ RENDER_MAP_SCHEMA_VERSION = 1
 RENDER_MAP_ENGINE = "docsync-contextual-pdf-map-v1"
 WORD_RENDER_ENGINE = "Microsoft Word ExportAsFixedFormat PDF"
 TOKEN_PATTERN = re.compile(r"\w+", re.UNICODE)
-RENDER_ID_PATTERN = re.compile(r"^[a-f0-9]{24}$")
 RENDER_MAP_EXECUTOR = ThreadPoolExecutor(
     max_workers=2,
     thread_name_prefix="docsync-render-map",
@@ -68,7 +67,12 @@ def _normalise_tokens(value: str) -> tuple[str, ...]:
 
 
 def _cache_path(document_set_id: str, version_id: str) -> Path:
-    return settings.data_dir / "renders" / document_set_id / f"{version_id}.render-map.json"
+    return (
+        settings.data_dir
+        / "renders"
+        / document_set_id
+        / f"{version_id}.render-map.json"
+    )
 
 
 def _pdf_path(document_set_id: str, version_id: str) -> Path:
@@ -76,11 +80,11 @@ def _pdf_path(document_set_id: str, version_id: str) -> Path:
 
 
 def _source_path(version: DocumentVersion) -> Path:
-    roots = {
+    allowed = {
         "originals": settings.data_dir / "originals",
         "generated": settings.data_dir / "generated",
     }
-    root = roots.get(version.storage_area)
+    root = allowed.get(version.storage_area)
     if root is None:
         raise HTTPException(status_code=500, detail="Document version storage is invalid.")
     path = (root / version.storage_name).resolve()
@@ -111,16 +115,17 @@ def _context_for_version(version: DocumentVersion) -> _RenderContext | None:
     if not pdf_path.is_file() or pdf_path.stat().st_size == 0:
         return None
     source_path = _source_path(version)
-    pdf_stat = pdf_path.stat()
+    stat = pdf_path.stat()
+    source_sha256 = version.checksum_sha256 or _sha256_file(source_path)
     return _RenderContext(
         version_id=version.id,
         document_id=version.document_id,
         document_set_id=document.document_set_id,
         source_path=source_path,
-        source_sha256=version.checksum_sha256 or _sha256_file(source_path),
+        source_sha256=source_sha256,
         pdf_path=pdf_path,
-        pdf_size=pdf_stat.st_size,
-        pdf_mtime_ns=pdf_stat.st_mtime_ns,
+        pdf_size=stat.st_size,
+        pdf_mtime_ns=stat.st_mtime_ns,
         cache_path=_cache_path(document.document_set_id, version.id),
         blocks=tuple(_serialise_block(block) for block in version.blocks),
     )
@@ -182,7 +187,6 @@ def _status_payload(context: _RenderContext, status: str, detail: str) -> dict:
         "pdf_mtime_ns": context.pdf_mtime_ns,
         "interactive_threshold": settings.render_map_confidence_threshold,
         "render_id": None,
-        "render_version": None,
         "page_count": 0,
         "pages": [],
         "regions": [],
@@ -195,6 +199,8 @@ def _status_payload(context: _RenderContext, status: str, detail: str) -> dict:
 
 
 def _public_payload(payload: dict) -> dict:
+    # File-system fingerprints are internal cache validators. The cryptographic
+    # source/PDF identities and immutable version identity remain public.
     return {
         key: value
         for key, value in payload.items()
@@ -214,7 +220,7 @@ def request_render_map(session: Session, version_id: str) -> dict:
             "document_id": version.document_id,
             "document_set_id": version.document.document_set_id,
             "status": "not_requested",
-            "status_detail": "Load the Word preview to create selectable areas.",
+            "status_detail": "Generate the Word layout preview to create selectable areas.",
             "map_engine": RENDER_MAP_ENGINE,
             "mapper": "PyMuPDF",
             "mapper_version": pymupdf.__version__,
@@ -224,7 +230,6 @@ def request_render_map(session: Session, version_id: str) -> dict:
             "pdf_sha256": None,
             "interactive_threshold": settings.render_map_confidence_threshold,
             "render_id": None,
-            "render_version": None,
             "page_count": 0,
             "pages": [],
             "regions": [],
@@ -252,7 +257,7 @@ def request_render_map(session: Session, version_id: str) -> dict:
         queued = _status_payload(
             context,
             "queued",
-            "The PDF is ready. Page images and selectable text are queued.",
+            "The PDF is ready. Selectable areas are queued for background processing.",
         )
         _write_cache(context.cache_path, queued)
         RENDER_MAP_EXECUTOR.submit(_generate_render_map, context, key)
@@ -283,11 +288,7 @@ def _candidate_context(block: dict, tokens: list[dict], start: int, end: int) ->
     return True
 
 
-def _find_candidates(
-    block: dict,
-    tokens: list[dict],
-    by_value: dict[str, list[int]],
-) -> list[tuple[int, int]]:
+def _find_candidates(block: dict, tokens: list[dict], by_value: dict[str, list[int]]) -> list[tuple[int, int]]:
     wanted = _normalise_tokens(block["text"])
     if not wanted:
         return []
@@ -298,6 +299,8 @@ def _find_candidates(
             continue
         if tuple(token["value"] for token in tokens[start:end]) != wanted:
             continue
+        # A selection may wrap across lines/pages, but may not start or end in
+        # the middle of another line. This prevents substring-only matches.
         first = tokens[start]
         last = tokens[end - 1]
         if start > 0:
@@ -330,6 +333,7 @@ def _find_candidates(
 
 
 def _group_key(block: dict) -> tuple:
+    location = block["location"]
     element_type = block["element_type"]
     context = (
         "header"
@@ -341,17 +345,15 @@ def _group_key(block: dict) -> tuple:
     return (
         _normalise_tokens(block["text"]),
         context,
-        str(block["location"].get("header_footer_type") or ""),
+        str(location.get("header_footer_type") or ""),
     )
 
 
-def _match_blocks(
-    blocks: tuple[dict, ...],
-    tokens: list[dict],
-) -> tuple[dict[str, dict], list[dict]]:
+def _match_blocks(blocks: tuple[dict, ...], tokens: list[dict]) -> tuple[dict[str, dict], list[dict]]:
     by_value: dict[str, list[int]] = {}
     for index, token in enumerate(tokens):
         by_value.setdefault(token["value"], []).append(index)
+
     grouped: dict[tuple, list[dict]] = {}
     for block in blocks:
         grouped.setdefault(_group_key(block), []).append(block)
@@ -359,26 +361,26 @@ def _match_blocks(
     matches: dict[str, dict] = {}
     unmapped: list[dict] = []
     for group_blocks in sorted(grouped.values(), key=lambda items: items[0]["ordinal"]):
-        ordered = sorted(group_blocks, key=lambda item: item["ordinal"])
-        candidates = _find_candidates(ordered[0], tokens, by_value)
-        is_header_footer = ordered[0]["element_type"] in {
-            "header_paragraph",
-            "footer_paragraph",
-        }
+        ordered_blocks = sorted(group_blocks, key=lambda item: item["ordinal"])
+        candidates = _find_candidates(ordered_blocks[0], tokens, by_value)
+        element_type = ordered_blocks[0]["element_type"]
+        is_header_footer = element_type in {"header_paragraph", "footer_paragraph"}
         assignments: list[tuple[dict, list[tuple[int, int]], float]] = []
-        if is_header_footer and len(ordered) == 1 and candidates:
-            assignments.append((ordered[0], candidates, 0.97))
-        elif len(ordered) == 1 and len(candidates) == 1:
-            assignments.append((ordered[0], [candidates[0]], 0.99))
-        elif len(ordered) == len(candidates) and candidates:
-            assignments.extend(
-                (block, [candidate], 0.95)
-                for block, candidate in zip(ordered, candidates, strict=True)
-            )
+        if is_header_footer and len(ordered_blocks) == 1 and candidates:
+            # One deduplicated source part intentionally maps to every repeated
+            # page occurrence of that same header/footer.
+            assignments.append((ordered_blocks[0], candidates, 0.97))
+        elif len(ordered_blocks) == 1 and len(candidates) == 1:
+            assignments.append((ordered_blocks[0], [candidates[0]], 0.99))
+        elif len(ordered_blocks) == len(candidates) and candidates:
+            # Text + structural type/location + immutable document order form
+            # a one-to-one resolution for genuine duplicate paragraphs.
+            for block, candidate in zip(ordered_blocks, candidates, strict=True):
+                assignments.append((block, [candidate], 0.95))
 
-        assigned = {item[0]["element_id"] for item in assignments}
-        for block in ordered:
-            if block["element_id"] not in assigned:
+        assigned_ids = {item[0]["element_id"] for item in assignments}
+        for block in ordered_blocks:
+            if block["element_id"] not in assigned_ids:
                 unmapped.append(
                     {
                         "element_id": block["element_id"],
@@ -397,6 +399,9 @@ def _match_blocks(
                 "confidence": confidence,
             }
 
+    # A PDF range must never activate two different Word blocks. This catches
+    # cross-type duplicates and overlapping first/default header variants that
+    # cannot be separated without section page-boundary information.
     token_owners: dict[int, set[str]] = {}
     for element_id, match in matches.items():
         for start, end in match["ranges"]:
@@ -412,21 +417,18 @@ def _match_blocks(
             match["ranges"] = safe_ranges
             continue
         del matches[element_id]
-        unmapped.append(
-            {
-                "element_id": element_id,
-                "element_type": match["block"]["element_type"],
-                "reason": "The PDF range overlaps another block and is not safe to select.",
-            }
-        )
+        if not any(item["element_id"] == element_id for item in unmapped):
+            unmapped.append(
+                {
+                    "element_id": element_id,
+                    "element_type": match["block"]["element_type"],
+                    "reason": "The PDF range overlaps another structured block and is not safe to select.",
+                }
+            )
     return matches, unmapped
 
 
-def _regions_for_match(
-    match: dict,
-    tokens: list[dict],
-    context: _RenderContext,
-) -> list[dict]:
+def _regions_for_match(match: dict, tokens: list[dict], context: _RenderContext) -> list[dict]:
     block = match["block"]
     confidence = float(match["confidence"])
     interactive = bool(
@@ -435,7 +437,7 @@ def _regions_for_match(
     )
     lines: dict[tuple[int, int, int], list[dict]] = {}
     for start, end in match["ranges"]:
-        seen: set[tuple[int, int, int, int]] = set()
+        seen_words: set[tuple] = set()
         for token in tokens[start:end]:
             word_key = (
                 token["page_number"],
@@ -443,10 +445,11 @@ def _regions_for_match(
                 token["line_number"],
                 token["word_number"],
             )
-            if word_key in seen:
+            if word_key in seen_words:
                 continue
-            seen.add(word_key)
-            lines.setdefault(word_key[:3], []).append(token)
+            seen_words.add(word_key)
+            line_key = word_key[:3]
+            lines.setdefault(line_key, []).append(token)
 
     regions: list[dict] = []
     for region_index, (line_key, words) in enumerate(sorted(lines.items()), start=1):
@@ -457,12 +460,7 @@ def _regions_for_match(
         y0 = max(0.0, min(word["y0"] for word in words))
         x1 = min(page_width, max(word["x1"] for word in words))
         y1 = min(page_height, max(word["y1"] for word in words))
-        coordinates = (
-            x0 / page_width,
-            y0 / page_height,
-            (x1 - x0) / page_width,
-            (y1 - y0) / page_height,
-        )
+        coordinates = (x0 / page_width, y0 / page_height, (x1 - x0) / page_width, (y1 - y0) / page_height)
         if not all(math.isfinite(value) and 0 <= value <= 1 for value in coordinates):
             continue
         reason = None
@@ -474,7 +472,6 @@ def _regions_for_match(
             {
                 "region_id": f"{block['element_id']}:{page_number}:{region_index}",
                 "region_index": region_index,
-                "render_id": None,
                 "element_id": block["element_id"],
                 "document_id": context.document_id,
                 "version_id": context.version_id,
@@ -499,21 +496,20 @@ def _regions_for_match(
     return regions
 
 
-def _extract_pdf(
-    context: _RenderContext,
-    render_id: str,
-) -> tuple[list[dict], list[dict]]:
+def _extract_pdf(context: _RenderContext, render_id: str) -> tuple[list[dict], list[dict]]:
     pages: list[dict] = []
     tokens: list[dict] = []
     page_directory = context.cache_path.parent / f"{context.version_id}.pages" / render_id
     page_directory.mkdir(parents=True, exist_ok=True)
+    # Reject obviously incomplete/corrupt output before invoking the native PDF
+    # parser. Besides producing a clearer failure, this avoids retaining a
+    # Windows file handle when a malformed stream cannot be opened.
     with context.pdf_path.open("rb") as source:
         header = source.read(8)
         source.seek(max(0, context.pdf_size - 2048))
         trailer = source.read()
     if not header.startswith(b"%PDF-") or b"%%EOF" not in trailer:
         raise ValueError("The Word render is not a complete PDF.")
-
     with pymupdf.open(context.pdf_path) as pdf:
         if not pdf.is_pdf or pdf.needs_pass:
             raise ValueError("The Word render is not an accessible PDF.")
@@ -521,17 +517,18 @@ def _extract_pdf(
             raise ValueError(
                 f"The PDF has {pdf.page_count} pages; the safe limit is {settings.render_map_max_pages}."
             )
-        matrix = pymupdf.Matrix(settings.render_map_dpi / 72, settings.render_map_dpi / 72)
+        scale = settings.render_map_dpi / 72
+        matrix = pymupdf.Matrix(scale, scale)
         for page_index, page in enumerate(pdf):
             page_number = page_index + 1
             width = float(page.rect.width)
             height = float(page.rect.height)
             if width <= 0 or height <= 0:
                 raise ValueError(f"PDF page {page_number} has invalid dimensions.")
-            pixmap = page.get_pixmap(matrix=matrix, alpha=False)
             image_path = page_directory / f"page-{page_number}.png"
             temporary_image = image_path.with_name(f"{image_path.name}.{uuid4().hex}.tmp")
             try:
+                pixmap = page.get_pixmap(matrix=matrix, alpha=False)
                 temporary_image.write_bytes(pixmap.tobytes("png"))
                 temporary_image.replace(image_path)
             finally:
@@ -584,7 +581,7 @@ def _generate_render_map(context: _RenderContext, key: str) -> None:
     processing = _status_payload(
         context,
         "processing",
-        "Rendering controlled preview pages.",
+        "Extracting PDF text geometry and matching immutable Word blocks.",
     )
     _write_cache(context.cache_path, processing)
     try:
@@ -603,27 +600,12 @@ def _generate_render_map(context: _RenderContext, key: str) -> None:
         )
         render_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
         pages, tokens = _extract_pdf(context, render_id)
-
-        # Publish controlled page images before contextual coordinate matching.
-        progressive = {
-            **processing,
-            "status_detail": "The PDF is visible. Preparing selectable text in the background.",
-            "pdf_sha256": pdf_sha256,
-            "render_id": render_id,
-            "render_version": render_id,
-            "page_count": len(pages),
-            "pages": pages,
-        }
-        _write_cache(context.cache_path, progressive)
-
         matches, unmapped = _match_blocks(context.blocks, tokens)
         regions = [
             region
             for match in matches.values()
             for region in _regions_for_match(match, tokens, context)
         ]
-        for region in regions:
-            region["render_id"] = render_id
         mapped_ids = {region["element_id"] for region in regions}
         interactive_ids = {
             region["element_id"] for region in regions if region["interactive"]
@@ -632,22 +614,27 @@ def _generate_render_map(context: _RenderContext, key: str) -> None:
         if total and not mapped_ids:
             status = "failed"
             detail = (
-                "The PDF remains available, but no blocks could be mapped reliably. "
+                "The PDF remains available, but no Word blocks could be mapped reliably. "
                 "Use Select from structure."
             )
         elif len(mapped_ids) < total:
             status = "partial"
             detail = (
-                "Reliable areas are editable. Unresolved content remains available "
-                "through Select from structure."
+                "Selectable areas are available for reliable matches. Unresolved areas remain "
+                "available through Select from structure."
             )
         else:
             status = "completed"
             detail = "Selectable areas are aligned to this immutable Word/PDF render."
         payload = {
-            **progressive,
+            **processing,
             "status": status,
             "status_detail": detail,
+            "pdf_sha256": pdf_sha256,
+            "render_id": render_id,
+            "render_version": render_id,
+            "page_count": len(pages),
+            "pages": pages,
             "regions": regions,
             "mapped_element_count": len(mapped_ids),
             "interactive_element_count": len(interactive_ids),
@@ -655,16 +642,16 @@ def _generate_render_map(context: _RenderContext, key: str) -> None:
             "generated_at": _utc_now(),
         }
         _write_cache(context.cache_path, payload)
-    except Exception as exc:
+    except Exception as exc:  # Keep the successful Word PDF available.
         logger.exception("docsync.render_map.failed version_id=%s", context.version_id)
         failed = {
             **processing,
             "status": "failed",
             "status_detail": (
-                "The PDF remains available, but selectable text could not be prepared. "
+                "The PDF remains available, but selectable areas could not be generated. "
                 "Use Select from structure."
             ),
-            "error": str(exc),
+            "error": str(exc)[:500],
             "generated_at": _utc_now(),
         }
         _write_cache(context.cache_path, failed)
@@ -679,36 +666,23 @@ def render_page_path(
     render_id: str,
     page_number: int,
 ) -> Path:
-    if not RENDER_ID_PATTERN.fullmatch(render_id) or page_number < 1:
-        raise HTTPException(status_code=404, detail="The preview page is unavailable.")
-    payload = request_render_map(session, version_id)
-    if payload.get("render_id") != render_id:
-        raise HTTPException(status_code=404, detail="The preview page is unavailable.")
-    page = next(
-        (
-            item
-            for item in payload.get("pages", [])
-            if int(item.get("page_number", 0)) == page_number
-        ),
-        None,
-    )
-    if page is None:
-        raise HTTPException(status_code=404, detail="The preview page is unavailable.")
-    version = session.get(DocumentVersion, version_id)
-    if version is None:
-        raise HTTPException(status_code=404, detail="Document version not found.")
-    page_directory = (
-        settings.data_dir
-        / "renders"
-        / version.document.document_set_id
-        / f"{version.id}.pages"
-        / render_id
-    ).resolve()
-    path = (page_directory / f"page-{page_number}.png").resolve()
-    try:
-        path.relative_to(page_directory)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail="The preview page is unavailable.") from exc
+    from .editor_service import get_version_or_404
+
+    version = get_version_or_404(session, version_id)
+    context = _context_for_version(version)
+    if context is None:
+        raise HTTPException(status_code=404, detail="The Word PDF preview is not available.")
+    payload = _read_cache(context.cache_path)
+    if (
+        not _cache_matches(payload, context)
+        or payload.get("status") not in {"completed", "partial"}
+        or payload.get("render_id") != render_id
+        or not re.fullmatch(r"[0-9a-f]{24}", render_id)
+        or page_number < 1
+        or page_number > int(payload.get("page_count") or 0)
+    ):
+        raise HTTPException(status_code=404, detail="The render-map page is not available.")
+    path = context.cache_path.parent / f"{version.id}.pages" / render_id / f"page-{page_number}.png"
     if not path.is_file():
-        raise HTTPException(status_code=404, detail="The preview page is unavailable.")
+        raise HTTPException(status_code=404, detail="The render-map page is missing.")
     return path

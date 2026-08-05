@@ -13,19 +13,17 @@ import {
   absoluteApiUrl,
   ApiError,
   currentDocumentDownloadUrl,
-  createPreviewJob,
   fetchDocumentVersions,
   fetchDocumentView,
   fetchEditorContent,
   fetchElementMatches,
   fetchSimilarMatches,
-  fetchPreviewJob,
-  fetchWordPreview,
   generateEdit,
   generateEditorEdit,
   previewEdit,
   previewEditorEdit,
   queueEditorEdit,
+  renderDocumentView,
   restoreDocumentVersion,
   saveMatchDecisions,
   versionDownloadUrl,
@@ -50,11 +48,10 @@ import {
   normaliseMatch,
   wordDifferenceSpans,
 } from "./editorUtils";
-import type { QuillDraft } from "./QuillBlockEditor";
-import WordPreviewOverlay, {
-  type LayoutSelectionIntent,
-} from "./WordPreviewOverlay";
-import type { InlineEditorCommand } from "./InlineLayoutEditor";
+import QuillBlockEditor, {
+  type QuillDraft,
+} from "./QuillBlockEditor";
+import WordPreviewOverlay from "./WordPreviewOverlay";
 import type {
   DifferenceSpan,
   DocumentSearchTarget,
@@ -73,20 +70,11 @@ import type {
   MatchDecision,
   MatchDiscovery,
   PreviewResponse,
-  PreviewRenderJobResponse,
   QuillDelta,
 } from "./types";
 
 type LoadingStatus = "idle" | "loading" | "ready" | "error";
 type EditorAction = "preview" | "generate" | "restore" | null;
-type WithoutCommandId<T> = T extends { id: number } ? Omit<T, "id"> : never;
-type InlineEditorCommandInput = WithoutCommandId<InlineEditorCommand>;
-
-interface PendingBlockSelection {
-  block: EditorBlock;
-  remainInLayout: boolean;
-  inlineSelection: LayoutSelectionIntent | null;
-}
 
 interface DocumentExperienceProps {
   documentSet: DocumentSetResponse;
@@ -99,19 +87,30 @@ interface DocumentExperienceProps {
   onDirtyChange: (dirty: boolean) => void;
 }
 
-function previewStageLabel(stage?: string): string {
-  const labels: Record<string, string> = {
-    queued: "Queued",
-    starting_microsoft_word: "Starting Microsoft Word",
-    opening_document: "Opening document",
-    rendering_pdf: "Rendering PDF",
-    displaying_document: "Displaying document",
-    preparing_selectable_text: "Preparing selectable text",
-    ready_to_edit: "Ready to edit",
-    failed: "Failed",
-  };
-  return labels[stage ?? ""] ?? "Preparing Word preview";
-}
+const WORKSPACE_MODES: Array<{
+  id: WorkspaceMode;
+  label: string;
+  description: string;
+}> = [
+  {
+    id: "layout",
+    label: "Layout",
+    description: "Read-only Word layout",
+  },
+  {
+    id: "edit",
+    label: "Edit",
+    description: "Structured Quill editor",
+  },
+  {
+    id: "compare",
+    label: "Compare",
+    description: "Exact and near matches",
+  },
+];
+
+const INITIAL_VISIBLE_BLOCKS = 200;
+const VISIBLE_BLOCK_BATCH = 200;
 
 function isUnavailable(error: unknown): boolean {
   return (
@@ -823,18 +822,12 @@ export default function DocumentExperience({
   const [layoutView, setLayoutView] = useState<DocumentView | null>(null);
   const [layoutStatus, setLayoutStatus] =
     useState<LoadingStatus>("idle");
-  const [previewJob, setPreviewJob] =
-    useState<PreviewRenderJobResponse | null>(null);
   const [showLayoutStructure, setShowLayoutStructure] = useState(true);
-  const [inlineSelection, setInlineSelection] =
-    useState<LayoutSelectionIntent | null>(null);
-  const [inlineCommand, setInlineCommand] =
-    useState<InlineEditorCommand | null>(null);
   const [selectedElementId, setSelectedElementId] = useState("");
   const [draft, setDraft] = useState<QuillDraft | null>(null);
   const [editorResetToken, setEditorResetToken] = useState(0);
   const [pendingBlockSelection, setPendingBlockSelection] =
-    useState<PendingBlockSelection | null>(null);
+    useState<EditorBlock | null>(null);
   const [matches, setMatches] = useState<EditorMatch[]>([]);
   const [matchStatus, setMatchStatus] =
     useState<LoadingStatus>("idle");
@@ -879,8 +872,6 @@ export default function DocumentExperience({
   });
   const contentRequestRef = useRef(0);
   const layoutRequestRef = useRef(0);
-  const layoutAbortRef = useRef<AbortController | null>(null);
-  const inlineCommandIdRef = useRef(0);
   const matchRequestRef = useRef(0);
   const editorActionRequestRef = useRef(0);
   const editorActionAbortRef = useRef<AbortController | null>(null);
@@ -890,12 +881,7 @@ export default function DocumentExperience({
     content: EditorContentResponse | null;
   } | null>(null);
   const selectBlockRef = useRef<
-    (
-      block: EditorBlock,
-      skipDiscardConfirmation?: boolean,
-      remainInLayout?: boolean,
-      selection?: LayoutSelectionIntent | null,
-    ) => void
+    (block: EditorBlock, skipDiscardConfirmation?: boolean) => void
   >(() => undefined);
 
   activeDocumentIdRef.current = document?.id ?? "";
@@ -914,8 +900,6 @@ export default function DocumentExperience({
       editorActionRequestRef.current += 1;
       editorActionAbortRef.current?.abort();
       editorActionAbortRef.current = null;
-      layoutAbortRef.current?.abort();
-      layoutAbortRef.current = null;
     };
   }, []);
 
@@ -994,16 +978,10 @@ export default function DocumentExperience({
     const savedState = activeViewStateKey
       ? getWorkspaceViewState(activeViewStateKey)
       : undefined;
-    const nextMode: WorkspaceMode = "layout";
-    setMode(nextMode);
-    modeRef.current = nextMode;
+    setMode(savedState?.mode ?? "edit");
+    modeRef.current = savedState?.mode ?? "edit";
     setSelectedElementId(savedState?.selectedElementId ?? "");
     setDraft(savedState?.draft ?? null);
-    setInlineSelection(null);
-    setInlineCommand(null);
-    setPreviewJob(null);
-    layoutAbortRef.current?.abort();
-    layoutAbortRef.current = null;
 
     if (document && activeVersionId) {
       const cachedPreview = getWorkspaceResource<DocumentView>(
@@ -1019,7 +997,7 @@ export default function DocumentExperience({
       setLayoutView(null);
       setLayoutStatus("idle");
     }
-    setShowLayoutStructure(false);
+    setShowLayoutStructure(true);
   }, [activeViewStateKey, activeVersionId, document?.id, documentSet.id]);
 
   useEffect(() => {
@@ -1296,9 +1274,8 @@ export default function DocumentExperience({
 
     const requestId = ++matchRequestRef.current;
     const controller = new AbortController();
-    const loadNearMatches = true;
     setMatchStatus("loading");
-    setNearMatchStatus(loadNearMatches ? "loading" : "idle");
+    setNearMatchStatus(mode === "compare" ? "loading" : "idle");
     setMatches([]);
     setLegacyDiscovery(null);
 
@@ -1321,7 +1298,7 @@ export default function DocumentExperience({
             exactResourceKey,
             () => fetchElementMatches(selectedBlock!.element_id),
           ),
-          loadNearMatches
+          mode === "compare"
             ? loadWorkspaceResource(
                 nearResourceKey,
                 () => fetchSimilarMatches(selectedBlock!.element_id),
@@ -1501,7 +1478,7 @@ export default function DocumentExperience({
           !controller.signal.aborted &&
           requestId === matchRequestRef.current
         ) {
-          if (loadNearMatches) setNearMatchStatus("error");
+          if (mode === "compare") setNearMatchStatus("error");
           setLocalError(
             `${document?.name ?? "Document"} · ${locationLabel(
               selectedBlock!,
@@ -1517,7 +1494,7 @@ export default function DocumentExperience({
           requestId === matchRequestRef.current
         ) {
           setMatchStatus("ready");
-          if (loadNearMatches) {
+          if (mode === "compare") {
             setNearMatchStatus((current) =>
               current === "loading" ? "ready" : current,
             );
@@ -1557,7 +1534,7 @@ export default function DocumentExperience({
         setMatchStatus((current) =>
           current === "loading" ? "ready" : current,
         );
-        if (loadNearMatches) {
+        if (mode === "compare") {
           setNearMatchStatus((current) =>
             current === "loading" ? "ready" : current,
           );
@@ -1574,9 +1551,6 @@ export default function DocumentExperience({
 
   async function loadWordPreview() {
     if (!document || !activeVersionId || layoutStatus === "loading") return;
-    layoutAbortRef.current?.abort();
-    const controller = new AbortController();
-    layoutAbortRef.current = controller;
     const requestId = ++layoutRequestRef.current;
     const resourceKey = wordPreviewResourceKey(
       documentSet.id,
@@ -1584,50 +1558,23 @@ export default function DocumentExperience({
       activeVersionId,
     );
     setLayoutStatus("loading");
-    setPreviewJob(null);
     setLocalError("");
 
     try {
-      let job = await createPreviewJob(activeVersionId, controller.signal);
-      let displayed = false;
-      while (!controller.signal.aborted) {
-        if (
-          requestId !== layoutRequestRef.current ||
-          activeDocumentIdRef.current !== document.id
-        ) return;
-        setPreviewJob(job);
-        if (job.pdf_ready && !displayed) {
-          const response = await loadWorkspaceResource(
-            resourceKey,
-            () => fetchWordPreview(activeVersionId, controller.signal),
-          );
-          if (controller.signal.aborted) return;
-          setLayoutView(response);
-          setLayoutStatus("ready");
-          setShowLayoutStructure(false);
-          displayed = true;
-        }
-        if (["completed", "failed", "interrupted"].includes(job.status)) {
-          if (job.status !== "completed" && !job.pdf_ready) {
-            throw new Error(job.error ?? "Microsoft Word could not prepare the preview.");
-          }
-          break;
-        }
-        await new Promise<void>((resolve, reject) => {
-          const timer = window.setTimeout(resolve, 350);
-          controller.signal.addEventListener(
-            "abort",
-            () => {
-              window.clearTimeout(timer);
-              reject(new DOMException("Aborted", "AbortError"));
-            },
-            { once: true },
-          );
-        });
-        job = await fetchPreviewJob(job.job_id, controller.signal);
+      const response = await loadWorkspaceResource(
+        resourceKey,
+        () => renderDocumentView(activeVersionId),
+      );
+      if (
+        requestId !== layoutRequestRef.current ||
+        activeDocumentIdRef.current !== document.id
+      ) {
+        return;
       }
+      setLayoutView(response);
+      setLayoutStatus("ready");
+      setShowLayoutStructure(false);
     } catch (error) {
-      if (controller.signal.aborted) return;
       if (
         requestId !== layoutRequestRef.current ||
         activeDocumentIdRef.current !== document.id
@@ -1642,25 +1589,8 @@ export default function DocumentExperience({
           "Microsoft Word could not prepare the preview. The selectable Layout structure remains available.",
         )}`,
       );
-    } finally {
-      if (layoutAbortRef.current === controller) {
-        layoutAbortRef.current = null;
-      }
     }
   }
-
-  useEffect(() => {
-    if (
-      mode !== "layout" ||
-      !document ||
-      !activeVersionId ||
-      layoutStatus !== "idle" ||
-      layoutView
-    ) {
-      return;
-    }
-    void loadWordPreview();
-  }, [activeVersionId, document?.id, layoutStatus, layoutView, mode]);
 
   function setWorkspaceMode(nextMode: WorkspaceMode) {
     const currentMode = modeRef.current;
@@ -1727,8 +1657,6 @@ export default function DocumentExperience({
       sourceVersionId?: string;
       sourceLabel?: string;
       skipDiscardConfirmation?: boolean;
-      remainInLayout?: boolean;
-      inlineSelection?: LayoutSelectionIntent | null;
     } = {},
   ) {
     const sourceLabel = options.sourceLabel ?? "Layout element";
@@ -1781,19 +1709,10 @@ export default function DocumentExperience({
       return;
     }
 
-    selectBlock(
-      block,
-      options.skipDiscardConfirmation ?? false,
-      options.remainInLayout ?? false,
-      options.inlineSelection ?? null,
-    );
+    selectBlock(block, options.skipDiscardConfirmation ?? false);
   }
 
-  function activateSelectedBlock(
-    block: EditorBlock,
-    remainInLayout = false,
-    selection: LayoutSelectionIntent | null = null,
-  ) {
+  function activateSelectedBlock(block: EditorBlock) {
     matchRequestRef.current += 1;
     editorActionRequestRef.current += 1;
     editorActionAbortRef.current?.abort();
@@ -1814,28 +1733,24 @@ export default function DocumentExperience({
     setPreviewSignature("");
     setAction(null);
     setEditorResetToken((current) => current + 1);
-    setInlineSelection(remainInLayout ? selection : null);
 
     if (block.supported && !block.read_only) {
-      setShowLayoutStructure(selection ? false : true);
-      setWorkspaceMode("layout");
+      setWorkspaceMode("edit");
+      focusEditorForElement(block.element_id);
     }
   }
 
   function selectBlock(
     block: EditorBlock,
     skipDiscardConfirmation = false,
-    remainInLayout = false,
-    selection: LayoutSelectionIntent | null = null,
   ) {
     const changingBlock = block.element_id !== selectedElementId;
 
     if (!changingBlock) {
       if (block.supported && !block.read_only) {
+        setWorkspaceMode("edit");
         setEditorResetToken((current) => current + 1);
-        setInlineSelection(remainInLayout ? selection : null);
-        setShowLayoutStructure(selection ? false : true);
-        setWorkspaceMode("layout");
+        focusEditorForElement(block.element_id);
       }
       return;
     }
@@ -1844,15 +1759,11 @@ export default function DocumentExperience({
       !skipDiscardConfirmation &&
       (dirty || perDocumentDirty)
     ) {
-      setPendingBlockSelection({
-        block,
-        remainInLayout,
-        inlineSelection: selection,
-      });
+      setPendingBlockSelection(block);
       return;
     }
 
-    activateSelectedBlock(block, remainInLayout, selection);
+    activateSelectedBlock(block);
   }
 
   selectBlockRef.current = selectBlock;
@@ -1862,16 +1773,12 @@ export default function DocumentExperience({
   );
 
   function confirmPendingBlockSelection() {
-    const pending = pendingBlockSelection;
-    if (!pending) {
+    const block = pendingBlockSelection;
+    if (!block) {
       return;
     }
 
-    activateSelectedBlock(
-      pending.block,
-      pending.remainInLayout,
-      pending.inlineSelection,
-    );
+    activateSelectedBlock(block);
   }
 
   function cancelPendingBlockSelection() {
@@ -1884,37 +1791,13 @@ export default function DocumentExperience({
       return;
     }
 
+    /*
+     * Cancel keeps the current draft, but forces a fresh Quill instance so the
+     * editor is immediately clickable after the confirmation dialog closes.
+     */
+    setWorkspaceMode("edit");
     setEditorResetToken((current) => current + 1);
-    window.requestAnimationFrame(() => {
-      if (inlineSelection?.regionId) {
-        window.document
-          .querySelector<HTMLElement>(
-            `[data-render-region-id="${CSS.escape(inlineSelection.regionId)}"]`,
-          )
-          ?.focus();
-        return;
-      }
-      findLayoutElement(currentElementId)?.focus();
-    });
-  }
-
-  function exitInlineEditing(regionId: string) {
-    setInlineSelection(null);
-    window.requestAnimationFrame(() => {
-      if (!regionId) return;
-      window.document
-        .querySelector<HTMLElement>(
-          `[data-render-region-id="${CSS.escape(regionId)}"]`,
-        )
-        ?.focus();
-    });
-  }
-
-  function issueInlineCommand(command: InlineEditorCommandInput) {
-    setInlineCommand({
-      ...command,
-      id: ++inlineCommandIdRef.current,
-    } as InlineEditorCommand);
+    focusEditorForElement(currentElementId);
   }
 
   function handleDraftChange(nextDraft: QuillDraft) {
@@ -2407,15 +2290,6 @@ export default function DocumentExperience({
     : versionApiAvailable
       ? versionDownloadUrl(currentVersionId)
       : currentDocumentDownloadUrl(document.id);
-  const draftMayOverflow = Boolean(
-    selectedBlock &&
-      draft &&
-      draft.text.length >
-        Math.max(
-          selectedBlock.text.length * 1.35,
-          selectedBlock.text.length + 40,
-        ),
-  );
 
   async function handleRestoreVersion(version: DocumentVersion) {
     if (!document || version.is_current || action) return;
@@ -2656,10 +2530,55 @@ export default function DocumentExperience({
             aria-label="Document layout"
             className="editor-mode-panel layout-mode-panel"
           >
+            <div className="mode-panel-heading">
+              <div>
+                <p className="eyebrow">Authoritative layout</p>
+                <h2>
+                  {showLayoutStructure || !layoutView?.pdf_url
+                    ? "Select from document structure"
+                    : "Read-only Word preview"}
+                </h2>
+                <p>
+                  {showLayoutStructure || !layoutView?.pdf_url
+                    ? "Choose a supported heading, body paragraph, list item, table paragraph, header paragraph, or footer paragraph to open its exact mapped block in Edit."
+                    : "This view is rendered from the current DOCX. Click a reliable selectable area to open its exact block in Edit, or use Select from structure."}
+                </p>
+              </div>
+              <div className="layout-heading-actions">
+                {layoutView?.pdf_url && (
+                  <button
+                    type="button"
+                    className="quiet-button layout-selection-toggle"
+                    onClick={() =>
+                      setShowLayoutStructure((current) => !current)
+                    }
+                    aria-pressed={showLayoutStructure}
+                  >
+                    {showLayoutStructure
+                      ? "Show Word preview"
+                      : "Select from structure"}
+                  </button>
+                )}
+                {!layoutView?.pdf_url && (
+                  <button
+                    type="button"
+                    className="primary-button"
+                    disabled={layoutStatus === "loading"}
+                    onClick={() => void loadWordPreview()}
+                  >
+                    {layoutStatus === "loading"
+                      ? "Loading Word Previewâ€¦"
+                      : layoutStatus === "error"
+                        ? "Retry Word Preview"
+                        : "Load Word Preview"}
+                  </button>
+                )}
+              </div>
+            </div>
             {layoutStatus === "loading" && (
               <div className="editor-loading-state nonblocking" role="status">
                 <span className="spinner" aria-hidden="true" />
-                {previewStageLabel(previewJob?.stage)}. You can continue using the workspace.
+                Microsoft Word is preparing the layout preview…
               </div>
             )}
             {layoutStatus === "error" && !editorContent && (
@@ -2674,34 +2593,21 @@ export default function DocumentExperience({
             {layoutStatus === "ready" &&
               layoutView?.pdf_url &&
               !showLayoutStructure && (
-              <div className="layout-iframe-shell">
-                <WordPreviewOverlay
-                  documentName={document.name}
-                  versionId={layoutView.version_id}
-                  selectedElementId={selectedElementId}
-                  selectedBlock={selectedBlock}
-                  draft={draft}
-                  editorResetToken={editorResetToken}
-                  inlineSelection={inlineSelection}
-                  inlineCommand={inlineCommand}
-                  editorDisabled={action === "generate"}
-                  onSelect={(intent) =>
-                    selectElementById(intent.elementId, {
-                      sourceVersionId: intent.versionId,
-                      sourceLabel: "Word preview region",
-                      remainInLayout: true,
-                      inlineSelection: intent,
-                    })
-                  }
-                  onDraftChange={handleDraftChange}
-                  onExitInline={exitInlineEditing}
-                  onShowStructure={() => {
-                    setInlineSelection(null);
-                    setShowLayoutStructure(true);
-                  }}
-                  onRetryPreview={() => void loadWordPreview()}
-                />
-              </div>
+                <div className="layout-iframe-shell">
+                  <WordPreviewOverlay
+                    documentName={document.name}
+                    versionId={layoutView.version_id}
+                    pdfUrl={layoutView.pdf_url}
+                    selectedElementId={selectedElementId}
+                    onSelect={(elementId, sourceVersionId) =>
+                      selectElementById(elementId, {
+                        sourceVersionId,
+                        sourceLabel: "Word preview region",
+                      })
+                    }
+                    onShowStructure={() => setShowLayoutStructure(true)}
+                  />
+                </div>
             )}
             {editorContent &&
               mode === "layout" &&
@@ -2750,6 +2656,338 @@ export default function DocumentExperience({
               )}
           </section>
 
+          <section
+            id="workspace-panel-edit"
+            role="tabpanel"
+            aria-labelledby="workspace-tab-edit"
+            hidden={mode !== "edit"}
+            className="editor-mode-panel edit-mode-panel"
+          >
+            {/* DOCSYNC_QUILL_REMOUNT_V2 */}
+            {selectedBlock && (
+              <div className="selected-block-context" role="status">
+                <strong>Document: {document.name}</strong>
+                <span>{locationLabel(selectedBlock)}</span>
+                {linkedContentExplanation(selectedBlock) && (
+                  <small>{linkedContentExplanation(selectedBlock)}</small>
+                )}
+              </div>
+            )}
+            <QuillBlockEditor
+              key={`${selectedBlock?.element_id ?? "empty"}:${editorResetToken}`}
+              block={selectedBlock}
+              value={draft?.delta ?? null}
+              resetToken={editorResetToken}
+              disabled={action === "generate"}
+              onChange={handleDraftChange}
+            />
+            <div className="structured-document-heading">
+              <div>
+                <p className="eyebrow">Stable block mapping</p>
+                <h2>Document blocks</h2>
+                <p>
+                  Every card maps one-to-one to a stored Word element. Select
+                  one supported card to edit it above.
+                </p>
+              </div>
+              <div className="block-counts">
+                <span>
+                  <strong>{editorContent?.blocks.length ?? 0}</strong> total
+                </span>
+                <span>
+                  <strong>{editorContent?.unsupported_count ?? 0}</strong>{" "}
+                  read-only
+                </span>
+              </div>
+            </div>
+            {editorContent?.notice && (
+              <div className="editor-content-notice" role="note">
+                {editorContent.notice}
+              </div>
+            )}
+            {editorContent?.unsupported.length ? (
+              <details className="unsupported-diagnostics">
+                <summary>
+                  {editorContent.unsupported.length} preserved unsupported
+                  structure
+                  {editorContent.unsupported.length === 1 ? "" : "s"}
+                </summary>
+                <div>
+                  {editorContent.unsupported.map((diagnostic, index) => (
+                    <article
+                      key={
+                        diagnostic.id ??
+                        `${diagnostic.element_type}-${index}`
+                      }
+                    >
+                      <strong>
+                        {diagnostic.element_type.replaceAll("_", " ")}
+                      </strong>
+                      {diagnostic.location && (
+                        <small>{diagnostic.location}</small>
+                      )}
+                      <p>{diagnostic.reason}</p>
+                      {diagnostic.text && <blockquote>{diagnostic.text}</blockquote>}
+                    </article>
+                  ))}
+                </div>
+              </details>
+            ) : null}
+            {contentStatus === "loading" && (
+              <div className="editor-loading-state" role="status">
+                <span className="spinner" aria-hidden="true" />
+                Loading structured editor content…
+              </div>
+            )}
+            {contentStatus === "error" && (
+              <div className="editor-empty-state">
+                <strong>Editor content unavailable</strong>
+                <p>Choose another document or return home and reopen the set.</p>
+              </div>
+            )}
+            {contentStatus === "ready" &&
+              editorContent?.blocks.length === 0 && (
+                <div className="editor-empty-state">
+                  <strong>No editable text blocks</strong>
+                  <p>
+                    The document remains available in Layout. Unsupported Word
+                    structures are preserved and are not rewritten.
+                  </p>
+                </div>
+              )}
+            <div className="editor-block-list">
+              {groupStructuredBlocks(
+                editorContent?.blocks.slice(0, visibleBlockCount) ?? [],
+              ).map((group) => (
+                <section
+                  className={`structured-block-group ${group.region}`}
+                  aria-labelledby={`edit-group-${group.key.replaceAll(":", "-")}`}
+                  key={group.key}
+                >
+                  <h3 id={`edit-group-${group.key.replaceAll(":", "-")}`}>
+                    {group.label}
+                  </h3>
+                  {group.blocks.map((block) => (
+                    <BlockCard
+                      block={block}
+                      selected={block.element_id === selectedElementId}
+                      searchRange={
+                        searchTarget?.document_id === document.id &&
+                        searchTarget.element_id === block.element_id
+                          ? {
+                              start: searchTarget.match_start,
+                              end: searchTarget.match_end,
+                            }
+                          : undefined
+                      }
+                      onSelect={handleBlockSelect}
+                      key={block.element_id}
+                    />
+                  ))}
+                </section>
+              ))}
+            </div>
+            {editorContent &&
+              visibleBlockCount < editorContent.blocks.length && (
+                <button
+                  type="button"
+                  className="quiet-button editor-load-more"
+                  onClick={() =>
+                    setVisibleBlockCount((current) =>
+                      Math.min(
+                        editorContent.blocks.length,
+                        current + VISIBLE_BLOCK_BATCH,
+                      ),
+                    )
+                  }
+                >
+                  Show next{" "}
+                  {Math.min(
+                    VISIBLE_BLOCK_BATCH,
+                    editorContent.blocks.length - visibleBlockCount,
+                  )}{" "}
+                  blocks
+                </button>
+              )}
+          </section>
+
+          <section
+            id="workspace-panel-compare"
+            role="tabpanel"
+            aria-labelledby="workspace-tab-compare"
+            hidden={mode !== "compare"}
+            className="editor-mode-panel compare-mode-panel"
+          >
+            <div className="mode-panel-heading">
+              <div>
+                <p className="eyebrow">Cross-document comparison</p>
+                <h2>Exact and near matches</h2>
+                <p>
+                  Exact matches start included. Near matches require an
+                  explicit decision before they can be changed.
+                </p>
+              </div>
+              {selectedBlock && (
+                <button
+                  type="button"
+                  className="quiet-button"
+                  onClick={() => setWorkspaceMode("edit")}
+                >
+                  Back to selected block
+                </button>
+              )}
+            </div>
+            {!selectedBlock ? (
+              <div className="editor-empty-state">
+                <strong>Select a block in Edit first</strong>
+                <p>
+                  Comparison is anchored to one stable source element so every
+                  target remains traceable.
+                </p>
+                <button
+                  type="button"
+                  className="primary-button"
+                  onClick={() => setWorkspaceMode("edit")}
+                >
+                  Go to Edit
+                </button>
+              </div>
+            ) : !selectedBlock.supported || selectedBlock.read_only ? (
+              <div className="editor-empty-state">
+                <strong>This block is read-only</strong>
+                <p>
+                  {selectedBlock.unsupported_reason ??
+                    "It cannot be safely compared or edited in this release."}
+                </p>
+              </div>
+            ) : (
+              <>
+                <article className="compare-source-card">
+                  <header>
+                    <span>Source</span>
+                    <strong>{document.name}</strong>
+                    <small>{locationLabel(selectedBlock)}</small>
+                  </header>
+                  <p>{draft?.text ?? selectedBlock.text}</p>
+                </article>
+                {nearMatchStatus === "loading" && (
+                  <div className="editor-loading-state" role="status">
+                    <span className="spinner" aria-hidden="true" />
+                    Finding exact and near matches…
+                  </div>
+                )}
+                {matchStatus === "ready" &&
+                  nearMatchStatus !== "loading" &&
+                  matches.filter(
+                    (match) => match.match_type !== "source",
+                  ).length === 0 && (
+                    <div className="editor-empty-state">
+                      <strong>No related blocks found</strong>
+                      <p>
+                        You can still use Whole-paragraph override for the
+                        selected source block.
+                      </p>
+                    </div>
+                  )}
+                <div className="comparison-list">
+                  {matches
+                    .filter((match) => match.match_type !== "source")
+                    .map((match) => {
+                      const included = includedElementIds.has(match.element_id);
+                      const nearUnavailable =
+                        match.match_type === "near" &&
+                        (match.decision !== "confirmed" ||
+                          editMode === "shared");
+                      return (
+                        <article
+                          className={`comparison-card ${match.match_type} ${
+                            included ? "included" : "excluded"
+                          }`}
+                          key={match.element_id}
+                        >
+                          <header>
+                            <label>
+                              <input
+                                type="checkbox"
+                                checked={included}
+                                disabled={nearUnavailable}
+                                onChange={() => toggleTarget(match)}
+                              />
+                              <span>
+                                <strong>{match.document_name}</strong>
+                                <small>{locationLabel(match)}</small>
+                              </span>
+                            </label>
+                            <span className={`match-kind ${match.match_type}`}>
+                              {match.match_type === "exact"
+                                ? "Exact · 100%"
+                                : `Near · ${Math.round(
+                                    match.similarity_score * 100,
+                                  )}%`}
+                            </span>
+                          </header>
+                          <p>
+                            <DifferenceText spans={match.difference_spans} />
+                          </p>
+                          {match.match_type === "near" && (
+                            <footer>
+                              <span>
+                                Decision:{" "}
+                                <strong>{match.decision}</strong>
+                              </span>
+                              <div
+                                role="group"
+                                aria-label={`Decision for ${match.document_name}`}
+                              >
+                                <button
+                                  type="button"
+                                  className={
+                                    match.decision === "confirmed"
+                                      ? "active"
+                                      : ""
+                                  }
+                                  onClick={() =>
+                                    updateDecision(match, "confirmed")
+                                  }
+                                >
+                                  Confirm
+                                </button>
+                                <button
+                                  type="button"
+                                  className={
+                                    match.decision === "ignored"
+                                      ? "active"
+                                      : ""
+                                  }
+                                  onClick={() =>
+                                    updateDecision(match, "ignored")
+                                  }
+                                >
+                                  Ignore
+                                </button>
+                                <button
+                                  type="button"
+                                  className={
+                                    match.decision === "removed"
+                                      ? "active"
+                                      : ""
+                                  }
+                                  onClick={() =>
+                                    updateDecision(match, "removed")
+                                  }
+                                >
+                                  Remove
+                                </button>
+                              </div>
+                            </footer>
+                          )}
+                        </article>
+                      );
+                    })}
+                </div>
+              </>
+            )}
+          </section>
         </div>
       </section>
 
@@ -2757,20 +2995,45 @@ export default function DocumentExperience({
         className="edit-sidebar editor-operation-sidebar"
         aria-labelledby="editor-operation-title"
       >
-        {!selectedBlock ? (
+        {mode === "layout" ? (
           <>
             <div className="sidebar-heading">
               <div>
-                <span className="eyebrow">Inline editing</span>
-                <h2 id="editor-operation-title">Select text in Layout</h2>
+                <span className="eyebrow">Layout diagnostics</span>
+                <h2 id="editor-operation-title">Read-only source</h2>
               </div>
             </div>
             <div className="sidebar-empty">
               <span aria-hidden="true">W</span>
-              <h3>Click supported Word text</h3>
+              <h3>Formatting stays authoritative</h3>
               <p>
-                A restricted editor will appear over the selected paragraph.
-                Uncertain mappings and complex Word structures stay read-only.
+                Layout is never edited in the browser. Quill writes supported
+                changes back to targeted Word blocks while unrelated content
+                remains intact.
+              </p>
+              <button
+                type="button"
+                className="quiet-button"
+                onClick={() => setWorkspaceMode("edit")}
+              >
+                Switch to Edit
+              </button>
+            </div>
+          </>
+        ) : !selectedBlock ? (
+          <>
+            <div className="sidebar-heading">
+              <div>
+                <span className="eyebrow">Controlled edit</span>
+                <h2 id="editor-operation-title">Edit operation</h2>
+              </div>
+            </div>
+            <div className="sidebar-empty">
+              <span aria-hidden="true">T</span>
+              <h3>Select one stable block</h3>
+              <p>
+                Choose a supported block in Edit to configure shared wording,
+                per-document values, or a whole-paragraph override.
               </p>
             </div>
           </>
@@ -2806,66 +3069,12 @@ export default function DocumentExperience({
               </span>
             </div>
             <div className="operation-sidebar-scroll">
-              {mode === "layout" && (
-                <>
-                  {draftMayOverflow && (
-                    <div className="inline-overflow-warning" role="status">
-                      <strong>This draft may wrap differently in the final Word document.</strong>
-                      <span>Generate a new version to view the accurate layout.</span>
-                    </div>
-                  )}
-                  {!inlineSelection && (
-                    <p className="inline-editor-paused">
-                      Inline typing is paused. Activate the selected outline to
-                      place the cursor back in the paragraph.
-                    </p>
-                  )}
-                  <div
-                    className="inline-formatting-toolbar"
-                    role="toolbar"
-                    aria-label="Inline text and paragraph formatting"
-                  >
-                    <button type="button" onClick={() => issueInlineCommand({ action: "bold" })}>Bold</button>
-                    <button type="button" onClick={() => issueInlineCommand({ action: "italic" })}>Italic</button>
-                    <button type="button" onClick={() => issueInlineCommand({ action: "underline" })}>Underline</button>
-                    <select
-                      aria-label="Heading level"
-                      defaultValue=""
-                      disabled={["table_paragraph", "header_paragraph", "footer_paragraph"].includes(selectedBlock.element_type)}
-                      onChange={(event) => {
-                        const value = event.target.value;
-                        issueInlineCommand({ action: "heading", value: value ? Number(value) : false });
-                      }}
-                    >
-                      <option value="">Normal</option>
-                      <option value="1">Heading 1</option>
-                      <option value="2">Heading 2</option>
-                      <option value="3">Heading 3</option>
-                    </select>
-                    <button type="button" onClick={() => issueInlineCommand({ action: "list", value: "ordered" })}>Numbered</button>
-                    <button type="button" onClick={() => issueInlineCommand({ action: "list", value: "bullet" })}>Bullets</button>
-                    <button type="button" onClick={() => issueInlineCommand({ action: "indent", value: -1 })}>Outdent</button>
-                    <button type="button" onClick={() => issueInlineCommand({ action: "indent", value: 1 })}>Indent</button>
-                    <select
-                      aria-label="Paragraph alignment"
-                      defaultValue=""
-                      onChange={(event) =>
-                        issueInlineCommand({
-                          action: "align",
-                          value: event.target.value as "" | "center" | "right" | "justify",
-                        })
-                      }
-                    >
-                      <option value="">Left</option>
-                      <option value="center">Centre</option>
-                      <option value="right">Right</option>
-                      <option value="justify">Justify</option>
-                    </select>
-                    <button type="button" onClick={() => issueInlineCommand({ action: "undo" })}>Undo</button>
-                    <button type="button" onClick={() => issueInlineCommand({ action: "redo" })}>Redo</button>
-                  </div>
-                </>
-              )}
+              <div className="operation-source">
+                <small>
+                  Source · {document.name} · {locationLabel(selectedBlock)}
+                </small>
+                <p>{selectedBlock.text}</p>
+              </div>
 
               <fieldset className="edit-mode-options">
                 <legend>Update mode</legend>
@@ -2976,41 +3185,6 @@ export default function DocumentExperience({
                 )}
               </section>
 
-              {mode === "layout" &&
-                matches.some((match) => match.match_type === "near") && (
-                  <section className="layout-near-matches" aria-labelledby="layout-near-title">
-                    <h3 id="layout-near-title">Near matches</h3>
-                    <p>Review word-level differences and explicitly include or exclude each candidate.</p>
-                    {matches
-                      .filter((match) => match.match_type === "near")
-                      .map((match) => (
-                        <article key={match.element_id}>
-                          <header>
-                            <strong>{match.document_name}</strong>
-                            <span>{Math.round(match.similarity_score * 100)}%</span>
-                          </header>
-                          <p><DifferenceText spans={match.difference_spans} /></p>
-                          <div role="group" aria-label={`Near-match decision for ${match.document_name}`}>
-                            <button
-                              type="button"
-                              className={match.decision === "confirmed" ? "active" : ""}
-                              onClick={() => updateDecision(match, "confirmed")}
-                            >
-                              Include
-                            </button>
-                            <button
-                              type="button"
-                              className={match.decision === "ignored" ? "active" : ""}
-                              onClick={() => updateDecision(match, "ignored")}
-                            >
-                              Exclude
-                            </button>
-                          </div>
-                        </article>
-                      ))}
-                  </section>
-                )}
-
               {editMode === "per_document" && (
                 <section className="per-document-values">
                   <h3>Result for each document</h3>
@@ -3080,7 +3254,10 @@ export default function DocumentExperience({
                       : "Generate new versions"}
                 </button>
               </div>
-            
+              <p className="generate-safety-copy">
+                Preview never writes files. Generate is enabled only for the
+                exact operation you reviewed.
+              </p>
 
               {preview && previewSignature === operationSignature && (
                 <div className="preview-ready-state" role="status">

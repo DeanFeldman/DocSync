@@ -15,7 +15,6 @@ import type {
   MatchDecisionPayload,
   MatchDiscovery,
   PreviewResponse,
-  PreviewRenderJobResponse,
   RenderMapResponse,
   SimilarMatchesResponse,
 } from "./types";
@@ -203,36 +202,6 @@ export async function renderDocumentView(
     method: "POST",
     signal,
   });
-  return parseResponse<DocumentView>(response);
-}
-
-export async function createPreviewJob(
-  versionId: string,
-  signal?: AbortSignal,
-): Promise<PreviewRenderJobResponse> {
-  const response = await fetch(
-    `${API_URL}/document-versions/${versionId}/preview-jobs`,
-    { method: "POST", signal },
-  );
-  return parseResponse<PreviewRenderJobResponse>(response);
-}
-
-export async function fetchPreviewJob(
-  jobId: string,
-  signal?: AbortSignal,
-): Promise<PreviewRenderJobResponse> {
-  const response = await fetch(`${API_URL}/preview-jobs/${jobId}`, { signal });
-  return parseResponse<PreviewRenderJobResponse>(response);
-}
-
-export async function fetchWordPreview(
-  versionId: string,
-  signal?: AbortSignal,
-): Promise<DocumentView> {
-  const response = await fetch(
-    `${API_URL}/document-versions/${versionId}/preview`,
-    { signal },
-  );
   return parseResponse<DocumentView>(response);
 }
 

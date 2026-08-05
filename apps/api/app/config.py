@@ -120,14 +120,14 @@ def _build_settings() -> Settings:
         render_map_confidence_threshold=_bounded_float_env(
             "DOCUMENTSYNC_RENDER_MAP_CONFIDENCE_THRESHOLD",
             0.90,
-            minimum=0.5,
+            minimum=0.50,
             maximum=1.0,
         ),
         render_map_dpi=_bounded_int_env(
             "DOCUMENTSYNC_RENDER_MAP_DPI",
             144,
             minimum=72,
-            maximum=300,
+            maximum=240,
         ),
         render_map_max_pages=_bounded_int_env(
             "DOCUMENTSYNC_RENDER_MAP_MAX_PAGES",

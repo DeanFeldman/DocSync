@@ -52,52 +52,82 @@ Returns the current document set, its documents, extracted-element counts, and e
 
 Each document includes a `version_id` and `view_url` for the immutable uploaded version.
 
-## Preview-render endpoints
+## `POST /documents/{document_id}/render`
 
-```text
-POST /document-versions/{version_id}/preview-jobs
-GET  /preview-jobs/{job_id}
-GET  /document-versions/{version_id}/preview
-GET  /document-versions/{version_id}/rendered-file
-GET  /document-versions/{version_id}/render-map
-GET  /document-versions/{version_id}/render-pages/{render_id}/{page_number}.png
-```
+Exports the current immutable DOCX version to a cached PDF through Microsoft
+Word, queues coordinate extraction, and returns the PDF URL, render-map status
+and URL, and structured element payload. PDF viewing does not wait for the map.
 
-The POST returns `202 Accepted` before Word conversion. A representative job is:
+## `GET /document-versions/{version_id}/rendered-file`
+
+Returns the Microsoft Word-generated PDF inline for the high-fidelity layout tab.
+
+## `GET /document-versions/{version_id}/render-map`
+
+Returns the version/render-bound coordinate map. Status is one of
+`not_requested`, `queued`, `processing`, `completed`, `partial`, or `failed`.
+Queued and processing responses should be polled with bounded backoff.
+
+Example terminal response (abridged):
 
 ```json
 {
-  "job_id": "uuid",
-  "document_id": "uuid",
-  "version_id": "uuid",
-  "status": "processing",
-  "stage": "rendering_pdf",
-  "pdf_ready": false,
-  "render_map_ready": false,
-  "render_map_status": "not_requested",
-  "cache_hit": false,
-  "error": null
+  "schema_version": 1,
+  "version_id": "version-456",
+  "document_id": "document-123",
+  "document_set_id": "workspace-789",
+  "status": "completed",
+  "coordinate_unit": "normalised",
+  "render_id": "4d92381ce36b19c4eabc1234",
+  "render_version": "4d92381ce36b19c4eabc1234",
+  "source_sha256": "...",
+  "pdf_sha256": "...",
+  "pdf_engine": "Microsoft Word ExportAsFixedFormat PDF",
+  "mapper": "PyMuPDF",
+  "mapper_version": "1.28.0",
+  "interactive_threshold": 0.9,
+  "page_count": 1,
+  "pages": [
+    {
+      "page_id": "4d92381ce36b19c4eabc1234:1",
+      "page_number": 1,
+      "page_width": 612.0,
+      "page_height": 792.0,
+      "coordinate_unit": "normalised",
+      "render_version": "4d92381ce36b19c4eabc1234",
+      "image_url": "/api/document-versions/version-456/render-pages/4d92381ce36b19c4eabc1234/1.png"
+    }
+  ],
+  "regions": [
+    {
+      "region_id": "element-123:1:1",
+      "element_id": "element-123",
+      "version_id": "version-456",
+      "element_type": "paragraph",
+      "page_number": 1,
+      "x": 0.1421569,
+      "y": 0.3180521,
+      "width": 0.6110049,
+      "height": 0.0471221,
+      "confidence": 0.99,
+      "mapping_method": "word_pdf_text_context_order",
+      "interactive": true,
+      "read_only": false,
+      "reason": null
+    }
+  ],
+  "unmapped": []
 }
 ```
 
-Stages are `queued`, `starting_microsoft_word`, `opening_document`,
-`rendering_pdf`, `displaying_document`, `preparing_selectable_text`,
-`ready_to_edit`, and `failed`. `pdf_ready` permits the client to fetch the
-preview immediately; it must not wait for `render_map_ready`.
+A `partial` result keeps reliable regions selectable and lists unresolved
+blocks in `unmapped`. A `failed` result has no clickable regions and does not
+affect the successful PDF. Maps are disposable cache data, not document state.
 
-The render map reports normalized page regions with render/version/element
-identity, type, text preview, location, confidence, mapping method,
-`interactive`, `read_only`, and reason fields. During `processing`, `pages` may
-already contain controlled PNG URLs while `regions` is still empty. Completed
-and partial maps may contain both interactive and explained read-only regions.
+## `GET /document-versions/{version_id}/render-pages/{render_id}/{page}.png`
 
-`GET rendered-file` never starts Word. It returns the cached immutable PDF only
-after a background job has created it. The legacy synchronous render endpoint
-is retained for compatibility, but v1.8 Layout uses preview jobs.
-
-## `POST /documents/{document_id}/render` (compatibility)
-
-Exports the current working DOCX version to a cached PDF through Microsoft Word and returns both the PDF URL and the structured element payload. Applying an edit invalidates the affected PDF cache before the browser refreshes it.
+Returns one controlled page image only when the immutable version, current map,
+render ID, and page number all match. Mismatched or stale paths return `404`.
 
 ## `GET /document-versions/{version_id}/pages`
 

@@ -7,7 +7,6 @@ from difflib import SequenceMatcher
 from io import BytesIO
 import hashlib
 import json
-import logging
 import math
 from pathlib import Path
 import re
@@ -50,9 +49,6 @@ from .schemas import (
     QuillDelta,
     VersionRestoreRequest,
 )
-
-
-logger = logging.getLogger(__name__)
 
 
 BODY_STYLE_PATTERN = re.compile(r"^body_order:(\d+):(.*)$", re.DOTALL)
@@ -108,22 +104,6 @@ UNSUPPORTED_XML_TAGS = {
     qn("w:footnoteReference"): "Footnote reference",
     qn("w:endnoteReference"): "Endnote reference",
 }
-
-
-def _queue_previews_safely(session: Session, version_ids: list[str]) -> list[dict]:
-    """Preview failure must never roll back a committed immutable version."""
-
-    try:
-        from .preview_job_service import queue_generated_version_previews
-
-        return queue_generated_version_previews(session, version_ids)
-    except Exception:
-        session.rollback()
-        logger.exception(
-            "docsync.post_generation_preview_queue.failed versions=%s",
-            ",".join(version_ids),
-        )
-        return []
 
 
 def _header_footer_type(kind: str, variant: str) -> str:
@@ -3334,22 +3314,15 @@ def generate_editor_versions(
             from .document_service import (
                 _rebuild_exact_link_groups,
                 get_document_set_or_404,
-                rendered_pdf_path,
                 serialize_document_set,
             )
 
             _rebuild_exact_link_groups(session, document_set_id)
-            for item in staged.values():
-                # Remove legacy document-ID render cache. True-version renders
-                # use their own cache name.
-                rendered_pdf_path(item["document"]).unlink(missing_ok=True)
+            # Render caches are keyed by immutable version. Advancing a head
+            # creates a fresh key and must not remove a historical preview that
+            # a background coordinate worker or version-history view is using.
             session.commit()
             committed = True
-
-            preview_jobs = _queue_previews_safely(
-                session,
-                [item["version_id"] for item in response_versions],
-            )
 
             refreshed = serialize_document_set(
                 get_document_set_or_404(session, document_set_id)
@@ -3375,7 +3348,6 @@ def generate_editor_versions(
                 "download_url": (
                     f"/api/editor-operations/{operation.id}/download"
                 ),
-                "preview_jobs": preview_jobs,
                 "document_set": refreshed,
             }
         except Exception:
@@ -3564,7 +3536,6 @@ def restore_document_version(
             from .document_service import (
                 _rebuild_exact_link_groups,
                 get_document_set_or_404,
-                rendered_pdf_path,
                 serialize_document_set,
             )
 
@@ -3573,11 +3544,10 @@ def restore_document_version(
             refreshed = serialize_document_set(
                 get_document_set_or_404(session, document.document_set_id)
             )
-            rendered_pdf_path(document).unlink(missing_ok=True)
+            # The restored descendant has a new version/render key. Preserve
+            # historical immutable-version previews and their coordinate maps.
             session.commit()
             committed = True
-
-            preview_jobs = _queue_previews_safely(session, [version.id])
 
             return {
                 "operation_id": operation.id,
@@ -3613,7 +3583,6 @@ def restore_document_version(
                     "element_ids_by_location": location_to_element,
                 },
                 "download_url": f"/api/editor-operations/{operation.id}/download",
-                "preview_jobs": preview_jobs,
                 "document_set": refreshed,
             }
         except Exception:

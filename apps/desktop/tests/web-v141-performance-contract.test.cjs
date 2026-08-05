@@ -55,23 +55,14 @@ test("Word preview auto-loads while near matching and version history remain laz
     "function setWorkspaceMode",
   );
 
-  assert.match(wordPreviewHandler, /createPreviewJob\(activeVersionId/);
-  assert.match(wordPreviewHandler, /fetchPreviewJob\(job\.job_id/);
-  assert.match(wordPreviewHandler, /fetchWordPreview\(activeVersionId/);
-  assert.match(
-    experience,
-    /layoutStatus !== "idle"[\s\S]*void loadWordPreview\(\)/,
-  );
-  assert.doesNotMatch(experience, /Load Word Preview/);
-  assert.match(
-    experience,
-    /onRetryPreview=\{\(\) => void loadWordPreview\(\)\}/,
-  );
+  assert.match(wordPreviewHandler, /renderDocumentView\(activeVersionId\)/);
+  assert.match(experience, /Load Word Preview/);
+  assert.match(experience, /Retry Word Preview/);
   assert.match(experience, /onToggle=\{\(event\) =>/);
   assert.match(experience, /setHistoryRequested\(true\)/);
   assert.match(
     experience,
-    /loadNearMatches\s*\?\s*loadWorkspaceResource\(/,
+    /mode === "compare"\s*\?\s*loadWorkspaceResource\(/,
   );
   assert.match(experience, /fetchSimilarMatches\(selectedBlock!/);
   assert.doesNotMatch(experience, /compareDocumentElements/);
