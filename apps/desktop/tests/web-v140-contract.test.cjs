@@ -1,4 +1,4 @@
-"use strict";
+﻿"use strict";
 
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -29,7 +29,7 @@ test("theme is applied before React and persists the explicit preference", () =>
   assert.match(styles, /\.docsync-quill-toolbar \.ql-stroke/);
 });
 
-test("structured Layout selection uses the central version-safe editor path", () => {
+test("structured Layout selection uses the central version-safe inline editor path", () => {
   const experience = read("apps/web/src/DocumentExperience.tsx");
   const types = read("apps/web/src/types.ts");
 
@@ -41,7 +41,11 @@ test("structured Layout selection uses the central version-safe editor path", ()
   );
   assert.match(experience, /selectBlock\(block,/);
   assert.match(experience, /aria-pressed=\{selected\}/);
-  assert.match(experience, /setWorkspaceMode\("edit"\)/);
-  assert.match(experience, /focusEditorForElement\(block\.element_id\)/);
+  assert.match(experience, /setWorkspaceMode\("layout"\)/);
+  assert.match(
+    experience,
+    /setInlineSelection\(remainInLayout \? selection : null\)/,
+  );
+  assert.doesNotMatch(experience, /setWorkspaceMode\("edit"\)/);
   assert.match(types, /layout_regions\?: LayoutElementRegion\[\]/);
 });

@@ -1,4 +1,4 @@
-"use strict";
+﻿"use strict";
 
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -47,7 +47,7 @@ test("workspace resources are version keyed, bounded, and request deduplicated",
   assert.match(resources, /deleteWhere/);
 });
 
-test("Word preview, near matching, and version history are explicit lazy resources", () => {
+test("Word preview auto-loads while near matching and version history remain lazy", () => {
   const experience = read("apps/web/src/DocumentExperience.tsx");
   const wordPreviewHandler = between(
     experience,
@@ -76,13 +76,18 @@ test("Word preview, near matching, and version history are explicit lazy resourc
   );
 });
 
-test("large editor lists render progressively with memoized cards", () => {
+test("Layout fallback renders stable grouped blocks without the removed card list", () => {
   const experience = read("apps/web/src/DocumentExperience.tsx");
 
-  assert.match(experience, /const BlockCard = memo/);
-  assert.match(experience, /INITIAL_VISIBLE_BLOCKS = 200/);
-  assert.match(experience, /\.slice\(0, visibleBlockCount\)/);
-  assert.match(experience, /Show next/);
+  assert.match(experience, /function LayoutFallbackBlock/);
+  assert.match(
+    experience,
+    /groupStructuredBlocks\(editorContent\.blocks\)\.map/,
+  );
+  assert.match(experience, /group\.blocks\.map\(\(block\) =>/);
+  assert.match(experience, /key=\{block\.element_id\}/);
+  assert.doesNotMatch(experience, /const BlockCard = memo/);
+  assert.doesNotMatch(experience, /INITIAL_VISIBLE_BLOCKS/);
 });
 
 test("generation is accepted immediately and reconciled by the application shell", () => {
