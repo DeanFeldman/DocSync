@@ -47,14 +47,15 @@ test("header and footer blocks are grouped, button-selectable, and explain links
 });
 
 test("header and footer editing keeps the existing one-paragraph Quill boundary", () => {
-  const editor = read("apps/web/src/QuillBlockEditor.tsx");
+  const editor = read("apps/web/src/InlineLayoutEditor.tsx");
+  const experience = read("apps/web/src/DocumentExperience.tsx");
 
-  assert.match(editor, /docsyncEnter:[\s\S]*handler: \(\) => false/);
+  assert.match(editor, /docsyncInlineEnter:[\s\S]*handler: \(\) => false/);
   assert.match(editor, /aria-multiline", "false"/);
   assert.match(editor, /replace\(\/\\s\*\[\\r\\n\]\+\\s\*\/g, " "\)/);
-  assert.match(editor, /"header_paragraph"/);
-  assert.match(editor, /"footer_paragraph"/);
-  assert.match(editor, /Choose a supported heading, body paragraph/);
+  assert.match(experience, /"header_paragraph"/);
+  assert.match(experience, /"footer_paragraph"/);
+  assert.match(experience, /disabled=\{\["table_paragraph", "header_paragraph", "footer_paragraph"\]/);
 });
 
 test("preview and selected Layout context expose header/footer location metadata", () => {

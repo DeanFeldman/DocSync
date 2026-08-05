@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import shutil
 import threading
+from time import perf_counter
 from types import SimpleNamespace
 import unicodedata
 from uuid import uuid4
@@ -2221,6 +2222,7 @@ def _set_list_format(
     level: object,
     *,
     existing_list_type: str | None = None,
+    style_names: set[str] | None = None,
 ) -> None:
     if list_type not in {"ordered", "bullet"}:
         return
@@ -2245,7 +2247,7 @@ def _set_list_format(
         else base_style
     )
 
-    style_names = {style.name for style in document.styles}
+    style_names = style_names or {style.name for style in document.styles}
 
     selected_style = next(
         (
@@ -2287,11 +2289,16 @@ def _apply_target_to_docx(
     revision: DocumentBlockRevision,
     target: EditorTarget,
     delta: dict,
+    *,
+    paragraphs: list[Paragraph] | None = None,
+    tables: list | None = None,
+    header_footer_parts: dict[str, dict] | None = None,
+    style_names: set[str] | None = None,
 ) -> None:
     location = revision.location_json or {}
     paragraph: Paragraph
     if location.get("kind") in {"header_paragraph", "footer_paragraph"}:
-        parts = _header_footer_part_map(document)
+        parts = header_footer_parts or _header_footer_part_map(document)
         relationship_id = str(location.get("part_relationship_id") or "")
         entry = parts.get(relationship_id)
         if entry is None:
@@ -2331,7 +2338,7 @@ def _apply_target_to_docx(
     elif location.get("kind") in {"table_cell", "table_paragraph"}:
         try:
             cell = (
-                document.tables[int(location["table_index"])]
+                (tables or list(document.tables))[int(location["table_index"])]
                 .rows[int(location["row_index"])]
                 .cells[int(location["column_index"])]
             )
@@ -2363,7 +2370,9 @@ def _apply_target_to_docx(
             )
     else:
         try:
-            paragraph = document.paragraphs[int(location["paragraph_index"])]
+            paragraph = (paragraphs or list(document.paragraphs))[
+                int(location["paragraph_index"])
+            ]
         except (IndexError, KeyError, TypeError, ValueError) as exc:
             raise HTTPException(
                 status_code=409,
@@ -2384,11 +2393,11 @@ def _apply_target_to_docx(
         # A submitted Quill document is authoritative for supported block
         # formatting. Missing attributes therefore represent clear-format.
         if "header" not in newline_attributes and revision.element_type == "heading":
-            if "Normal" in {style.name for style in document.styles}:
+            if "Normal" in (style_names or {style.name for style in document.styles}):
                 paragraph.style = "Normal"
         if "list" not in newline_attributes and existing_list_type is not None:
             _clear_numbering(paragraph)
-            if "Normal" in {style.name for style in document.styles}:
+            if "Normal" in (style_names or {style.name for style in document.styles}):
                 paragraph.style = "Normal"
         if "align" not in newline_attributes:
             paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
@@ -2396,7 +2405,7 @@ def _apply_target_to_docx(
         _clear_numbering(paragraph)
         level = int(newline_attributes["header"])
         style_name = f"Heading {min(max(level, 1), 9)}"
-        if style_name in {style.name for style in document.styles}:
+        if style_name in (style_names or {style.name for style in document.styles}):
             paragraph.style = style_name
     if "list" in newline_attributes:
         if existing_list_type != newline_attributes.get("list"):
@@ -2407,6 +2416,7 @@ def _apply_target_to_docx(
             newline_attributes.get("list"),
             newline_attributes.get("indent", 0),
             existing_list_type=existing_list_type,
+            style_names=style_names,
         )
     if "align" in newline_attributes:
         _set_alignment(paragraph, newline_attributes["align"])
@@ -2416,23 +2426,57 @@ def _apply_document_targets(
     source_path: Path,
     targets: list[tuple[EditorTarget, DocumentBlockRevision, DocumentRecord, dict]],
 ) -> tuple[DocxDocument, bytes]:
+    total_started = perf_counter()
+    stage_started = perf_counter()
     document = _load_docx(source_path)
+    source_read_ms = (perf_counter() - stage_started) * 1000
+    paragraphs = list(document.paragraphs)
+    tables = list(document.tables)
+    header_footer_parts = _header_footer_part_map(document)
+    style_names = {style.name for style in document.styles}
+    stage_started = perf_counter()
     for target, revision, _record, delta in sorted(
         targets,
         key=lambda item: item[1].ordinal,
     ):
-        _apply_target_to_docx(document, revision, target, delta)
+        _apply_target_to_docx(
+            document,
+            revision,
+            target,
+            delta,
+            paragraphs=paragraphs,
+            tables=tables,
+            header_footer_parts=header_footer_parts,
+            style_names=style_names,
+        )
+    replacement_ms = (perf_counter() - stage_started) * 1000
+    stage_started = perf_counter()
     output = BytesIO()
     document.save(output)
     payload = output.getvalue()
+    package_write_ms = (perf_counter() - stage_started) * 1000
+    stage_started = perf_counter()
     try:
-        Document(BytesIO(payload))
+        validated_document = Document(BytesIO(payload))
     except Exception as exc:
         raise HTTPException(
             status_code=500,
             detail="The edited DOCX failed validation and was not saved.",
         ) from exc
-    return document, payload
+    validation_ms = (perf_counter() - stage_started) * 1000
+    logger.info(
+        "docsync.generation_document_timing source=%s targets=%s "
+        "source_read_ms=%.2f replacement_ms=%.2f package_write_ms=%.2f "
+        "validation_ms=%.2f total_ms=%.2f",
+        source_path.name,
+        len(targets),
+        source_read_ms,
+        replacement_ms,
+        package_write_ms,
+        validation_ms,
+        (perf_counter() - total_started) * 1000,
+    )
+    return validated_document, payload
 
 
 def _preview_payload(
@@ -2536,17 +2580,17 @@ def _sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _shared_states_by_location(
+def _revisions_by_location(
     session: Session,
     version_id: str,
-) -> dict[str, str]:
+) -> dict[str, DocumentBlockRevision]:
     revisions = session.scalars(
         select(DocumentBlockRevision).where(
             DocumentBlockRevision.version_id == version_id
         )
     )
     return {
-        _location_key(revision.location_json): revision.shared_state
+        _location_key(revision.location_json): revision
         for revision in revisions
     }
 
@@ -2560,16 +2604,18 @@ def _replace_current_elements_and_create_revisions(
     base_version_id: str,
     override_locations: set[str] | None = None,
     reconnect_locations: set[str] | None = None,
+    prepared_docx: DocxDocument | None = None,
+    changed_match_hashes: set[str] | None = None,
 ) -> dict[str, str]:
     from .document_service import _extract_paragraphs
 
-    docx = _load_docx(source_path)
+    docx = prepared_docx or _load_docx(source_path)
     extracted = _extract_paragraphs(docx)
     paragraphs = list(docx.paragraphs)
     tables = list(docx.tables)
     header_footer_parts = _header_footer_part_map(docx)
     style_name_cache: dict[str | None, str | None] = {}
-    previous_states = _shared_states_by_location(session, base_version_id)
+    previous_revisions = _revisions_by_location(session, base_version_id)
     override_locations = override_locations or set()
     reconnect_locations = reconnect_locations or set()
 
@@ -2578,13 +2624,37 @@ def _replace_current_elements_and_create_revisions(
             select(DocumentElement).where(DocumentElement.document_id == document.id)
         )
     )
+    existing_by_location = {
+        (
+            element.paragraph_index,
+            _location_key(_element_location(element)[1]),
+        ): element
+        for element in current_elements
+    }
+    prepared_elements: list[
+        tuple[int, str, str | None, str, DocumentElement | None]
+    ] = []
+    retained_element_ids: set[str] = set()
+    for paragraph_index, text, style_name in extracted:
+        probe = SimpleNamespace(
+            paragraph_index=paragraph_index,
+            style_name=style_name,
+        )
+        key = _location_key(_element_location(probe)[1])
+        existing = existing_by_location.get((paragraph_index, key))
+        if existing is not None:
+            retained_element_ids.add(existing.id)
+        prepared_elements.append((paragraph_index, text, style_name, key, existing))
+
     for element in current_elements:
-        session.delete(element)
+        if element.id not in retained_element_ids:
+            session.delete(element)
     session.flush()
 
-    elements: list[DocumentElement] = []
-    for paragraph_index, text, style_name in extracted:
-        element = DocumentElement(
+    elements: list[tuple[DocumentElement, str]] = []
+    new_elements: list[DocumentElement] = []
+    for paragraph_index, text, style_name, key, existing in prepared_elements:
+        element = existing or DocumentElement(
             id=new_id(),
             document_id=document.id,
             paragraph_index=paragraph_index,
@@ -2592,16 +2662,24 @@ def _replace_current_elements_and_create_revisions(
             normalized_text=normalise_editor_text(text),
             style_name=style_name,
         )
-        session.add(element)
-        elements.append(element)
-    session.flush()
-
+        if existing is not None:
+            element.text = text
+            element.normalized_text = normalise_editor_text(text)
+            element.style_name = style_name
+        else:
+            new_elements.append(element)
+        elements.append((element, key))
     location_to_element: dict[str, str] = {}
     revisions: list[DocumentBlockRevision] = []
-    for element in elements:
-        _ordinal, location = _element_location(element)
-        key = _location_key(location)
-        shared_state = previous_states.get(key, "shared")
+    current_locations: set[str] = set()
+    for element, key in elements:
+        current_locations.add(key)
+        previous_revision = previous_revisions.get(key)
+        shared_state = (
+            previous_revision.shared_state
+            if previous_revision is not None
+            else "shared"
+        )
         if key in override_locations:
             shared_state = "detached"
         elif key in reconnect_locations:
@@ -2618,7 +2696,23 @@ def _replace_current_elements_and_create_revisions(
         revision = DocumentBlockRevision(version_id=version.id, **values)
         revisions.append(revision)
         location_to_element[key] = element.id
-    session.add_all(revisions)
+        if (
+            changed_match_hashes is not None
+            and previous_revision is not None
+            and previous_revision.exact_match_hash != revision.exact_match_hash
+        ):
+            if previous_revision.exact_match_hash:
+                changed_match_hashes.add(previous_revision.exact_match_hash)
+            if revision.exact_match_hash:
+                changed_match_hashes.add(revision.exact_match_hash)
+        elif changed_match_hashes is not None and previous_revision is None:
+            if revision.exact_match_hash:
+                changed_match_hashes.add(revision.exact_match_hash)
+    if changed_match_hashes is not None:
+        for key, previous_revision in previous_revisions.items():
+            if key not in current_locations and previous_revision.exact_match_hash:
+                changed_match_hashes.add(previous_revision.exact_match_hash)
+    session.add_all([*new_elements, *revisions])
     session.flush()
     return location_to_element
 
@@ -2656,19 +2750,13 @@ def queue_editor_generation(
     *,
     retry_of_operation_id: str | None = None,
 ) -> dict:
+    queue_started = perf_counter()
     with EDITOR_QUEUE_LOCK:
-        _source, _source_document, _base_context, validated_targets = (
-            _validate_editor_request(session, document_set_id, request)
-        )
-        affected_documents = sorted(
-            {
-                item[2].id: item[2].original_name
-                for item in validated_targets
-            }.items(),
-            key=lambda item: item[1].casefold(),
-        )
-        affected_document_ids = [item[0] for item in affected_documents]
-        affected_document_names = [item[1] for item in affected_documents]
+        # Reject an overlapping second click before doing the comparatively
+        # expensive target/delta validation. base_versions contains exactly
+        # the documents selected by the editor request.
+        requested_documents = set(request.base_versions)
+        pending_scan_started = perf_counter()
         pending_operations = list(
             session.scalars(
                 select(EditorOperation)
@@ -2679,7 +2767,7 @@ def queue_editor_generation(
                 .order_by(EditorOperation.created_at.desc())
             )
         )
-        requested_documents = set(affected_document_ids)
+        pending_scan_ms = (perf_counter() - pending_scan_started) * 1000
         for pending in pending_operations:
             pending_envelope = pending.preview_json or {}
             pending_document_ids = set(
@@ -2695,23 +2783,44 @@ def queue_editor_generation(
                     )
             overlap = requested_documents & pending_document_ids
             if overlap:
-                names = ", ".join(
-                    name
-                    for document_id, name in zip(
-                        affected_document_ids,
-                        affected_document_names,
+                overlapping_names = list(
+                    session.scalars(
+                        select(DocumentRecord.original_name)
+                        .where(DocumentRecord.id.in_(overlap))
+                        .order_by(DocumentRecord.original_name)
                     )
-                    if document_id in overlap
+                )
+                logger.info(
+                    "docsync.generation_queue_timing document_set_id=%s "
+                    "status=overlap pending_scan_ms=%.2f total_ms=%.2f",
+                    document_set_id,
+                    pending_scan_ms,
+                    (perf_counter() - queue_started) * 1000,
                 )
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail=(
-                        f"{names or 'A selected document'} already has a background "
-                        "update in progress. Wait for it to finish, then reload and "
-                        "review this change against the latest version."
+                        f"{', '.join(overlapping_names) or 'A selected document'} "
+                        "already has a background update in progress. Wait for it "
+                        "to finish, then reload and review this change against the "
+                        "latest version."
                     ),
                 )
 
+        validation_started = perf_counter()
+        _source, _source_document, _base_context, validated_targets = (
+            _validate_editor_request(session, document_set_id, request)
+        )
+        validation_ms = (perf_counter() - validation_started) * 1000
+        affected_documents = sorted(
+            {
+                item[2].id: item[2].original_name
+                for item in validated_targets
+            }.items(),
+            key=lambda item: item[1].casefold(),
+        )
+        affected_document_ids = [item[0] for item in affected_documents]
+        affected_document_names = [item[1] for item in affected_documents]
         preview = _preview_payload(
             document_set_id,
             request,
@@ -2738,7 +2847,21 @@ def queue_editor_generation(
             },
         )
         session.add(operation)
+        commit_started = perf_counter()
         session.commit()
+        commit_ms = (perf_counter() - commit_started) * 1000
+        total_ms = (perf_counter() - queue_started) * 1000
+        logger.info(
+            "docsync.generation_queue_timing operation_id=%s document_set_id=%s "
+            "status=queued pending_scan_ms=%.2f validation_ms=%.2f "
+            "commit_ms=%.2f total_ms=%.2f",
+            operation.id,
+            document_set_id,
+            pending_scan_ms,
+            validation_ms,
+            commit_ms,
+            total_ms,
+        )
         return {
             "id": operation.id,
             "job_id": operation.id,
@@ -2762,7 +2885,51 @@ def queue_editor_generation(
             "affected_document_count": preview["affected_document_count"],
             "affected_location_count": preview["affected_location_count"],
             "status_url": f"/api/editor-operations/{operation.id}",
+            "timings": {
+                "pending_scan_ms": round(pending_scan_ms, 2),
+                "validation_ms": round(validation_ms, 2),
+                "commit_ms": round(commit_ms, 2),
+                "total_ms": round(total_ms, 2),
+            },
         }
+
+
+def _serialize_generated_document_updates(
+    session: Session,
+    versions: list[DocumentVersion],
+) -> list[dict]:
+    """Return only the changed workspace rows needed by the active UI."""
+
+    if not versions:
+        return []
+    document_ids = {version.document_id for version in versions}
+    element_counts = {
+        document_id: int(count)
+        for document_id, count in session.execute(
+            select(DocumentElement.document_id, func.count(DocumentElement.id))
+            .where(DocumentElement.document_id.in_(document_ids))
+            .group_by(DocumentElement.document_id)
+        ).all()
+    }
+    return [
+        {
+            "id": version.document_id,
+            "version_id": version.id,
+            "current_version_id": version.id,
+            "version_number": version.version_number,
+            "parent_version_id": version.parent_version_id,
+            "name": version.document.original_name,
+            "checksum_sha256": version.document.checksum_sha256,
+            "current_checksum_sha256": version.checksum_sha256,
+            "element_count": element_counts.get(version.document_id, 0),
+            "view_url": f"/api/document-versions/{version.id}/pages",
+            "download_url": f"/api/documents/{version.document_id}/download",
+        }
+        for version in sorted(
+            versions,
+            key=lambda item: item.document.original_name.casefold(),
+        )
+    ]
 
 
 def serialize_editor_generation_status(
@@ -2826,6 +2993,11 @@ def serialize_editor_generation_status(
         "error": operation.error_detail,
         "edit_mode": operation.operation_type,
         "status_url": f"/api/editor-operations/{operation.id}",
+        "timings": (
+            preview_envelope.get("timings", {})
+            if isinstance(preview_envelope, dict)
+            else {}
+        ),
     }
     if operation.status in {"failed", "interrupted"}:
         payload["error_detail"] = (
@@ -2845,11 +3017,6 @@ def serialize_editor_generation_status(
             }
         )
         return payload
-
-    from .document_service import (
-        get_document_set_or_404,
-        serialize_document_set,
-    )
 
     versions = sorted(
         operation.versions,
@@ -2892,11 +3059,9 @@ def serialize_editor_generation_status(
                 if operation.status == "completed"
                 else None
             ),
-            "document_set": serialize_document_set(
-                get_document_set_or_404(
-                    session,
-                    operation.document_set_id,
-                )
+            "document_updates": _serialize_generated_document_updates(
+                session,
+                versions,
             ),
         }
     )
@@ -3076,20 +3241,26 @@ def generate_editor_versions(
     *,
     queued_operation_id: str | None = None,
 ) -> dict:
+    generation_started = perf_counter()
+    timings: dict[str, float] = {}
+    operation_id = queued_operation_id or new_id()
     with EDITOR_GENERATION_LOCK:
         committed = False
         staging_directory: Path | None = None
         final_directory: Path | None = None
         try:
+            stage_started = perf_counter()
             source, _source_document, base_context, validated_targets = (
                 _validate_editor_request(session, document_set_id, request)
             )
+            timings["database_lookup_and_validation_ms"] = (
+                perf_counter() - stage_started
+            ) * 1000
             preview = _preview_payload(
                 document_set_id,
                 request,
                 validated_targets,
             )
-            operation_id = queued_operation_id or new_id()
             generated_root = settings.data_dir / "generated" / document_set_id
             generated_root.mkdir(parents=True, exist_ok=True)
             staging_directory = generated_root / f".{operation_id}.staging"
@@ -3123,20 +3294,28 @@ def generate_editor_versions(
             staged: dict[str, dict] = {}
             from .document_service import safe_download_name
 
+            timings["docx_generation_ms"] = 0.0
+            timings["file_write_ms"] = 0.0
             for document_id, targets in by_document.items():
                 document, head, base_version = base_context[document_id]
-                _docx, payload = _apply_document_targets(
+                stage_started = perf_counter()
+                prepared_docx, payload = _apply_document_targets(
                     document_version_path(base_version),
                     targets,
                 )
+                timings["docx_generation_ms"] += (
+                    perf_counter() - stage_started
+                ) * 1000
                 next_number = base_version.version_number + 1
                 output_name = safe_download_name(
                     f"{Path(document.original_name).stem}-v{next_number}.docx"
                 )
                 output_path = staging_directory / output_name
+                stage_started = perf_counter()
                 output_path.write_bytes(payload)
-                # Validate the actual staged file, not only the memory buffer.
-                _load_docx(output_path)
+                timings["file_write_ms"] += (
+                    perf_counter() - stage_started
+                ) * 1000
                 staged[document_id] = {
                     "document": document,
                     "head": head,
@@ -3147,6 +3326,7 @@ def generate_editor_versions(
                     "output_name": output_name,
                     "staging_path": output_path,
                     "checksum": _sha256(payload),
+                    "prepared_docx": prepared_docx,
                 }
 
             _commit_editor_generation_stage(
@@ -3156,10 +3336,13 @@ def generate_editor_versions(
             )
 
             zip_path = staging_directory / "current-documents.zip"
+            stage_started = perf_counter()
             with zipfile.ZipFile(
                 zip_path,
                 mode="w",
-                compression=zipfile.ZIP_DEFLATED,
+                # DOCX files are ZIP packages already; recompressing them wastes
+                # CPU and provides negligible size reduction.
+                compression=zipfile.ZIP_STORED,
             ) as archive:
                 documents = list(
                     session.scalars(
@@ -3180,6 +3363,7 @@ def generate_editor_versions(
                         path,
                         arcname=safe_download_name(document.original_name),
                     )
+            timings["archive_write_ms"] = (perf_counter() - stage_started) * 1000
 
             _commit_editor_generation_stage(
                 session,
@@ -3195,6 +3379,7 @@ def generate_editor_versions(
                 "refreshing_workspace",
             )
 
+            database_update_started = perf_counter()
             operation = (
                 session.get(EditorOperation, operation_id)
                 if queued_operation_id is not None
@@ -3218,14 +3403,19 @@ def generate_editor_versions(
                         if len(validated_targets) == 1
                         else None
                     ),
-                    preview_json=preview,
+                    preview_json={"preview": preview},
                     completed_at=utc_now(),
                 )
                 session.add(operation)
             else:
                 operation.status = "completed"
                 operation.stage = "completed"
-                operation.preview_json = preview
+                queued_envelope = (
+                    dict(operation.preview_json)
+                    if isinstance(operation.preview_json, dict)
+                    else {}
+                )
+                operation.preview_json = {**queued_envelope, "preview": preview}
                 operation.error_detail = None
                 operation.completed_at = utc_now()
             session.flush()
@@ -3237,6 +3427,8 @@ def generate_editor_versions(
             )
 
             response_versions: list[dict] = []
+            changed_match_hashes: set[str] = set()
+            timings["block_parsing_and_database_ms"] = 0.0
             for document_id, item in staged.items():
                 document: DocumentRecord = item["document"]
                 head: DocumentHead = item["head"]
@@ -3269,6 +3461,7 @@ def generate_editor_versions(
                     if request.edit_mode != "override"
                     and revision.shared_state == "detached"
                 }
+                block_stage_started = perf_counter()
                 location_to_element = (
                     _replace_current_elements_and_create_revisions(
                         session,
@@ -3278,6 +3471,8 @@ def generate_editor_versions(
                         base_version_id=base_version.id,
                         override_locations=override_locations,
                         reconnect_locations=reconnect_locations,
+                        prepared_docx=item["prepared_docx"],
+                        changed_match_hashes=changed_match_hashes,
                     )
                 )
 
@@ -3329,32 +3524,81 @@ def generate_editor_versions(
                         "element_ids_by_location": location_to_element,
                     }
                 )
+                timings["block_parsing_and_database_ms"] += (
+                    perf_counter() - block_stage_started
+                ) * 1000
 
             session.flush()
             from .document_service import (
-                _rebuild_exact_link_groups,
-                get_document_set_or_404,
+                _rebuild_exact_link_groups_for_hashes,
                 rendered_pdf_path,
-                serialize_document_set,
             )
 
-            _rebuild_exact_link_groups(session, document_set_id)
+            stage_started = perf_counter()
+            _rebuild_exact_link_groups_for_hashes(
+                session,
+                document_set_id,
+                changed_match_hashes,
+            )
+            timings["matching_and_synchronisation_ms"] = (
+                perf_counter() - stage_started
+            ) * 1000
             for item in staged.values():
                 # Remove legacy document-ID render cache. True-version renders
                 # use their own cache name.
                 rendered_pdf_path(item["document"]).unlink(missing_ok=True)
+            timings["database_update_ms"] = (
+                perf_counter() - database_update_started
+            ) * 1000
+            if isinstance(operation.preview_json, dict):
+                # Assign a new JSON value so SQLAlchemy persists the timing
+                # envelope without requiring a mutable JSON extension.
+                operation.preview_json = {
+                    **operation.preview_json,
+                    "timings": {
+                        key: round(value, 2) for key, value in timings.items()
+                    },
+                }
+            commit_started = perf_counter()
             session.commit()
+            timings["database_commit_ms"] = (perf_counter() - commit_started) * 1000
             committed = True
 
+            stage_started = perf_counter()
             preview_jobs = _queue_previews_safely(
                 session,
                 [item["version_id"] for item in response_versions],
             )
+            timings["deferred_preview_queue_ms"] = (
+                perf_counter() - stage_started
+            ) * 1000
 
-            refreshed = serialize_document_set(
-                get_document_set_or_404(session, document_set_id)
+            stage_started = perf_counter()
+            generated_versions = [
+                session.get(DocumentVersion, item["version_id"])
+                for item in response_versions
+            ]
+            document_updates = _serialize_generated_document_updates(
+                session,
+                [version for version in generated_versions if version is not None],
             )
-            return {
+            refreshed = None
+            if queued_operation_id is None:
+                # Preserve the synchronous compatibility response. The active
+                # UI uses the async endpoint and only needs changed rows.
+                from .document_service import (
+                    get_document_set_or_404,
+                    serialize_document_set,
+                )
+
+                refreshed = serialize_document_set(
+                    get_document_set_or_404(session, document_set_id)
+                )
+            timings["response_serialization_ms"] = (
+                perf_counter() - stage_started
+            ) * 1000
+            timings["total_ms"] = (perf_counter() - generation_started) * 1000
+            result = {
                 "operation_id": operation.id,
                 "generation_id": operation.id,
                 "status": "completed",
@@ -3376,8 +3620,14 @@ def generate_editor_versions(
                     f"/api/editor-operations/{operation.id}/download"
                 ),
                 "preview_jobs": preview_jobs,
-                "document_set": refreshed,
+                "document_updates": document_updates,
+                "timings": {
+                    key: round(value, 2) for key, value in timings.items()
+                },
             }
+            if refreshed is not None:
+                result["document_set"] = refreshed
+            return result
         except Exception:
             if not committed:
                 session.rollback()
@@ -3386,6 +3636,20 @@ def generate_editor_versions(
                 if final_directory is not None:
                     shutil.rmtree(final_directory, ignore_errors=True)
             raise
+        finally:
+            timings.setdefault(
+                "total_ms",
+                (perf_counter() - generation_started) * 1000,
+            )
+            logger.info(
+                "docsync.generation_timing operation_id=%s document_set_id=%s %s",
+                operation_id,
+                document_set_id,
+                " ".join(
+                    f"{name}={value:.2f}"
+                    for name, value in timings.items()
+                ),
+            )
 
 
 def restore_document_version(

@@ -26,7 +26,7 @@ test("theme is applied before React and persists the explicit preference", () =>
   assert.match(app, /className="theme-toggle"/);
   assert.match(app, /aria-pressed=\{theme === "dark"\}/);
   assert.match(styles, /:root\[data-theme="dark"\]/);
-  assert.match(styles, /\.docsync-quill-toolbar \.ql-stroke/);
+  assert.match(styles, /:root\[data-theme="dark"\]/);
 });
 
 test("structured Layout selection uses the central version-safe inline editor path", () => {

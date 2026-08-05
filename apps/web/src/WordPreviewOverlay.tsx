@@ -8,15 +8,21 @@ import {
   useState,
 } from "react";
 import { absoluteApiUrl, fetchRenderMap } from "./api";
+import {
+  getWorkspaceResource,
+  refreshWorkspaceResource,
+  renderMapResourceKey,
+} from "./workspaceResources";
 import InlineLayoutEditor, {
   type InlineEditorCommand,
 } from "./InlineLayoutEditor";
-import type { QuillDraft } from "./QuillBlockEditor";
 import type {
   EditorBlock,
+  QuillDraft,
   RenderMapPage,
   RenderMapRegion,
   RenderMapResponse,
+  ViewerPage,
 } from "./types";
 
 type ScaleMode = "custom" | "fit-width" | "fit-page";
@@ -32,8 +38,10 @@ export interface LayoutSelectionIntent {
 }
 
 interface WordPreviewOverlayProps {
+  documentSetId: string;
   documentName: string;
   versionId: string;
+  previewPages: ViewerPage[];
   selectedElementId: string;
   selectedBlock: EditorBlock | null;
   draft: QuillDraft | null;
@@ -46,6 +54,31 @@ interface WordPreviewOverlayProps {
   onExitInline: (regionId: string) => void;
   onShowStructure: () => void;
   onRetryPreview: () => void;
+}
+
+function CachedTextPreview({ pages }: { pages: ViewerPage[] }) {
+  const visiblePages = pages.slice(0, 3);
+  return (
+    <div className="cached-text-preview" role="document" aria-label="Cached document preview">
+      {visiblePages.map((page) => (
+        <section key={page.page_number} aria-label={`Cached page ${page.page_number}`}>
+          {page.elements.map((element) =>
+            element.element_type === "heading" ? (
+              <h3 key={element.id}>{element.text}</h3>
+            ) : (
+              <p key={element.id}>{element.text || "\u00a0"}</p>
+            ),
+          )}
+        </section>
+      ))}
+      {pages.length > visiblePages.length && (
+        <p className="cached-text-preview-more">
+          Preparing the visual layout for {pages.length - visiblePages.length} more page
+          {pages.length - visiblePages.length === 1 ? "" : "s"}…
+        </p>
+      )}
+    </div>
+  );
 }
 
 interface MapPageProps {
@@ -278,8 +311,10 @@ function MapPage({
 }
 
 export default function WordPreviewOverlay({
+  documentSetId,
   documentName,
   versionId,
+  previewPages,
   selectedElementId,
   selectedBlock,
   draft,
@@ -300,15 +335,24 @@ export default function WordPreviewOverlay({
   const [showSelectableAreas, setShowSelectableAreas] = useState(false);
   const [viewportSize, setViewportSize] = useState({ width: 760, height: 600 });
   const viewportRef = useRef<HTMLDivElement>(null);
+  const renderStartedRef = useRef(performance.now());
 
   useEffect(() => {
-    const controller = new AbortController();
+    let cancelled = false;
     let timer = 0;
     let delay = 200;
+    const resourceKey = renderMapResourceKey(documentSetId, versionId);
+    const cached = getWorkspaceResource<RenderMapResponse>(resourceKey);
+    setRenderMap(cached ?? null);
+    setMapError("");
+    renderStartedRef.current = performance.now();
     const load = async () => {
       try {
-        const response = await fetchRenderMap(versionId, controller.signal);
-        if (controller.signal.aborted) return;
+        const response = await refreshWorkspaceResource(
+          resourceKey,
+          () => fetchRenderMap(versionId),
+        );
+        if (cancelled) return;
         if (response.version_id !== versionId) {
           setMapError("The selectable-area map did not match the displayed version.");
           return;
@@ -320,7 +364,7 @@ export default function WordPreviewOverlay({
           timer = window.setTimeout(load, delay);
         }
       } catch (error) {
-        if (controller.signal.aborted) return;
+        if (cancelled) return;
         setMapError(
           error instanceof Error ? error.message : "Selectable areas could not be loaded.",
         );
@@ -328,10 +372,10 @@ export default function WordPreviewOverlay({
     };
     void load();
     return () => {
-      controller.abort();
+      cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [versionId]);
+  }, [documentSetId, versionId]);
 
   useEffect(() => {
     const viewport = viewportRef.current;
@@ -390,6 +434,17 @@ export default function WordPreviewOverlay({
   const statusText = mapError
     ? `The controlled preview remains available where possible. ${mapError}`
     : renderMap?.status_detail ?? "Preparing the controlled Word preview.";
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => {
+      console.info("docsync.preview_render_timing", {
+        version_id: versionId,
+        mode: pagesReady ? "word_pages" : "cached_text",
+        duration_ms: Number((performance.now() - renderStartedRef.current).toFixed(2)),
+      });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [pagesReady, versionId]);
 
   return (
     <div
@@ -472,11 +527,13 @@ export default function WordPreviewOverlay({
           ))}
         </div>
       ) : (
-        <div className="render-map-empty" role="status">
-          <span className="spinner" aria-hidden="true" />
-          <strong>Preparing controlled preview pages</strong>
-          <p>You can keep using Edit or navigate elsewhere while Microsoft Word works.</p>
-        </div>
+        <>
+          <CachedTextPreview pages={previewPages} />
+          <div className="render-map-empty nonblocking" role="status">
+            <span className="spinner" aria-hidden="true" />
+            <strong>Updating visual layout…</strong>
+          </div>
+        </>
       )}
     </div>
   );

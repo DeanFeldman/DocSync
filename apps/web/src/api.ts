@@ -369,24 +369,6 @@ export async function fetchEditorGenerationJobs(
   return parseResponse<EditorGenerationListResponse>(response);
 }
 
-export async function fetchRecoverableEditorGenerationJobs(
-  signal?: AbortSignal,
-): Promise<EditorGenerationListResponse> {
-  const response = await fetch(`${API_URL}/generation-jobs`, { signal });
-  return parseResponse<EditorGenerationListResponse>(response);
-}
-
-export async function retryEditorGeneration(
-  operationId: string,
-  signal?: AbortSignal,
-): Promise<EditorGenerationResponse> {
-  const response = await fetch(
-    `${API_URL}/generation-jobs/${operationId}/retry`,
-    { method: "POST", signal },
-  );
-  return parseResponse<EditorGenerationResponse>(response);
-}
-
 export async function fetchDocumentVersions(
   documentId: string,
   signal?: AbortSignal,

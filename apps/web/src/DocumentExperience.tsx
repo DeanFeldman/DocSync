@@ -37,6 +37,8 @@ import {
   getWorkspaceViewState,
   loadWorkspaceResource,
   nearMatchesResourceKey,
+  refreshWorkspaceResource,
+  setWorkspaceResource,
   setWorkspaceViewState,
   versionHistoryResourceKey,
   wordPreviewResourceKey,
@@ -50,7 +52,6 @@ import {
   normaliseMatch,
   wordDifferenceSpans,
 } from "./editorUtils";
-import type { QuillDraft } from "./QuillBlockEditor";
 import WordPreviewOverlay, {
   type LayoutSelectionIntent,
 } from "./WordPreviewOverlay";
@@ -75,6 +76,7 @@ import type {
   PreviewResponse,
   PreviewRenderJobResponse,
   QuillDelta,
+  QuillDraft,
 } from "./types";
 
 type LoadingStatus = "idle" | "loading" | "ready" | "error";
@@ -91,7 +93,6 @@ interface PendingBlockSelection {
 interface DocumentExperienceProps {
   documentSet: DocumentSetResponse;
   document: DocumentSummary | null;
-  fallbackView: DocumentView | null;
   searchTarget: DocumentSearchTarget | null;
   onGenerated: (result: EditorGenerationResponse) => void;
   generationJobs: EditorGenerationResponse[];
@@ -106,6 +107,7 @@ function previewStageLabel(stage?: string): string {
     opening_document: "Opening document",
     rendering_pdf: "Rendering PDF",
     displaying_document: "Displaying document",
+    updating_preview: "Updating preview",
     preparing_selectable_text: "Preparing selectable text",
     ready_to_edit: "Ready to edit",
     failed: "Failed",
@@ -791,7 +793,6 @@ function PreviewDialog({
 export default function DocumentExperience({
   documentSet,
   document,
-  fallbackView,
   searchTarget,
   onGenerated,
   generationJobs,
@@ -880,10 +881,16 @@ export default function DocumentExperience({
   const contentRequestRef = useRef(0);
   const layoutRequestRef = useRef(0);
   const layoutAbortRef = useRef<AbortController | null>(null);
+  const layoutViewRef = useRef<DocumentView | null>(null);
+  const previewVersionStartedRef = useRef("");
+  const documentOpenStartedRef = useRef(performance.now());
+  const previewRenderLoggedRef = useRef("");
   const inlineCommandIdRef = useRef(0);
   const matchRequestRef = useRef(0);
   const editorActionRequestRef = useRef(0);
   const editorActionAbortRef = useRef<AbortController | null>(null);
+  const generationSubmissionRef = useRef(false);
+  const generationStartedAtRef = useRef(new Map<string, number>());
   const queuedGenerationSnapshotRef = useRef<{
     jobId: string;
     documentId: string;
@@ -927,6 +934,21 @@ export default function DocumentExperience({
     if (!job) return;
     setLastGeneration(job);
     if (["queued", "processing"].includes(job.status)) return;
+
+    const generationStartedAt = generationStartedAtRef.current.get(
+      job.generation_id,
+    );
+    if (generationStartedAt !== undefined) {
+      window.requestAnimationFrame(() => {
+        console.info("DocuSync generation ready", {
+          generationId: job.generation_id,
+          status: job.status,
+          totalMs: Math.round(performance.now() - generationStartedAt),
+          serverTimings: job.timings,
+        });
+      });
+      generationStartedAtRef.current.delete(job.generation_id);
+    }
 
     setPendingGenerationId("");
     const snapshot = queuedGenerationSnapshotRef.current;
@@ -1002,6 +1024,8 @@ export default function DocumentExperience({
     setInlineSelection(null);
     setInlineCommand(null);
     setPreviewJob(null);
+    documentOpenStartedRef.current = performance.now();
+    previewRenderLoggedRef.current = "";
     layoutAbortRef.current?.abort();
     layoutAbortRef.current = null;
 
@@ -1013,13 +1037,16 @@ export default function DocumentExperience({
           activeVersionId,
         ),
       );
+      layoutViewRef.current = cachedPreview ?? null;
       setLayoutView(cachedPreview ?? null);
       setLayoutStatus(cachedPreview ? "ready" : "idle");
+      setShowLayoutStructure(!cachedPreview);
     } else {
+      layoutViewRef.current = null;
       setLayoutView(null);
       setLayoutStatus("idle");
+      setShowLayoutStructure(true);
     }
-    setShowLayoutStructure(false);
   }, [activeViewStateKey, activeVersionId, document?.id, documentSet.id]);
 
   useEffect(() => {
@@ -1057,6 +1084,8 @@ export default function DocumentExperience({
 
     async function loadContent() {
       let loaded = false;
+      const fetchStarted = performance.now();
+      const cacheHit = Boolean(cachedContent);
       try {
         const response = await loadWorkspaceResource(
           resourceKey,
@@ -1066,12 +1095,7 @@ export default function DocumentExperience({
               return normaliseEditorContent(content, document!);
             } catch (error) {
               if (!isUnavailable(error)) throw error;
-              const compatibleView =
-                refreshToken === 0 &&
-                fallbackView?.document_id === document!.id &&
-                fallbackView.version_id === requestedVersionId
-                  ? fallbackView
-                  : await fetchDocumentView(requestedVersionId);
+              const compatibleView = await fetchDocumentView(requestedVersionId);
               return editorContentFromView(compatibleView, document!);
             }
           },
@@ -1100,6 +1124,11 @@ export default function DocumentExperience({
           )}`,
         );
       } finally {
+        console.info("docsync.document_fetch_timing", {
+          version_id: requestedVersionId,
+          cache_hit: cacheHit,
+          duration_ms: Number((performance.now() - fetchStarted).toFixed(2)),
+        });
         if (requestId === contentRequestRef.current) {
           setContentStatus(loaded ? "ready" : "error");
         }
@@ -1113,9 +1142,25 @@ export default function DocumentExperience({
     document?.version_id,
     document?.current_version_id,
     documentSet.id,
-    fallbackView,
     refreshToken,
   ]);
+
+  useEffect(() => {
+    if (!editorContent || layoutViewRef.current) return;
+    const logKey = `structured:${editorContent.version_id}`;
+    if (previewRenderLoggedRef.current === logKey) return;
+    previewRenderLoggedRef.current = logKey;
+    const frame = window.requestAnimationFrame(() => {
+      console.info("docsync.preview_render_timing", {
+        version_id: editorContent.version_id,
+        mode: "structured_text",
+        duration_ms: Number(
+          (performance.now() - documentOpenStartedRef.current).toFixed(2),
+        ),
+      });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [editorContent?.version_id]);
 
   useEffect(() => {
     if (
@@ -1572,8 +1617,9 @@ export default function DocumentExperience({
     versionScope,
   ]);
 
-  async function loadWordPreview() {
-    if (!document || !activeVersionId || layoutStatus === "loading") return;
+  async function loadWordPreview(force = false) {
+    if (!document || !activeVersionId) return;
+    if (layoutAbortRef.current && !force) return;
     layoutAbortRef.current?.abort();
     const controller = new AbortController();
     layoutAbortRef.current = controller;
@@ -1587,9 +1633,48 @@ export default function DocumentExperience({
     setPreviewJob(null);
     setLocalError("");
 
+    const displayPreview = (response: DocumentView) => {
+      if (
+        controller.signal.aborted ||
+        response.version_id !== activeVersionId ||
+        requestId !== layoutRequestRef.current
+      ) {
+        return;
+      }
+      layoutViewRef.current = response;
+      setWorkspaceResource(resourceKey, response);
+      setLayoutView(response);
+      setShowLayoutStructure(false);
+      const renderStarted = performance.now();
+      window.requestAnimationFrame(() => {
+        console.info("docsync.preview_render_timing", {
+          version_id: activeVersionId,
+          mode: response.preview_cache_status === "stale" ? "stale_word_cache" : "word_cache",
+          duration_ms: Number((performance.now() - renderStarted).toFixed(2)),
+          opening_duration_ms: Number(
+            (performance.now() - documentOpenStartedRef.current).toFixed(2),
+          ),
+        });
+      });
+    };
+
     try {
+      const fetchStarted = performance.now();
       let job = await createPreviewJob(activeVersionId, controller.signal);
-      let displayed = false;
+      console.info("docsync.document_fetch_timing", {
+        version_id: activeVersionId,
+        resource: "preview_job",
+        duration_ms: Number((performance.now() - fetchStarted).toFixed(2)),
+      });
+      let displayed = Boolean(layoutViewRef.current);
+      let displayedFresh = Boolean(
+        displayed && layoutViewRef.current?.preview_cache_status !== "stale",
+      );
+      if (job.cached_preview) {
+        displayPreview(job.cached_preview);
+        displayed = true;
+        displayedFresh = !job.stale_preview_available;
+      }
       while (!controller.signal.aborted) {
         if (
           requestId !== layoutRequestRef.current ||
@@ -1597,19 +1682,29 @@ export default function DocumentExperience({
         ) return;
         setPreviewJob(job);
         if (job.pdf_ready && !displayed) {
-          const response = await loadWorkspaceResource(
+          const response = await refreshWorkspaceResource(
             resourceKey,
-            () => fetchWordPreview(activeVersionId, controller.signal),
+            () => fetchWordPreview(activeVersionId),
           );
           if (controller.signal.aborted) return;
-          setLayoutView(response);
-          setLayoutStatus("ready");
-          setShowLayoutStructure(false);
+          displayPreview(response);
           displayed = true;
+          displayedFresh = true;
         }
         if (["completed", "failed", "interrupted"].includes(job.status)) {
-          if (job.status !== "completed" && !job.pdf_ready) {
-            throw new Error(job.error ?? "Microsoft Word could not prepare the preview.");
+          if (job.status === "completed" && !displayedFresh) {
+            const response = await refreshWorkspaceResource(
+              resourceKey,
+              () => fetchWordPreview(activeVersionId),
+            );
+            if (controller.signal.aborted) return;
+            displayPreview(response);
+            displayed = true;
+            displayedFresh = true;
+          } else if (job.status !== "completed") {
+            throw new Error(
+              job.error ?? "Microsoft Word could not prepare the preview.",
+            );
           }
           break;
         }
@@ -1626,6 +1721,16 @@ export default function DocumentExperience({
         });
         job = await fetchPreviewJob(job.job_id, controller.signal);
       }
+      if (!controller.signal.aborted) {
+        setLayoutStatus("ready");
+        console.info("docsync.document_ready_timing", {
+          version_id: activeVersionId,
+          duration_ms: Number(
+            (performance.now() - documentOpenStartedRef.current).toFixed(2),
+          ),
+          cache_status: layoutViewRef.current?.preview_cache_status ?? "none",
+        });
+      }
     } catch (error) {
       if (controller.signal.aborted) return;
       if (
@@ -1634,12 +1739,15 @@ export default function DocumentExperience({
       ) {
         return;
       }
-      setLayoutStatus("error");
-      setShowLayoutStructure(true);
+      const retainedPreview = layoutViewRef.current;
+      setLayoutStatus(retainedPreview ? "ready" : "error");
+      setShowLayoutStructure(!retainedPreview);
       setLocalError(
         `${document.name}: ${errorMessage(
           error,
-          "Microsoft Word could not prepare the preview. The selectable Layout structure remains available.",
+          retainedPreview
+            ? "The preview refresh failed. The last working cached preview remains available."
+            : "Microsoft Word could not prepare the preview. The selectable Layout structure remains available.",
         )}`,
       );
     } finally {
@@ -1654,13 +1762,13 @@ export default function DocumentExperience({
       mode !== "layout" ||
       !document ||
       !activeVersionId ||
-      layoutStatus !== "idle" ||
-      layoutView
+      previewVersionStartedRef.current === activeVersionId
     ) {
       return;
     }
+    previewVersionStartedRef.current = activeVersionId;
     void loadWordPreview();
-  }, [activeVersionId, document?.id, layoutStatus, layoutView, mode]);
+  }, [activeVersionId, document?.id, mode]);
 
   function setWorkspaceMode(nextMode: WorkspaceMode) {
     const currentMode = modeRef.current;
@@ -2130,7 +2238,8 @@ export default function DocumentExperience({
       validTargets &&
       hasChangedOperation &&
       matchStatus === "ready" &&
-      !action,
+      !action &&
+      !pendingGenerationId,
   );
   const canGenerate = Boolean(
     canPreview &&
@@ -2215,7 +2324,16 @@ export default function DocumentExperience({
   }
 
   async function handleGenerate() {
-    if (!operation || !selectedBlock || !canGenerate) return;
+    if (
+      !operation ||
+      !selectedBlock ||
+      !canGenerate ||
+      generationSubmissionRef.current
+    ) {
+      return;
+    }
+    generationSubmissionRef.current = true;
+    const generationStartedAt = performance.now();
     editorActionAbortRef.current?.abort();
     const requestId = ++editorActionRequestRef.current;
     const controller = new AbortController();
@@ -2236,6 +2354,15 @@ export default function DocumentExperience({
         ) {
           return;
         }
+        console.info("DocuSync generation queued", {
+          generationId: queued.generation_id,
+          requestMs: Math.round(performance.now() - generationStartedAt),
+          serverTimings: queued.timings,
+        });
+        generationStartedAtRef.current.set(
+          queued.generation_id,
+          generationStartedAt,
+        );
 
         const previousEditorContent = editorContent;
         const optimisticTarget = operation.targets.find(
@@ -2325,6 +2452,12 @@ export default function DocumentExperience({
       }
 
       setLastGeneration(result);
+      console.info("DocuSync generation ready", {
+        generationId: result.generation_id,
+        status: result.status,
+        totalMs: Math.round(performance.now() - generationStartedAt),
+        serverTimings: result.timings,
+      });
       onGenerated(result);
       setPreview(null);
       setPreviewOpen(false);
@@ -2357,6 +2490,7 @@ export default function DocumentExperience({
         );
       }
     } finally {
+      generationSubmissionRef.current = false;
       if (requestId === editorActionRequestRef.current) {
         if (editorActionAbortRef.current === controller) {
           editorActionAbortRef.current = null;
@@ -2656,10 +2790,20 @@ export default function DocumentExperience({
             aria-label="Document layout"
             className="editor-mode-panel layout-mode-panel"
           >
-            {layoutStatus === "loading" && (
+            {(layoutStatus === "loading" ||
+              (contentStatus === "loading" && !layoutView && !editorContent)) && (
               <div className="editor-loading-state nonblocking" role="status">
                 <span className="spinner" aria-hidden="true" />
-                {previewStageLabel(previewJob?.stage)}. You can continue using the workspace.
+                <span>
+                  <strong>
+                    {layoutView || editorContent
+                      ? "Updating preview…"
+                      : "Opening document…"}
+                  </strong>
+                  {layoutView || editorContent
+                    ? ` ${previewStageLabel(previewJob?.stage)} continues in the background.`
+                    : " Loading the cached document content."}
+                </span>
               </div>
             )}
             {layoutStatus === "error" && !editorContent && (
@@ -2671,13 +2815,14 @@ export default function DocumentExperience({
                 </p>
               </div>
             )}
-            {layoutStatus === "ready" &&
-              layoutView?.pdf_url &&
+            {layoutView?.pdf_url &&
               !showLayoutStructure && (
               <div className="layout-iframe-shell">
                 <WordPreviewOverlay
+                  documentSetId={documentSet.id}
                   documentName={document.name}
                   versionId={layoutView.version_id}
+                  previewPages={layoutView.pages}
                   selectedElementId={selectedElementId}
                   selectedBlock={selectedBlock}
                   draft={draft}
@@ -2699,13 +2844,14 @@ export default function DocumentExperience({
                     setInlineSelection(null);
                     setShowLayoutStructure(true);
                   }}
-                  onRetryPreview={() => void loadWordPreview()}
+                  onRetryPreview={() => void loadWordPreview(true)}
                 />
               </div>
             )}
             {editorContent &&
               mode === "layout" &&
               (showLayoutStructure ||
+                !layoutView ||
                 (layoutStatus === "ready" &&
                   layoutView &&
                   !layoutView.pdf_url) ||

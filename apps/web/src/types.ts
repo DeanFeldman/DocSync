@@ -159,6 +159,8 @@ export interface PreviewRenderJobResponse {
   render_map_ready: boolean;
   render_map_status: RenderMapStatus;
   cache_hit: boolean;
+  stale_preview_available: boolean;
+  cached_preview?: DocumentView;
   created_at: string;
   updated_at: string;
   completed_at?: string | null;
@@ -184,6 +186,7 @@ export interface DocumentView {
   render_map_url?: string;
   pages: ViewerPage[];
   layout_regions?: LayoutElementRegion[];
+  preview_cache_status?: "fresh" | "stale" | string;
 }
 
 export interface MatchDiscovery {
@@ -337,6 +340,11 @@ export interface QuillOperation {
 
 export interface QuillDelta {
   ops: QuillOperation[];
+}
+
+export interface QuillDraft {
+  delta: QuillDelta;
+  text: string;
 }
 
 export type EditorElementType =
@@ -558,8 +566,10 @@ export interface EditorGenerationResponse {
   result_version_ids?: string[];
   affected_document_count?: number;
   affected_location_count?: number;
+  timings?: Record<string, number>;
   download_url?: string;
   document_set?: DocumentSetResponse;
+  document_updates?: DocumentSummary[];
   versions?: DocumentVersion[];
   files?: Array<{
     source_document_id: string;

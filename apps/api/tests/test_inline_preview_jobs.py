@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import io
+import os
 from pathlib import Path
 import sys
 import time
@@ -117,10 +118,13 @@ def test_preview_job_returns_before_word_finishes_and_reuses_cache(
         nonlocal render_calls
         render_calls += 1
         time.sleep(0.25)
+        output_path = document_service.rendered_pdf_path(document, version.id)
+        temporary_path = output_path.with_name(f"{version.id}-test-refresh.pdf")
         write_pdf(
-            document_service.rendered_pdf_path(document, version.id),
+            temporary_path,
             [(72, 100, text, None)],
         )
+        temporary_path.replace(output_path)
         return document_service.serialize_cached_word_preview(
             session,
             document,
@@ -155,18 +159,87 @@ def test_preview_job_returns_before_word_finishes_and_reuses_cache(
         assert completed["pdf_ready"] is True
         assert completed["render_map_ready"] is True
         assert completed["cache_hit"] is False
-        assert client.get(completed["preview_url"]).status_code == 200
+        preview_response = client.get(completed["preview_url"])
+        assert preview_response.status_code == 200
+        assert preview_response.json()["preview_cache_status"] == "fresh"
         assert render_calls == 1
+
+        first_pages = client.get(f"/api/document-versions/{version_id}/pages")
+        second_pages = client.get(f"/api/document-versions/{version_id}/pages")
+        assert first_pages.status_code == 200
+        assert second_pages.status_code == 200
+        assert second_pages.headers["x-docsync-preview-cache"] == "hit"
 
         cached = client.post(
             f"/api/document-versions/{version_id}/preview-jobs"
         )
         assert cached.status_code == 202
+        assert cached.json()["cached_preview"]["preview_cache_status"] == "fresh"
         cached_result = poll_job(client, cached.json()["job_id"])
         assert cached_result["status"] == "completed"
         assert cached_result["pdf_ready"] is True
         assert cached_result["cache_hit"] is True
         assert render_calls == 1
+
+        database = importlib.import_module("app.database")
+        models = importlib.import_module("app.models")
+        editor_service = importlib.import_module("app.editor_service")
+        with database.SessionLocal() as session:
+            version = session.get(models.DocumentVersion, version_id)
+            assert version is not None
+            cache = session.get(models.DocumentPreviewCache, version_id)
+            assert cache is not None
+            assert cache.word_preview_json["version_id"] == version_id
+            source_path = editor_service.document_version_path(version)
+            source_stat = source_path.stat()
+            os.utime(
+                source_path,
+                ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns + 1_000_000),
+            )
+
+        stale = client.post(f"/api/document-versions/{version_id}/preview-jobs")
+        assert stale.status_code == 202
+        stale_payload = stale.json()
+        assert stale_payload["stale_preview_available"] is True
+        assert stale_payload["cached_preview"]["preview_cache_status"] == "stale"
+        refreshed = poll_job(client, stale_payload["job_id"])
+        assert refreshed["status"] == "completed"
+        assert refreshed["cache_hit"] is False
+        assert refreshed["stale_preview_available"] is False
+        assert render_calls == 2
+
+        with database.SessionLocal() as session:
+            version = session.get(models.DocumentVersion, version_id)
+            assert version is not None
+            source_path = editor_service.document_version_path(version)
+            source_stat = source_path.stat()
+            os.utime(
+                source_path,
+                ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns + 1_000_000),
+            )
+
+        def fail_refresh(*_args, **_kwargs):
+            raise HTTPException(status_code=422, detail="Forced cached refresh failure")
+
+        monkeypatch.setattr(
+            document_service,
+            "render_document_with_word",
+            fail_refresh,
+        )
+        retained = client.post(
+            f"/api/document-versions/{version_id}/preview-jobs"
+        )
+        assert retained.status_code == 202
+        retained_payload = retained.json()
+        assert retained_payload["stale_preview_available"] is True
+        assert retained_payload["cached_preview"]["preview_cache_status"] == "stale"
+        failed_refresh = poll_job(client, retained_payload["job_id"])
+        assert failed_refresh["status"] == "failed"
+        assert failed_refresh["stale_preview_available"] is True
+        still_visible = client.get(f"/api/document-versions/{version_id}/preview")
+        assert still_visible.status_code == 200
+        assert still_visible.json()["preview_cache_status"] == "stale"
+        assert render_calls == 2
 
 
 def test_controlled_pages_are_published_before_coordinate_matching(

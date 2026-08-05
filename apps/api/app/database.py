@@ -84,6 +84,11 @@ def init_db() -> None:
                 name="durable_preview_render_jobs",
                 apply=_migrate_preview_render_jobs,
             ),
+            WorkspaceMigration(
+                version=6,
+                name="durable_document_preview_cache",
+                apply=_migrate_document_preview_cache,
+            ),
         ),
         report_stage=report_stage,
     )
@@ -852,6 +857,29 @@ def _migrate_preview_render_jobs(session: Session) -> None:
         "error_detail = 'DocSync restarted before this preview finished. Retry the preview.' "
         "WHERE status IN ('queued', 'processing')"
     )
+
+
+def _migrate_document_preview_cache(session: Session) -> None:
+    """Add stale-preview state to durable jobs; create_all adds the cache table."""
+
+    connection = session.connection()
+    table_exists = connection.exec_driver_sql(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'preview_render_jobs'"
+    ).first()
+    if table_exists is None:
+        return
+    columns = {
+        str(row[1])
+        for row in connection.exec_driver_sql(
+            "PRAGMA table_info(preview_render_jobs)"
+        ).fetchall()
+    }
+    if "stale_preview_available" not in columns:
+        connection.exec_driver_sql(
+            "ALTER TABLE preview_render_jobs ADD COLUMN "
+            "stale_preview_available BOOLEAN NOT NULL DEFAULT 0"
+        )
 
 
 def get_session() -> Generator[Session, None, None]:

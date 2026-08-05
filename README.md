@@ -9,6 +9,11 @@ DocSync is a local-first Windows desktop application for safely coordinating edi
 
 Upload a set of `.docx` files, inspect their Word layout, edit supported content in a structured rich-text editor, compare repeated wording across documents, preview every change, and generate new immutable document versions. Original uploads are never overwritten.
 
+Opening a document is progressive: DocSync shows cached or structured content first,
+then completes the high-fidelity Word preview in the background. An open workspace
+fills the desktop window, the application page stays fixed, and scrolling is kept
+inside the document list, preview, and editing sidebar.
+
 ---
 
 ## Download
@@ -34,11 +39,12 @@ DocSync-Setup-latest.exe
 ## Version 1.8.0
 
 DocSync `v1.8.0` turns the high-fidelity Word layout into a controlled inline
-editing workspace. **Load Word Preview** now creates a durable background job
-and returns control immediately. Microsoft Word rendering is serialized for COM
-safety, immutable-version PDF caches are reused, controlled page images appear
-before coordinate matching finishes, and visible or nearby pages are mounted
-first.
+editing workspace. Selecting a document first checks version-keyed memory and
+SQLite preview caches, displays readable structured content as soon as it is
+available, and starts the durable Word-preview job automatically. Microsoft Word
+rendering is serialized for COM safety, immutable-version PDF caches are reused,
+controlled page images appear before coordinate matching finishes, and visible or
+nearby pages are mounted first.
 
 Reliable page-relative regions can be focused or clicked without leaving
 **Layout**. A restricted Quill editor appears over the selected paragraph and
@@ -54,9 +60,22 @@ text boxes, watermarks, and other unsafe structures remain preserved and
 read-only. **Select from structure** and the structured **Edit** view remain the
 safe fallback and advanced diagnostic surface.
 
+The open workspace now fills the remaining window height and prevents the outer
+application page from scrolling. Long content scrolls only inside the file rail,
+Word preview, or operation sidebar. The global **Processing** button, processing
+history popover, retry control, and floating interrupted/error notifications have
+been removed. Durable generation and reconciliation still run in the background;
+relevant progress or action errors stay inline with the active document.
+
+Performance work for the current build reduced the median three-document generation
+benchmark by 33.1%. A cached 1,000-block structured preview returned in a 26.98 ms
+median, and Quill now loads as a separate lazy chunk only after an editable region
+is selected.
+
 See [the v1.8.0 release notes](docs/v1.8.0-release-notes.md),
 [inline-layout requirements](docs/v1.8.0-inline-layout-editing-requirements.md),
-and [manual test plan](docs/v1.8.0-manual-testing.md).
+[manual test plan](docs/v1.8.0-manual-testing.md), and the
+[document performance report](docs/performance-optimisation-2026-08.md).
 
 ---
 
@@ -83,10 +102,12 @@ See [the v1.7.0 release notes](docs/v1.7.0-release-notes.md),
 
 DocSync `v1.6.0` moves reviewed document processing into durable, non-blocking
 background jobs. Process returns quickly while users continue navigating, and
-the application keeps visible queued, preparing, applying, validating, saving,
-refreshing, completed, failed, and interrupted states. Completion selectively
-refreshes affected document heads, versions, blocks, matches, search results,
-and downloads without replacing an unrelated active draft.
+the application records queued, preparing, applying, validating, saving,
+refreshing, completed, failed, and interrupted states for safe reconciliation.
+Completion selectively refreshes affected document heads, versions, blocks,
+matches, search results, and downloads without replacing an unrelated active
+draft. The current interface keeps this reconciliation internal rather than
+showing a global processing history control.
 
 The release also preserves custom Word list styles when the list type is not
 changed, strengthens SQLite processing reliability and conflict handling, and
@@ -204,11 +225,13 @@ DocSync provides three document workspace modes.
 
 #### Layout
 
-- Displays the selectable structured document immediately.
-- Queues Microsoft Word rendering after **Load Word Preview** and keeps the
-  workspace responsive while named stages progress.
+- Displays cached or selectable structured content immediately.
+- Starts Microsoft Word rendering automatically and keeps the workspace
+  responsive while preview stages progress.
 - Reuses the Word preview for the same immutable document version.
 - Displays controlled PDF page images before selectable coordinates finish.
+- Fills the remaining desktop window height and keeps document scrolling inside
+  the preview instead of scrolling the application page.
 - Lets users click supported text, place a cursor, and edit the paragraph
   directly without leaving Layout.
 - Reuses the complete operation sidebar for formatting, exact and near matches,
@@ -267,6 +290,9 @@ DocSync supports three controlled editing modes:
 - Reject stale operations when a document changed after the editor was opened.
 - Generate changes atomically.
 - Submit processing to a durable background job and keep navigation available.
+- Keep background-job reconciliation internal without a global processing button,
+  history popover, retry control, or floating processing notifications.
+- Show relevant progress and actionable errors inline with the active document.
 - Refresh only affected workspace resources when processing completes.
 - Create new immutable document versions.
 - Keep original uploads unchanged.
@@ -296,7 +322,8 @@ DocSync is designed around controlled document editing.
 - Stale edits are rejected when a document changes before generation.
 - Failed generation operations are rolled back.
 - Unsupported Word structures are preserved and shown as read-only.
-- Local error messages can be dismissed without disabling the editor.
+- Actionable errors stay inline with the relevant workspace and can be dismissed
+  without disabling the editor; processing errors are not shown as floating popups.
 
 ---
 
@@ -304,8 +331,10 @@ DocSync is designed around controlled document editing.
 
 1. Create a document set.
 2. Upload related Microsoft Word documents.
-3. Open a document in **Layout** and choose **Load Word Preview**.
-4. Continue working while Microsoft Word renders in the background.
+3. Open a document in **Layout**. Cached or structured content appears first and
+   the Word preview starts automatically.
+4. Continue working while Microsoft Word completes the high-fidelity layout in
+   the background.
 5. Click a reliable selectable area and edit it directly over the Word layout.
 6. Use the right sidebar to format text and review exact and near matches.
 7. Choose the editing mode and intended targets.
@@ -379,7 +408,8 @@ normally required.
 Schema migration 2 introduced paragraph-level table mappings, schema migration
 3 added durable background-job progress fields, schema migration 4 reparses all
 immutable versions to add deduplicated, section-aware header/footer blocks, and
-schema migration 5 adds durable preview-render jobs.
+schema migration 5 adds durable preview-render jobs. Schema migration 6 adds the
+durable structured/Word preview cache and stale-preview recovery metadata.
 
 If migration fails, the active database is restored automatically and the
 startup dialog shows the workspace and recovery-backup paths. Do not move or
@@ -634,8 +664,9 @@ http://localhost:8001/docs
 
 - The packaged desktop release currently targets Windows.
 - High-fidelity layout rendering works best when Microsoft Word desktop is installed.
-- High-fidelity Word rendering is intentionally on demand; the structured
-  Layout view remains available when Word is missing or a preview fails.
+- High-fidelity Word rendering starts automatically in the background; cached or
+  structured Layout content remains available when Word is missing or a preview
+  refresh fails.
 - The PDF is a fixed visual snapshot and is never modified. Final Word line
   wrapping and pagination appear after a new version is generated and rerendered.
 - Low-confidence or ambiguous PDF text mappings remain unavailable for inline
@@ -664,7 +695,8 @@ Planned work includes:
 - Hosted authentication
 - PostgreSQL
 - Cloud storage and synchronisation
--- find and replace
+- Find and replace
+
 ---
 
 ## Contributing
