@@ -82,6 +82,7 @@ from .preview_job_service import (
     get_preview_job,
     preview_for_version,
 )
+from .preview_cache_service import get_or_create_structured_preview
 
 
 from .audit_logger import AuditLogger
@@ -274,9 +275,15 @@ def render_document(
 @app.get("/api/document-versions/{version_id}/pages")
 def read_document_pages(
     version_id: str,
+    response: Response,
     session: Session = Depends(get_session),
 ) -> dict:
-    return serialize_version_document_view(session, version_id)
+    started = perf_counter()
+    payload, cache_hit = get_or_create_structured_preview(session, version_id)
+    duration_ms = (perf_counter() - started) * 1000
+    response.headers["Server-Timing"] = f"document-fetch;dur={duration_ms:.2f}"
+    response.headers["X-DocSync-Preview-Cache"] = "hit" if cache_hit else "miss"
+    return payload
 
 
 @app.get("/api/document-versions/{version_id}/rendered-file")
@@ -320,9 +327,20 @@ def read_preview_job(
 @app.get("/api/document-versions/{version_id}/preview")
 def read_document_preview(
     version_id: str,
+    response: Response,
     session: Session = Depends(get_session),
 ) -> dict:
-    return preview_for_version(session, version_id)
+    started = perf_counter()
+    payload = preview_for_version(session, version_id)
+    duration_ms = (perf_counter() - started) * 1000
+    response.headers["Server-Timing"] = f"preview-fetch;dur={duration_ms:.2f}"
+    logger.info(
+        "docsync.preview_fetch_timing version_id=%s cache_status=%s duration_ms=%.2f",
+        version_id,
+        payload.get("preview_cache_status", "fresh"),
+        duration_ms,
+    )
+    return payload
 
 
 @app.get("/api/document-versions/{version_id}/render-map")
@@ -407,9 +425,20 @@ def update_document_element_match_decisions(
 @app.get("/api/document-versions/{version_id}/editor-content")
 def read_document_editor_content(
     version_id: str,
+    response: Response,
     session: Session = Depends(get_session),
 ) -> dict:
-    return serialize_editor_content(session, version_id)
+    started = perf_counter()
+    payload = serialize_editor_content(session, version_id)
+    duration_ms = (perf_counter() - started) * 1000
+    response.headers["Server-Timing"] = f"document-fetch;dur={duration_ms:.2f}"
+    logger.info(
+        "docsync.document_fetch_timing version_id=%s resource=editor_content "
+        "duration_ms=%.2f",
+        version_id,
+        duration_ms,
+    )
+    return payload
 
 
 @app.get("/api/document-versions/{version_id}/download")

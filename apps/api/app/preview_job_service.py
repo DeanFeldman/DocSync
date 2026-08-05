@@ -12,6 +12,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .models import DocumentRecord, DocumentVersion, PreviewRenderJob
+from .preview_cache_service import (
+    cached_word_preview,
+    record_preview_refresh_error,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -66,8 +70,12 @@ def _set_stage(
     session.commit()
 
 
-def serialize_preview_job(job: PreviewRenderJob) -> dict:
-    return {
+def serialize_preview_job(
+    job: PreviewRenderJob,
+    *,
+    cached_preview: dict | None = None,
+) -> dict:
+    payload = {
         "job_id": job.id,
         "document_id": job.document_id,
         "version_id": job.version_id,
@@ -77,6 +85,7 @@ def serialize_preview_job(job: PreviewRenderJob) -> dict:
         "render_map_ready": bool(job.render_map_ready),
         "render_map_status": job.render_map_status,
         "cache_hit": bool(job.cache_hit),
+        "stale_preview_available": bool(job.stale_preview_available),
         "created_at": _iso(job.created_at),
         "updated_at": _iso(job.updated_at),
         "completed_at": _iso(job.completed_at),
@@ -88,6 +97,9 @@ def serialize_preview_job(job: PreviewRenderJob) -> dict:
         ),
         "retry_allowed": job.status in {"failed", "interrupted"},
     }
+    if cached_preview is not None:
+        payload["cached_preview"] = cached_preview
+    return payload
 
 
 def create_preview_job(
@@ -96,7 +108,7 @@ def create_preview_job(
     *,
     start: bool = True,
 ) -> dict:
-    from .document_service import rendered_pdf_path
+    from .document_service import rendered_pdf_path, serialize_cached_word_preview
     from .editor_service import get_version_or_404
 
     version = get_version_or_404(session, version_id)
@@ -110,27 +122,58 @@ def create_preview_job(
         .limit(1)
     )
     if active is not None:
+        cached_preview, cache_state = cached_word_preview(
+            session,
+            version,
+            rendered_pdf_path(version.document, version.id),
+        )
+        if cached_preview is not None:
+            cached_preview = {
+                **cached_preview,
+                "preview_cache_status": cache_state,
+            }
         if start:
             submit_preview_job(active.id)
-        return serialize_preview_job(active)
+        return serialize_preview_job(active, cached_preview=cached_preview)
 
-    pdf_ready = _pdf_is_ready(rendered_pdf_path(version.document, version.id))
+    pdf_path = rendered_pdf_path(version.document, version.id)
+    pdf_ready = _pdf_is_ready(pdf_path)
+    cached_preview, cache_state = cached_word_preview(session, version, pdf_path)
+    if pdf_ready and cache_state == "legacy":
+        # Adopt version-keyed previews created before the SQLite preview cache.
+        cached_preview = serialize_cached_word_preview(session, version.document, version)
+        cache_state = "fresh"
+    if cached_preview is not None:
+        cached_preview = {
+            **cached_preview,
+            "preview_cache_status": cache_state,
+        }
+    stale_preview_available = bool(
+        pdf_ready and cache_state == "stale" and cached_preview is not None
+    )
     job = PreviewRenderJob(
         id=_new_id(),
         document_id=version.document_id,
         version_id=version.id,
         status="queued",
-        stage="displaying_document" if pdf_ready else "queued",
+        stage=(
+            "updating_preview"
+            if stale_preview_available
+            else "displaying_document"
+            if pdf_ready
+            else "queued"
+        ),
         pdf_ready=pdf_ready,
         render_map_ready=False,
         render_map_status="not_requested",
-        cache_hit=pdf_ready,
+        cache_hit=pdf_ready and cache_state == "fresh",
+        stale_preview_available=stale_preview_available,
     )
     session.add(job)
     session.commit()
     if start:
         submit_preview_job(job.id)
-    return serialize_preview_job(job)
+    return serialize_preview_job(job, cached_preview=cached_preview)
 
 
 def get_preview_job(session: Session, job_id: str) -> dict:
@@ -141,11 +184,20 @@ def get_preview_job(session: Session, job_id: str) -> dict:
 
 
 def preview_for_version(session: Session, version_id: str) -> dict:
-    from .document_service import serialize_cached_word_preview
+    from .document_service import rendered_pdf_path, serialize_cached_word_preview
     from .editor_service import get_version_or_404
 
     version = get_version_or_404(session, version_id)
-    return serialize_cached_word_preview(session, version.document, version)
+    cached_preview, cache_state = cached_word_preview(
+        session,
+        version,
+        rendered_pdf_path(version.document, version.id),
+    )
+    if cached_preview is not None:
+        return {**cached_preview, "preview_cache_status": cache_state}
+    if cache_state in {"fresh", "legacy"}:
+        return serialize_cached_word_preview(session, version.document, version)
+    raise HTTPException(status_code=409, detail="The Word preview is still being rendered.")
 
 
 def _new_id() -> str:
@@ -180,20 +232,47 @@ def _process_preview_job(job_id: str) -> None:
 
         try:
             pdf_path = rendered_pdf_path(document, version.id)
-            if _pdf_is_ready(pdf_path):
+            cached_preview, cache_state = cached_word_preview(
+                session,
+                version,
+                pdf_path,
+            )
+            if _pdf_is_ready(pdf_path) and cache_state in {"fresh", "legacy"}:
                 job.cache_hit = True
                 job.pdf_ready = True
+                job.stale_preview_available = False
                 _set_stage(session, job, "displaying_document", status="processing")
+                conversion_started = time.perf_counter()
                 serialize_cached_word_preview(session, document, version)
+                logger.info(
+                    "docsync.docx_conversion_timing version_id=%s cache_hit=true "
+                    "duration_ms=%.2f",
+                    version.id,
+                    (time.perf_counter() - conversion_started) * 1000,
+                )
             else:
-                _set_stage(session, job, "starting_microsoft_word", status="processing")
+                job.stale_preview_available = bool(cached_preview)
+                _set_stage(
+                    session,
+                    job,
+                    "updating_preview" if cached_preview else "starting_microsoft_word",
+                    status="processing",
+                )
                 _set_stage(session, job, "opening_document")
                 _set_stage(session, job, "rendering_pdf")
+                conversion_started = time.perf_counter()
                 render_document_with_word(session, document, version)
+                logger.info(
+                    "docsync.docx_conversion_timing version_id=%s cache_hit=false "
+                    "duration_ms=%.2f",
+                    version.id,
+                    (time.perf_counter() - conversion_started) * 1000,
+                )
                 if not _pdf_is_ready(pdf_path):
                     raise RuntimeError("Microsoft Word did not create a complete PDF preview.")
                 job.pdf_ready = True
                 job.cache_hit = False
+                job.stale_preview_available = False
                 _set_stage(session, job, "displaying_document")
 
             _set_stage(session, job, "preparing_selectable_text")
@@ -228,6 +307,12 @@ def _process_preview_job(job_id: str) -> None:
                     if isinstance(exc, HTTPException)
                     else str(exc) or "The Word preview could not be rendered."
                 )
+                if version is not None:
+                    record_preview_refresh_error(
+                        session,
+                        version,
+                        failed.error_detail,
+                    )
                 failed.completed_at = _now()
                 failed.updated_at = failed.completed_at
                 session.commit()

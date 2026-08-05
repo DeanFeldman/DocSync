@@ -1093,8 +1093,14 @@ def search_document_set(
         "truncated": len(results) < result_count,
     }
 
-def _create_exact_link_groups(session: Session, document_set_id: str) -> None:
-    current_blocks = session.execute(
+def _create_exact_link_groups(
+    session: Session,
+    document_set_id: str,
+    match_hashes: set[str] | None = None,
+) -> None:
+    if match_hashes is not None and not match_hashes:
+        return
+    statement = (
         select(DocumentBlockRevision, DocumentElement)
         .join(
             DocumentHead,
@@ -1113,7 +1119,12 @@ def _create_exact_link_groups(session: Session, document_set_id: str) -> None:
             DocumentBlockRevision.shared_state == "shared",
             DocumentBlockRevision.supported.is_(True),
         )
-    ).all()
+    )
+    if match_hashes is not None:
+        statement = statement.where(
+            DocumentBlockRevision.exact_match_hash.in_(match_hashes)
+        )
+    current_blocks = session.execute(statement).all()
 
     by_hash: dict[str, list[DocumentElement]] = defaultdict(list)
     normalized_by_hash: dict[str, str] = {}
@@ -1170,6 +1181,53 @@ def _rebuild_exact_link_groups(session: Session, document_set_id: str) -> None:
     )
     session.flush()
     _create_exact_link_groups(session, document_set_id)
+
+
+def _rebuild_exact_link_groups_for_hashes(
+    session: Session,
+    document_set_id: str,
+    match_hashes: set[str],
+) -> None:
+    """Rebuild only groups whose current membership can have changed."""
+
+    if not match_hashes:
+        return
+    impacted_group_ids = list(
+        session.scalars(
+            select(LinkMember.link_group_id)
+            .join(DocumentElement, DocumentElement.id == LinkMember.element_id)
+            .join(
+                DocumentBlockRevision,
+                DocumentBlockRevision.element_id == DocumentElement.id,
+            )
+            .join(
+                DocumentHead,
+                DocumentHead.current_version_id == DocumentBlockRevision.version_id,
+            )
+            .join(
+                DocumentRecord,
+                DocumentRecord.id == DocumentBlockRevision.document_id,
+            )
+            .where(
+                DocumentRecord.document_set_id == document_set_id,
+                DocumentBlockRevision.exact_match_hash.in_(match_hashes),
+            )
+            .distinct()
+        )
+    )
+    if impacted_group_ids:
+        session.execute(
+            delete(LinkMember)
+            .where(LinkMember.link_group_id.in_(impacted_group_ids))
+            .execution_options(synchronize_session=False)
+        )
+        session.execute(
+            delete(LinkGroup)
+            .where(LinkGroup.id.in_(impacted_group_ids))
+            .execution_options(synchronize_session=False)
+        )
+        session.flush()
+    _create_exact_link_groups(session, document_set_id, match_hashes)
 
 def list_document_sets(session: Session) -> dict:
     """Return lightweight saved-workspace summaries."""
@@ -1459,7 +1517,9 @@ def serialize_cached_word_preview(
             "render_map_url": f"/api/document-versions/{version.id}/render-map",
         }
     )
-    return view
+    from .preview_cache_service import store_word_preview
+
+    return store_word_preview(session, version, output_path, view)
 
 
 def render_document_with_word(
@@ -1478,7 +1538,19 @@ def render_document_with_word(
 
     cache_id = version.id if version is not None else document.id
     output_path = rendered_pdf_path(document, cache_id)
-    if not output_path.exists() or output_path.stat().st_size == 0:
+    force_render = False
+    if version is not None and output_path.exists() and output_path.stat().st_size > 0:
+        from .preview_cache_service import cached_word_preview
+
+        _cached_preview, cache_state = cached_word_preview(
+            session,
+            version,
+            output_path,
+        )
+        force_render = cache_state == "stale"
+    conversion_started = perf_counter()
+    rendered_now = False
+    if force_render or not output_path.exists() or output_path.stat().st_size == 0:
         powershell = shutil.which("powershell.exe") or shutil.which("powershell")
         render_script = settings.render_script
         if powershell is None or not render_script.exists():
@@ -1491,7 +1563,11 @@ def render_document_with_word(
         temporary_path = output_path.with_name(f"{cache_id}-{new_id()}.tmp.pdf")
         try:
             with WORD_RENDER_LOCK:
-                if output_path.exists() and output_path.stat().st_size > 0:
+                if (
+                    not force_render
+                    and output_path.exists()
+                    and output_path.stat().st_size > 0
+                ):
                     temporary_path.unlink(missing_ok=True)
                 else:
                     result = subprocess.run(
@@ -1522,6 +1598,7 @@ def render_document_with_word(
                             ),
                         )
                     temporary_path.replace(output_path)
+                    rendered_now = True
         except subprocess.TimeoutExpired as exc:
             raise HTTPException(
                 status_code=504,
@@ -1529,6 +1606,13 @@ def render_document_with_word(
             ) from exc
         finally:
             temporary_path.unlink(missing_ok=True)
+
+    logger.info(
+        "docsync.word_render_timing version_id=%s cache_hit=%s duration_ms=%.2f",
+        cache_id,
+        not rendered_now,
+        (perf_counter() - conversion_started) * 1000,
+    )
 
     if version is not None:
         return serialize_cached_word_preview(session, document, version)

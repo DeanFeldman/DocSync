@@ -42,15 +42,16 @@ test("Layout selection keeps and focuses the exact supported table paragraph inl
 });
 
 test("the one-paragraph Quill boundary resets history and blocks structure edits", () => {
-  const editor = read("apps/web/src/QuillBlockEditor.tsx");
+  const editor = read("apps/web/src/InlineLayoutEditor.tsx");
 
-  assert.match(editor, /docsyncEnter:[\s\S]*handler: \(\) => false/);
+  assert.match(editor, /docsyncInlineEnter:[\s\S]*handler: \(\) => false/);
   assert.match(editor, /aria-multiline", "false"/);
   assert.match(editor, /replace\(\/\\s\*\[\\r\\n\]\+\\s\*\/g, " "\)/);
   assert.match(editor, /quill\.history\.clear\(\)/);
   assert.match(editor, /quill\.history\.undo\(\)/);
   assert.match(editor, /quill\.history\.redo\(\)/);
-  assert.match(editor, /"table_paragraph",[\s\S]*"header_paragraph",[\s\S]*"footer_paragraph"/);
+  assert.match(editor, /loadQuill/);
+  assert.match(editor, /import\("quill"\)/);
 });
 
 test("table paragraph active and read-only states remain explicit in dark mode", () => {
@@ -58,6 +59,6 @@ test("table paragraph active and read-only states remain explicit in dark mode",
 
   assert.match(styles, /\.document-element\.table_paragraph\.selected/);
   assert.match(styles, /:root\[data-theme="dark"\] \.editor-block-card\.read-only/);
-  assert.match(styles, /:root\[data-theme="dark"\] \.selected-block-context/);
+  assert.match(styles, /:root\[data-theme="dark"\] \.editor-block-card\.read-only/);
   assert.match(styles, /\.support-label\.read-only/);
 });

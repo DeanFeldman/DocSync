@@ -323,6 +323,7 @@ class PreviewRenderJob(Base):
         String(30), default="not_requested"
     )
     cache_hit: Mapped[bool] = mapped_column(Boolean, default=False)
+    stale_preview_available: Mapped[bool] = mapped_column(Boolean, default=False)
     error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now
@@ -332,6 +333,40 @@ class PreviewRenderJob(Base):
     )
     completed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+
+
+class DocumentPreviewCache(Base):
+    """Durable, version-keyed payload for immediate document opening.
+
+    Large PDF and page-image binaries remain on disk. SQLite stores the
+    processed preview description and the source/PDF identity needed to decide
+    whether those files can be reused safely.
+    """
+
+    __tablename__ = "document_preview_caches"
+
+    version_id: Mapped[str] = mapped_column(
+        ForeignKey("document_versions.id", ondelete="CASCADE"), primary_key=True
+    )
+    document_id: Mapped[str] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), index=True
+    )
+    source_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    source_mtime_ns: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    pdf_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    pdf_mtime_ns: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    structured_preview_json: Mapped[dict | list | None] = mapped_column(
+        JSON, nullable=True
+    )
+    word_preview_json: Mapped[dict | list | None] = mapped_column(JSON, nullable=True)
+    refresh_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
     )
 
 

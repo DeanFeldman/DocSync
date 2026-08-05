@@ -7,23 +7,15 @@ import {
   useRef,
   useState,
 } from "react";
-import type { CSSProperties } from "react";
 import {
   absoluteApiUrl,
-  absoluteDownloadUrl,
   addDocumentsToSet,
   deleteDocumentSet,
   fetchDocumentSet,
   fetchDocumentSets,
-  fetchDocumentView,
   fetchEditorGeneration,
   fetchEditorGenerationJobs,
-  fetchRecoverableEditorGenerationJobs,
-  fetchElementMatches,
-  generateEdit,
-  previewEdit,
   removeDocumentFromSet,
-  retryEditorGeneration,
   searchDocumentSet,
   uploadDocumentSet,
 } from "./api";
@@ -32,14 +24,9 @@ import type {
   DocumentSetResponse,
   DocumentSearchTarget,
   DocumentSummary,
-  DocumentView,
   EditorGenerationResponse,
-  GenerationResponse,
   GlobalSearchResponse,
   GlobalSearchResult,
-  MatchDiscovery,
-  PreviewResponse,
-  ViewerElement,
 } from "./types";
 
 import docSyncLogo from "./assets/Docsync LOGO.png";
@@ -60,10 +47,6 @@ import {
 type BusyAction =
   | "upload"
   | "open-set"
-  | "view"
-  | "matches"
-  | "preview"
-  | "generate"
   | "add-documents"
   | "remove-document"
   | "delete-set"
@@ -76,20 +59,10 @@ type CreationStage =
   | "workspace"
   | null;
 
-type ProcessingNotification = {
-  id: string;
-  kind: "accepted" | "success" | "error";
-  title: string;
-  message: string;
-};
-
 type NewerVersionNotice = {
   document: DocumentSummary;
   jobId: string;
 };
-
-const INITIAL_VISIBLE_PAGES = 8;
-const VISIBLE_PAGE_BATCH = 8;
 
 function readableBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -102,21 +75,6 @@ function elementLabel(elementType: string): string {
   if (elementType === "table_cell") return "Table cell";
   if (elementType === "table_paragraph") return "Table paragraph";
   return elementType.charAt(0).toUpperCase() + elementType.slice(1);
-}
-
-function generationStageLabel(stage?: string): string {
-  const labels: Record<string, string> = {
-    queued: "Queued",
-    preparing_documents: "Preparing documents",
-    applying_changes: "Applying changes",
-    validating_generated_files: "Validating generated files",
-    saving_new_versions: "Saving new versions",
-    refreshing_workspace: "Refreshing workspace",
-    completed: "Completed",
-    failed: "Failed",
-    interrupted: "Interrupted",
-  };
-  return labels[stage ?? ""] ?? "Processing";
 }
 
 function mergeGenerationJobs(
@@ -161,62 +119,6 @@ function elementLocation(element: ElementLocation): string {
   }`;
 }
 
-type PositionedViewerElement = ViewerElement & {
-  preview_row_index?: number;
-  preview_column_index?: number;
-};
-
-type ViewerBlock =
-  | { kind: "element"; element: ViewerElement }
-  | { kind: "table"; tableIndex: number; cells: PositionedViewerElement[] };
-
-function groupViewerElements(elements: ViewerElement[]): ViewerBlock[] {
-  const blocks: ViewerBlock[] = [];
-
-  for (const element of elements) {
-    if (
-      element.element_type === "table_cell" &&
-      element.table_index !== undefined
-    ) {
-      const previous = blocks.at(-1);
-      if (
-        previous?.kind === "table" &&
-        previous.tableIndex === element.table_index
-      ) {
-        previous.cells.push(element);
-      } else {
-        blocks.push({
-          kind: "table",
-          tableIndex: element.table_index,
-          cells: [element],
-        });
-      }
-      continue;
-    }
-
-    blocks.push({ kind: "element", element });
-  }
-
-  for (const block of blocks) {
-    if (block.kind !== "table") continue;
-
-    const usedRows = Array.from(
-      new Set(block.cells.map((cell) => cell.row_index ?? 0)),
-    ).sort((left, right) => left - right);
-    const usedColumns = Array.from(
-      new Set(block.cells.map((cell) => cell.column_index ?? 0)),
-    ).sort((left, right) => left - right);
-
-    block.cells = block.cells.map((cell) => ({
-      ...cell,
-      preview_row_index: usedRows.indexOf(cell.row_index ?? 0),
-      preview_column_index: usedColumns.indexOf(cell.column_index ?? 0),
-    }));
-  }
-
-  return blocks;
-}
-
 function readableDate(value: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "Saved locally";
@@ -224,18 +126,6 @@ function readableDate(value: string): string {
     year: "numeric",
     month: "short",
     day: "numeric",
-  });
-}
-
-function readableDateTime(value?: string): string {
-  if (!value) return "Submitted just now";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "Submitted recently";
-  return date.toLocaleString(undefined, {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
   });
 }
 
@@ -265,36 +155,18 @@ const [setNameTouched, setSetNameTouched] = useState(false);
   const [documentSearchTarget, setDocumentSearchTarget] =
     useState<DocumentSearchTarget | null>(null);
   const [activeDocumentId, setActiveDocumentId] = useState("");
-  const [viewer, setViewer] = useState<DocumentView | null>(null);
-  const [selectedElementId, setSelectedElementId] = useState("");
-  const [discovery, setDiscovery] = useState<MatchDiscovery | null>(null);
-  const [includedElementIds, setIncludedElementIds] = useState<string[]>([]);
-  const [replacement, setReplacement] = useState("");
-  const [preview, setPreview] = useState<PreviewResponse | null>(null);
-  const [generation, setGeneration] = useState<GenerationResponse | null>(null);
   const [busyAction, setBusyAction] = useState<BusyAction>(null);
   const [creationStage, setCreationStage] = useState<CreationStage>(null);
   const [error, setError] = useState("");
-  const [searchQuery, setSearchQuery] = useState("");
-  const [searchCursor, setSearchCursor] = useState(-1);
-  const [zoom, setZoom] = useState(1);
-  const [currentPage, setCurrentPage] = useState(1);
-  const [visiblePageCount, setVisiblePageCount] = useState(INITIAL_VISIBLE_PAGES);
-  const [viewMode, setViewMode] = useState<"visual" | "select">("visual");
   const [editorDirty, setEditorDirty] = useState(false);
   const [generationJobs, setGenerationJobs] = useState<
     EditorGenerationResponse[]
-  >([]);
-  const [processingOpen, setProcessingOpen] = useState(false);
-  const [processingNotifications, setProcessingNotifications] = useState<
-    ProcessingNotification[]
   >([]);
   const [newerVersionNotice, setNewerVersionNotice] =
     useState<NewerVersionNotice | null>(null);
   const [deferredDocumentUpdates, setDeferredDocumentUpdates] = useState<
     Record<string, DocumentSummary>
   >({});
-  const viewerScrollRef = useRef<HTMLDivElement>(null);
   const addDocumentsInputRef = useRef<HTMLInputElement>(null);
   const globalSearchInputRef = useRef<HTMLInputElement>(null);
   const globalSearchContainerRef = useRef<HTMLDivElement>(null);
@@ -307,6 +179,11 @@ const [setNameTouched, setSetNameTouched] = useState(false);
   useEffect(() => {
     applyTheme(theme);
   }, [theme]);
+
+  useEffect(() => {
+    document.body.classList.toggle("workspace-open", Boolean(documentSet));
+    return () => document.body.classList.remove("workspace-open");
+  }, [documentSet?.id]);
 
   function toggleTheme() {
     const nextTheme: AppTheme = theme === "dark" ? "light" : "dark";
@@ -366,22 +243,6 @@ const [setNameTouched, setSetNameTouched] = useState(false);
     ? "Enter a document-set name."
     : "";
 
-  const selectedElement = useMemo(() => {
-    return (
-      viewer?.pages
-        .flatMap((page) => page.elements)
-        .find((element) => element.id === selectedElementId) ?? null
-    );
-  }, [selectedElementId, viewer]);
-
-  const searchMatches = useMemo(() => {
-    const query = searchQuery.trim().toLocaleLowerCase();
-    if (!query || !viewer) return [];
-    return viewer.pages
-      .flatMap((page) => page.elements)
-      .filter((element) => element.text.toLocaleLowerCase().includes(query));
-  }, [searchQuery, viewer]);
-
   useEffect(() => {
     let cancelled = false;
 
@@ -409,26 +270,12 @@ const [setNameTouched, setSetNameTouched] = useState(false);
   }, []);
 
   useEffect(() => {
-    const controller = new AbortController();
-    void fetchRecoverableEditorGenerationJobs(controller.signal)
-      .then((response) => {
-        setGenerationJobs((current) =>
-          mergeGenerationJobs(current, response.jobs),
-        );
-      })
-      .catch(() => {
-        // Startup recovery status is supplementary to the saved workspace list.
-      });
-    return () => controller.abort();
-  }, []);
-
-  useEffect(() => {
     if (!documentSet?.id) return;
     const controller = new AbortController();
     void fetchEditorGenerationJobs(documentSet.id, controller.signal)
       .then((response) => {
         const relevant = response.jobs.filter((job) => {
-          if (["completed", "failed"].includes(job.status)) {
+          if (["completed", "failed", "interrupted"].includes(job.status)) {
             handledGenerationJobsRef.current.add(job.generation_id);
             return false;
           }
@@ -564,68 +411,6 @@ const [setNameTouched, setSetNameTouched] = useState(false);
   ]);
 
   useEffect(() => {
-    setSearchCursor(-1);
-  }, [searchQuery, activeDocumentId]);
-
-  useEffect(() => {
-    if (!viewer) return;
-
-    setVisiblePageCount(INITIAL_VISIBLE_PAGES);
-    window.requestAnimationFrame(() => {
-      viewerScrollRef.current?.scrollTo({
-        top: 0,
-        left: 0,
-        behavior: "auto",
-      });
-      setCurrentPage(1);
-    });
-  }, [activeDocumentId, viewer?.version_id]);
-
-  useEffect(() => {
-    const container = viewerScrollRef.current;
-    if (!container || !viewer) return;
-
-    function updateCurrentPage() {
-      if (!container) return;
-      const containerTop = container.getBoundingClientRect().top;
-      const pages = Array.from(
-        container.querySelectorAll<HTMLElement>("[data-page-number]"),
-      );
-      let closestPage = 1;
-      let closestDistance = Number.POSITIVE_INFINITY;
-      for (const page of pages) {
-        const distance = Math.abs(page.getBoundingClientRect().top - containerTop - 24);
-        if (distance < closestDistance) {
-          closestDistance = distance;
-          closestPage = Number(page.dataset.pageNumber ?? 1);
-        }
-      }
-      setCurrentPage(closestPage);
-
-      const remainingScroll =
-        container.scrollHeight - container.scrollTop - container.clientHeight;
-      if (remainingScroll < 1400) {
-        setVisiblePageCount((current) =>
-          Math.min(viewer?.pages.length ?? current + VISIBLE_PAGE_BATCH),
-        );
-      }
-    }
-
-    container.addEventListener("scroll", updateCurrentPage, { passive: true });
-    updateCurrentPage();
-    return () => container.removeEventListener("scroll", updateCurrentPage);
-  }, [viewer, zoom]);
-
-  useEffect(() => {
-    if (!preview) return;
-    function closeOnEscape(event: KeyboardEvent) {
-      if (event.key === "Escape" && busyAction !== "generate") setPreview(null);
-    }
-    window.addEventListener("keydown", closeOnEscape);
-    return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [busyAction, preview]);
-
-  useEffect(() => {
     if (!window.history.state?.view) {
       window.history.replaceState({ view: "home" }, "");
     }
@@ -640,59 +425,24 @@ const [setNameTouched, setSetNameTouched] = useState(false);
     return () => window.removeEventListener("popstate", handlePopState);
   }, []);
 
-  function clearSelection() {
-    setSelectedElementId("");
-    setDiscovery(null);
-    setIncludedElementIds([]);
-    setReplacement("");
-    setPreview(null);
-  }
-
-  function pushProcessingNotification(
-    notification: ProcessingNotification,
-  ) {
-    setProcessingNotifications((current) => [
-      notification,
-      ...current.filter((item) => item.id !== notification.id),
-    ].slice(0, 4));
-  }
-
   function handleGenerationQueued(job: EditorGenerationResponse) {
     handledGenerationJobsRef.current.delete(job.generation_id);
     setGenerationJobs((current) => mergeGenerationJobs(current, [job]));
-    pushProcessingNotification({
-      id: `${job.generation_id}:accepted`,
-      kind: "accepted",
-      title: "Changes submitted",
-      message:
-        "DocSync is creating the updated document versions in the background. You may continue working.",
-    });
   }
 
   function handleGenerationJobSettled(job: EditorGenerationResponse) {
     if (job.status !== "completed") {
-      pushProcessingNotification({
-        id: `${job.generation_id}:${job.status}`,
-        kind: "error",
-        title:
-          job.status === "interrupted"
-            ? "Processing interrupted"
-            : "Processing failed",
-        message:
-          job.error_detail ??
-          job.error ??
-          "No document versions were changed. Open processing details to review the error.",
-      });
       return;
     }
 
     const updated = job.document_set;
+    const documentUpdates = job.document_updates ?? updated?.documents ?? [];
     const affectedIds = new Set(
       job.affected_document_ids ??
         job.versions?.map((version) => version.document_id) ??
         [],
     );
-    const updatedActiveDocument = updated?.documents.find(
+    const updatedActiveDocument = documentUpdates.find(
       (item) => item.id === activeDocumentIdRef.current && affectedIds.has(item.id),
     );
     const currentActiveDocument = documentSet?.documents.find(
@@ -715,17 +465,19 @@ const [setNameTouched, setSetNameTouched] = useState(false);
       });
     }
 
-    if (updated) {
+    if (updated || documentUpdates.length) {
+      const workspaceId = updated?.id ?? documentSet?.id;
+      if (!workspaceId) return;
       for (const documentId of affectedIds) {
-        invalidateDocumentHeadResources(updated.id, documentId);
+        invalidateDocumentHeadResources(workspaceId, documentId);
       }
       setDocumentSet((current) => {
-        if (!current || current.id !== updated.id) return current;
+        if (!current || current.id !== workspaceId) return current;
         const updatedById = new Map(
-          updated.documents.map((item) => [item.id, item]),
+          documentUpdates.map((item) => [item.id, item]),
         );
         return {
-          ...updated,
+          ...(updated ?? current),
           documents: current.documents.map((item) => {
             const replacement = updatedById.get(item.id) ?? item;
             return editorDirty && item.id === activeDocumentIdRef.current && affectedIds.has(item.id)
@@ -736,11 +488,12 @@ const [setNameTouched, setSetNameTouched] = useState(false);
       });
       setSavedSets((current) =>
         current.map((item) =>
-          item.id === updated.id
+          item.id === workspaceId
             ? {
                 ...item,
-                name: updated.name,
-                document_count: updated.documents.length,
+                name: updated?.name ?? item.name,
+                document_count:
+                  updated?.documents.length ?? item.document_count,
                 edit_count: item.edit_count + 1,
               }
             : item,
@@ -749,29 +502,6 @@ const [setNameTouched, setSetNameTouched] = useState(false);
       setGlobalSearchRefreshToken((current) => current + 1);
     }
 
-    const count = job.affected_document_ids?.length ?? job.versions?.length ?? 0;
-    pushProcessingNotification({
-      id: `${job.generation_id}:completed`,
-      kind: "success",
-      title: "Processing complete",
-      message: `${count} document${count === 1 ? " was" : "s were"} updated successfully. New Word previews are rendering in the background.`,
-    });
-  }
-
-  async function handleRetryGeneration(job: EditorGenerationResponse) {
-    try {
-      handleGenerationQueued(await retryEditorGeneration(job.generation_id));
-    } catch (caught) {
-      pushProcessingNotification({
-        id: `${job.generation_id}:retry-error`,
-        kind: "error",
-        title: "Retry was not accepted",
-        message:
-          caught instanceof Error
-            ? caught.message
-            : "Reload the latest versions and review the change before retrying.",
-      });
-    }
   }
 
   function openNewerVersion(notice: NewerVersionNotice) {
@@ -828,9 +558,7 @@ const [setNameTouched, setSetNameTouched] = useState(false);
 
     setDocumentSet(null);
     setActiveDocumentId("");
-    setViewer(null);
     setFiles([]);
-    setGeneration(null);
     setGlobalSearchQuery("");
     setGlobalSearchResults([]);
     setGlobalSearchSummary({
@@ -844,7 +572,6 @@ const [setNameTouched, setSetNameTouched] = useState(false);
     setNewerVersionNotice(null);
     setDeferredDocumentUpdates({});
     setError("");
-    clearSelection();
   }
 
   function handleFiles(event: ChangeEvent<HTMLInputElement>) {
@@ -873,10 +600,6 @@ const [setNameTouched, setSetNameTouched] = useState(false);
 
     setDocumentSet(workspace);
     setActiveDocumentId(firstDocument?.id ?? "");
-    setViewer(null);
-    setViewMode("select");
-    setCurrentPage(1);
-    setSearchQuery("");
     setGlobalSearchQuery("");
     setGlobalSearchResults([]);
     setGlobalSearchSummary({
@@ -886,11 +609,9 @@ const [setNameTouched, setSetNameTouched] = useState(false);
     });
     setGlobalSearchOpen(false);
     setDocumentSearchTarget(null);
-    setGeneration(null);
     setEditorDirty(false);
     setNewerVersionNotice(null);
     setDeferredDocumentUpdates({});
-    clearSelection();
   }
 
 async function handleUpload(event: FormEvent) {
@@ -996,7 +717,6 @@ async function handleUpload(event: FormEvent) {
             : item,
         ),
       );
-      setGeneration(null);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "The documents could not be added.");
     } finally {
@@ -1024,16 +744,11 @@ async function handleUpload(event: FormEvent) {
             : item,
         ),
       );
-      setGeneration(null);
-      clearSelection();
       clearWorkspaceResourcesForDocument(documentSet.id, document.id);
 
       if (activeDocumentId === document.id) {
         const nextDocument = updated.documents[0] ?? null;
         setActiveDocumentId(nextDocument?.id ?? "");
-        setViewer(null);
-        setViewMode("select");
-        setCurrentPage(1);
       }
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "The document could not be removed.");
@@ -1050,7 +765,7 @@ async function handleUpload(event: FormEvent) {
     if (!targetDocument) return;
 
     setGlobalSearchOpen(false);
-    await openDocument(targetDocument, "", result);
+    await openDocument(targetDocument, result);
   }
 
   function handleGlobalSearchResultKeyDown(
@@ -1089,18 +804,12 @@ async function handleUpload(event: FormEvent) {
 
   async function openDocument(
     document: DocumentSummary,
-    targetElementId = "",
     searchResult: GlobalSearchResult | null = null,
   ) {
-    const hasDraft = Boolean(
-      editorDirty ||
-        (selectedElement &&
-          replacement.trim() !== selectedElement.text.trim() &&
-          !preview),
-    );
+    const hasDraft = editorDirty;
     if (
       hasDraft &&
-      !window.confirm("Switch documents and discard the unpreviewed replacement text?")
+      !window.confirm("Switch documents and discard the uncommitted editor draft?")
     ) {
       return;
     }
@@ -1146,139 +855,6 @@ async function handleUpload(event: FormEvent) {
         : null,
     );
     setActiveDocumentId((deferredDocument ?? document).id);
-    setViewer(null);
-    setCurrentPage(1);
-    setSearchQuery("");
-    clearSelection();
-    setViewer(null);
-    setViewMode("select");
-  }
-
-  async function selectElement(element: ViewerElement) {
-    setSelectedElementId(element.id);
-    setReplacement(element.text);
-    setPreview(null);
-    setError("");
-    setBusyAction("matches");
-    try {
-      const matches = await fetchElementMatches(element.id);
-      setDiscovery(matches);
-      setIncludedElementIds(
-        matches.link_group
-          ? matches.link_group.members.map((member) => member.element_id)
-          : [element.id],
-      );
-    } catch (caught) {
-      setDiscovery(null);
-      setIncludedElementIds([element.id]);
-      setError(caught instanceof Error ? caught.message : "Match discovery failed.");
-    } finally {
-      setBusyAction(null);
-    }
-  }
-
-  function toggleTarget(elementId: string) {
-    if (elementId === selectedElementId) return;
-    setIncludedElementIds((current) =>
-      current.includes(elementId)
-        ? current.filter((item) => item !== elementId)
-        : [...current, elementId],
-    );
-    setPreview(null);
-  }
-
-  function moveSearch(direction: 1 | -1) {
-    if (searchMatches.length === 0) return;
-    const next =
-      (searchCursor + direction + searchMatches.length) % searchMatches.length;
-    const target = searchMatches[next];
-
-    setSearchCursor(next);
-    setVisiblePageCount((current) => Math.max(current, target.page_number));
-    window.setTimeout(() => {
-      document
-        .getElementById(`element-${target.id}`)
-        ?.scrollIntoView({ behavior: "smooth", block: "center" });
-    }, 50);
-  }
-
-  async function handlePreview() {
-    if (!documentSet || !discovery?.link_group || !selectedElement) return;
-    setError("");
-    setBusyAction("preview");
-    try {
-      setPreview(
-        await previewEdit(
-          documentSet.id,
-          discovery.link_group.id,
-          replacement,
-          selectedElement.id,
-          includedElementIds,
-        ),
-      );
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "The preview failed.");
-    } finally {
-      setBusyAction(null);
-    }
-  }
-
-  async function handleGenerate() {
-    if (!documentSet || !discovery?.link_group || !selectedElement) return;
-    setError("");
-    setBusyAction("generate");
-    try {
-      const result = await generateEdit(
-        documentSet.id,
-        discovery.link_group.id,
-        replacement,
-        selectedElement.id,
-        includedElementIds,
-      );
-      setDocumentSet(result.document_set);
-      setDocumentSearchTarget(null);
-      setGeneration(result);
-      setSavedSets((current) =>
-        current.map((item) =>
-          item.id === result.document_set.id
-            ? {
-                ...item,
-                name: result.document_set.name,
-                document_count: result.document_set.documents.length,
-                edit_count: item.edit_count + 1,
-              }
-            : item,
-        ),
-      );
-      setPreview(null);
-      clearSelection();
-      setViewer(null);
-      setViewMode("visual");
-      setBusyAction("view");
-
-      const refreshedDocument = result.document_set.documents.find(
-        (document) => document.id === activeDocumentId,
-      );
-      if (refreshedDocument) {
-        try {
-          const rendered = await fetchDocumentView(refreshedDocument.version_id);
-          setViewer(rendered);
-          setViewMode(rendered.pdf_url ? "visual" : "select");
-          setCurrentPage(1);
-        } catch (caught) {
-          setViewer(null);
-          setError(
-            `The changes were applied, but the refreshed preview could not open: ${
-              caught instanceof Error ? caught.message : "Unknown preview error."
-            }`,
-          );
-        }
-      }
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Generation failed.");
-    } finally {
-      setBusyAction(null);
-    }
   }
 
   function handleEditorGenerated(result: EditorGenerationResponse) {
@@ -1302,71 +878,10 @@ async function handleUpload(event: FormEvent) {
         ),
       );
     }
-    setGeneration(null);
     setEditorDirty(false);
   }
 
-  function renderViewerElement(
-    element: PositionedViewerElement,
-    insideTable = false,
-  ) {
-    const isSearchMatch =
-      Boolean(searchQuery.trim()) &&
-      searchMatches.some((match) => match.id === element.id);
-
-    const tableStyle =
-      insideTable &&
-      element.row_index !== undefined &&
-      element.column_index !== undefined
-        ? {
-            gridRow:
-              (element.preview_row_index ?? element.row_index) + 1,
-            gridColumn:
-              (element.preview_column_index ?? element.column_index) + 1,
-            minWidth: 0,
-          }
-        : undefined;
-
-    return (
-      <button
-        type="button"
-        id={`element-${element.id}`}
-        key={element.id}
-        className={`document-element ${element.element_type} ${
-          insideTable ? "inside-table" : ""
-        } ${selectedElementId === element.id ? "selected" : ""} ${
-          isSearchMatch ? "search-match" : ""
-        }`}
-        style={tableStyle}
-        onClick={() => void selectElement(element)}
-        aria-pressed={selectedElementId === element.id}
-        aria-label={`Select ${elementLabel(element.element_type)}: ${element.text}`}
-      >
-        <span className="selection-marker" aria-hidden="true">Edit</span>
-        {["table_cell", "table_paragraph"].includes(element.element_type) && (
-          <small className="table-cell-location">
-            {elementLocation(element)}
-          </small>
-        )}
-        <span>{element.text}</span>
-      </button>
-    );
-  }
-
-
 const canUpload = files.length >= 2 && !busyAction;
-  const activeGenerationJobs = generationJobs.filter((job) =>
-    ["queued", "processing"].includes(job.status),
-  );
-  const canPreview = Boolean(
-    documentSet &&
-      discovery?.link_group &&
-      selectedElement &&
-      replacement.trim().length > 0 &&
-      includedElementIds.includes(selectedElement.id) &&
-      !busyAction,
-  );
-
   return (
     <div className={`app-shell ${documentSet ? "workspace-mode" : ""}`}>
       <header className="topbar">
@@ -1389,79 +904,6 @@ const canUpload = files.length >= 2 && !busyAction;
               </p> */}
 
         <div className="topbar-actions">
-          {generationJobs.length > 0 && (
-            <div
-              className="processing-center"
-              onBlur={(event) => {
-                if (
-                  !event.currentTarget.contains(
-                    event.relatedTarget as Node | null,
-                  )
-                ) {
-                  setProcessingOpen(false);
-                }
-              }}
-            >
-              <button
-                type="button"
-                className={`processing-indicator ${
-                  activeGenerationJobs.length ? "active" : ""
-                }`}
-                onClick={() => setProcessingOpen((current) => !current)}
-                aria-expanded={processingOpen}
-                aria-controls="processing-job-list"
-              >
-                {activeGenerationJobs.length > 0 ? (
-                  <>
-                    <span className="processing-dot" aria-hidden="true" />
-                    Processing {activeGenerationJobs.length} change
-                    {activeGenerationJobs.length === 1 ? "" : "s"}…
-                  </>
-                ) : (
-                  "Recent processing"
-                )}
-              </button>
-              {processingOpen && (
-                <section
-                  id="processing-job-list"
-                  className="processing-popover"
-                  aria-label="Background processing jobs"
-                >
-                  <header>
-                    <strong>Background processing</strong>
-                    <span>Work continues while you navigate.</span>
-                  </header>
-                  <div className="processing-job-list">
-                    {generationJobs.slice(0, 8).map((job) => (
-                      <article className={`processing-job ${job.status}`} key={job.generation_id}>
-                        <div className="processing-job-heading">
-                          <strong>{generationStageLabel(job.stage)}</strong>
-                          <span>{job.status}</span>
-                        </div>
-                        <p>
-                          {job.affected_documents?.map((item) => item.name).join(", ") ||
-                            `${job.affected_document_count ?? 0} document${
-                              job.affected_document_count === 1 ? "" : "s"
-                            }`}
-                        </p>
-                        <small>{readableDateTime(job.submitted_at)}</small>
-                        {job.error_detail && <p className="processing-job-error">{job.error_detail}</p>}
-                        {["failed", "interrupted"].includes(job.status) && (
-                          <button
-                            type="button"
-                            className="quiet-button"
-                            onClick={() => void handleRetryGeneration(job)}
-                          >
-                            Retry safely
-                          </button>
-                        )}
-                      </article>
-                    ))}
-                  </div>
-                </section>
-              )}
-            </div>
-          )}
           <span
             className="version-badge"
             aria-label={`DocSync version ${__DOCSYNC_VERSION__}`}
@@ -1686,7 +1128,7 @@ const canUpload = files.length >= 2 && !busyAction;
           </section>
         </main>
       ) : (
-        <main id="top" className={`phase-two-main ${generation ? "has-download-dock" : ""}`}>
+        <main id="top" className="phase-two-main">
           <section className="workspace-heading" aria-labelledby="workspace-title">
             <div>
               <p className="eyebrow">Document set</p>
@@ -1930,20 +1372,11 @@ const canUpload = files.length >= 2 && !busyAction;
                   </div>
                 ))}
               </nav>
-              <div className="rail-guide">
-                <strong>Safe edit path</strong>
-                <ol>
-                  <li className={selectedElement ? "done" : "current"}>Select an element</li>
-                  <li className={preview ? "done" : selectedElement ? "current" : ""}>Confirm exact matches</li>
-                  <li className={preview ? "current" : ""}>Review and apply</li>
-                </ol>
-              </div>
             </aside>
 
             <DocumentExperience
               documentSet={documentSet}
               document={activeDocument}
-              fallbackView={viewer}
               searchTarget={documentSearchTarget}
               onGenerated={handleEditorGenerated}
               generationJobs={generationJobs}
@@ -1951,277 +1384,11 @@ const canUpload = files.length >= 2 && !busyAction;
               onDirtyChange={setEditorDirty}
             />
 
-            {Boolean(0) && (
-              <>
-            <section className="viewer-panel" aria-labelledby="viewer-title">
-              <div className="viewer-toolbar">
-                <div className="viewer-title">
-                  <strong id="viewer-title">{activeDocument?.name ?? "Document preview"}</strong>
-                  <span>{viewer?.render_mode === "word_pdf" ? "Microsoft Word layout" : "Structured preview"}</span>
-                </div>
-                {viewer?.pdf_url && (
-                  <div className="view-mode-toggle" role="group" aria-label="Preview mode">
-                    <button type="button" className={viewMode === "visual" ? "active" : ""} onClick={() => setViewMode("visual")} aria-pressed={viewMode === "visual"}>Word layout</button>
-                    <button type="button" className={viewMode === "select" ? "active" : ""} onClick={() => setViewMode("select")} aria-pressed={viewMode === "select"}>Select text</button>
-                  </div>
-                )}
-                {viewMode === "select" && (
-                  <>
-                    <div className="search-control" role="search">
-                      <label htmlFor="document-search" className="sr-only">Search document text</label>
-                      <input
-                        id="document-search"
-                        type="search"
-                        value={searchQuery}
-                        onChange={(event) => setSearchQuery(event.target.value)}
-                        placeholder="Search text"
-                        disabled={!viewer}
-                      />
-                      {searchQuery && <small>{searchMatches.length} found</small>}
-                      <button type="button" onClick={() => moveSearch(-1)} disabled={!searchMatches.length} aria-label="Previous search result">↑</button>
-                      <button type="button" onClick={() => moveSearch(1)} disabled={!searchMatches.length} aria-label="Next search result">↓</button>
-                    </div>
-                    <div className="viewer-controls" aria-label="Document view controls">
-                      <span className="page-indicator">Page {currentPage} / {viewer?.page_count ?? 0}</span>
-                      <button type="button" onClick={() => setZoom((value) => Math.max(0.75, value - 0.1))} disabled={!viewer || zoom <= 0.75} aria-label="Zoom out">−</button>
-                      <span>{Math.round(zoom * 100)}%</span>
-                      <button type="button" onClick={() => setZoom((value) => Math.min(1.35, value + 0.1))} disabled={!viewer || zoom >= 1.35} aria-label="Zoom in">+</button>
-                      <button type="button" className="fit-button" onClick={() => setZoom(1)} disabled={!viewer}>Fit width</button>
-                    </div>
-                  </>
-                )}
-              </div>
-
-              <div className="viewer-scroll" ref={viewerScrollRef} aria-busy={busyAction === "view"}>
-                {busyAction === "view" && <LoadingState label="Opening document preview…" />}
-                {!viewer && busyAction !== "view" && <LoadingState label="Preview unavailable" />}
-                {viewer && viewMode === "visual" && viewer.pdf_url && (
-                  <div className="word-preview">
-                    <div className="render-notice"><strong>Word layout</strong><span>{viewer.notice}</span></div>
-                    <iframe
-                      src={absoluteApiUrl(viewer.pdf_url)}
-                      title={`${viewer.document_name} Word layout preview`}
-                    />
-                  </div>
-                )}
-                {viewer && viewMode === "select" && (
-                  <>
-                    <div className="render-notice"><strong>Preview note</strong><span>{viewer.notice}</span></div>
-                    <div className="page-stack" style={{ "--page-zoom": zoom } as CSSProperties}>
-                      {viewer.pages.slice(0, visiblePageCount).map((page) => (
-                        <section className="document-page" key={page.page_number} data-page-number={page.page_number} aria-label={`Page ${page.page_number}`}>
-                          <span className="page-label">Page {page.page_number}</span>
-                          <div className="page-content">
-                            {page.elements.length === 0 ? (
-                              <p className="empty-page">No supported text elements on this page.</p>
-                            ) : (
-                              groupViewerElements(page.elements).map((block, blockIndex) =>
-                                block.kind === "table" ? (
-                                  <section
-                                    className="structured-table"
-                                    key={`table-${block.tableIndex}-${blockIndex}`}
-                                    aria-label={`Table ${block.tableIndex + 1}`}
-                                  >
-                                    <div className="structured-table-heading">
-                                      Table {block.tableIndex + 1}
-                                    </div>
-                                    <div
-                                      className="structured-table-grid"
-                                      style={{
-                                        gridTemplateColumns: `repeat(${
-                                          Math.max(
-                                            ...block.cells.map(
-                                              (cell) =>
-                                                (cell.preview_column_index ??
-                                                  cell.column_index ??
-                                                  0) + 1,
-                                            ),
-                                          )
-                                        }, minmax(120px, 1fr))`,
-                                      }}
-                                    >
-                                      {block.cells.map((cell) =>
-                                        renderViewerElement(cell, true),
-                                      )}
-                                    </div>
-                                  </section>
-                                ) : (
-                                  renderViewerElement(block.element)
-                                ),
-                              )
-                            )}
-                          </div>
-                        </section>
-                      ))}
-                    </div>
-                  </>
-                )}
-              </div>
-            </section>
-
-            <aside className="edit-sidebar" aria-labelledby="edit-sidebar-title">
-              <div className="sidebar-heading">
-                <div><span className="eyebrow">Controlled edit</span><h2 id="edit-sidebar-title">Selected content</h2></div>
-                {selectedElement && <span className="element-chip">{elementLabel(selectedElement.element_type)}</span>}
-              </div>
-
-              {!selectedElement ? (
-                <div className="sidebar-empty">
-                  <span aria-hidden="true">T</span>
-                  <h3>{viewMode === "visual" ? "Viewing the Word layout" : "Select text in the document"}</h3>
-                  <p>{viewMode === "visual" ? "This view uses Microsoft Word’s own layout. Switch to Select text when you are ready to choose content to edit." : "Supported paragraphs, headings, list items, and table paragraphs highlight as you hover or focus them."}</p>
-                  {viewMode === "visual" && viewer?.pdf_url && <button type="button" className="quiet-button" onClick={() => setViewMode("select")}>Switch to Select text</button>}
-                </div>
-              ) : (
-                <div className="edit-flow">
-                  <div className="source-card">
-                    <small>Source · {elementLocation(selectedElement)}</small>
-                    <p>{selectedElement.text}</p>
-                  </div>
-
-                  {busyAction === "matches" ? (
-                    <LoadingState label="Finding exact matches…" compact />
-                  ) : discovery?.link_group ? (
-                    <section className="targets-section" aria-labelledby="targets-title">
-                      <div className="targets-heading">
-                        <div><h3 id="targets-title">Confirmed locations</h3><p>Exact matches start included. Review each one.</p></div>
-                        <span>{includedElementIds.length}/{discovery.link_group.member_count}</span>
-                      </div>
-                      <div className="target-list">
-                        {discovery.link_group.members.map((member) => {
-                          const isSource = member.element_id === selectedElement.id;
-                          return (
-                            <label className={`target-row ${includedElementIds.includes(member.element_id) ? "included" : "excluded"}`} key={member.element_id}>
-                              <input
-                                type="checkbox"
-                                checked={includedElementIds.includes(member.element_id)}
-                                onChange={() => toggleTarget(member.element_id)}
-                                disabled={isSource}
-                              />
-                              <span>
-                                <strong>{member.document_name}</strong>
-                                <small>
-                                  {isSource
-                                    ? `Source · ${elementLocation(member)} · always included`
-                                    : `${elementLocation(member)} · Exact match`}
-                                </small>
-                              </span>
-                              <em>{includedElementIds.includes(member.element_id) ? "Included" : "Excluded"}</em>
-                            </label>
-                          );
-                        })}
-                      </div>
-                    </section>
-                  ) : (
-                    <div className="no-match-state" role="status">
-                      <strong>No exact matches</strong>
-                      <p>This element is selectable, but synchronised editing currently requires an exact match in another document.</p>
-                    </div>
-                  )}
-
-                  <label className="field replacement-field">
-                    <span>Replacement text</span>
-                    <textarea
-                      value={replacement}
-                      onChange={(event) => {
-                        setReplacement(event.target.value);
-                        setPreview(null);
-                      }}
-                      rows={7}
-                      maxLength={20000}
-                      disabled={!discovery?.link_group}
-                    />
-                    <small>{replacement.length.toLocaleString()} / 20,000 characters</small>
-                  </label>
-
-                  <div className="edit-actions">
-                    <button type="button" className="quiet-button" onClick={clearSelection}>Cancel</button>
-                    <button type="button" className="primary-button" disabled={!canPreview} onClick={() => void handlePreview()}>
-                      {busyAction === "preview" ? "Validating…" : `Preview ${includedElementIds.length} change${includedElementIds.length === 1 ? "" : "s"}`}
-                    </button>
-                  </div>
-                  <p className="immutability-note"><span aria-hidden="true">◇</span> Previewing and generating never overwrite an original upload.</p>
-                </div>
-              )}
-            </aside>
-              </>
-            )}
           </div>
 
-          {generation && (
-            <section className="generation-banner download-dock" aria-live="polite">
-              <span className="success-icon" aria-hidden="true">✓</span>
-              <div>
-                <strong>Changes applied — continue editing above</strong>
-                <p>The Word preview is showing the current documents. When you’re finished with every edit, download the complete set.</p>
-              </div>
-              <a className="download-button" href={absoluteDownloadUrl(generation.download_url)}>
-                Done editing — download all
-              </a>
-            </section>
-          )}
         </main>
       )}
 
-      {preview && (
-        <div className="modal-backdrop" role="presentation">
-          <section className="preview-dialog" role="dialog" aria-modal="true" aria-labelledby="preview-title">
-            <header className="preview-dialog-header">
-              <div><p className="eyebrow">Review required</p><h2 id="preview-title">Confirm the full impact</h2><p>{preview.affected_location_count} locations across {preview.affected_document_count} documents</p></div>
-              <button type="button" className="dialog-close" onClick={() => setPreview(null)} disabled={busyAction === "generate"} aria-label="Close preview">×</button>
-            </header>
-            <div className="preview-dialog-body">
-              {preview.documents.map((document) => (
-                <article className="preview-document" key={document.document_id}>
-                  <header><span className="word-icon" aria-hidden="true">W</span><div><h3>{document.document_name}</h3><p>{document.changes.length} confirmed location{document.changes.length === 1 ? "" : "s"}</p></div></header>
-                  {document.changes.map((change) => (
-                    <div className="diff" key={change.element_id}>
-                      <p className="location-label">{elementLocation(change)}</p>
-                      <div className="diff-grid">
-                        <div className="diff-side before"><span>Before</span><p>{change.before}</p></div>
-                        <div className="diff-arrow" aria-hidden="true">→</div>
-                        <div className="diff-side after"><span>After</span><p>{change.after}</p></div>
-                      </div>
-                    </div>
-                  ))}
-                </article>
-              ))}
-            </div>
-            <footer className="preview-dialog-footer">
-              <div><strong>Safe to apply</strong><span>Only the locations shown above will change. You can continue editing the updated versions, and the original uploads remain unchanged.</span></div>
-              <div><button type="button" className="quiet-button" onClick={() => setPreview(null)} disabled={busyAction === "generate"}>Back to edit</button><button type="button" className="primary-button" onClick={() => void handleGenerate()} disabled={busyAction === "generate"}>{busyAction === "generate" ? "Applying changes…" : "Apply changes and continue"}</button></div>
-            </footer>
-          </section>
-        </div>
-      )}
-
-      {processingNotifications.length > 0 && (
-        <div className="processing-notifications" aria-live="polite" aria-label="Processing notifications">
-          {processingNotifications.map((notification) => (
-            <section
-              className={`processing-notification ${notification.kind}`}
-              key={notification.id}
-              role={notification.kind === "error" ? "alert" : "status"}
-            >
-              <div>
-                <strong>{notification.title}</strong>
-                <p>{notification.message}</p>
-              </div>
-              <button
-                type="button"
-                onClick={() =>
-                  setProcessingNotifications((current) =>
-                    current.filter((item) => item.id !== notification.id),
-                  )
-                }
-                aria-label={`Dismiss ${notification.title}`}
-              >
-                ×
-              </button>
-            </section>
-          ))}
-        </div>
-      )}
     </div>
   );
 }

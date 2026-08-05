@@ -56,6 +56,17 @@ test("controlled preview publishes pages, overlays, zoom, and structure fallback
   assert.match(styles, /\.render-map-region\.selected/);
 });
 
+test("open workspaces fill the viewport and keep scrolling inside the preview", () => {
+  const app = read("apps/web/src/App.tsx");
+  const styles = read("apps/web/src/styles.css");
+
+  assert.match(app, /classList\.toggle\("workspace-open", Boolean\(documentSet\)\)/);
+  assert.match(styles, /body\.workspace-open[\s\S]*overflow: hidden/);
+  assert.match(styles, /\.workspace-mode \.layout-iframe-shell[\s\S]*flex: 1/);
+  assert.match(styles, /\.render-map-pages[\s\S]*overflow: auto/);
+  assert.doesNotMatch(styles, /height: calc\(100vh - 390px\)/);
+});
+
 test("inline Quill enforces one paragraph and shares the central draft", () => {
   const inlineEditor = read("apps/web/src/InlineLayoutEditor.tsx");
   const experience = read("apps/web/src/DocumentExperience.tsx");
@@ -66,6 +77,9 @@ test("inline Quill enforces one paragraph and shares the central draft", () => {
   assert.match(inlineEditor, /event\.key !== "Escape"/);
   assert.match(inlineEditor, /quill\.history\.undo/);
   assert.match(inlineEditor, /quill\.history\.redo/);
+  assert.match(inlineEditor, /import\("quill"\)/);
+  assert.match(inlineEditor, /import\("quill\/dist\/quill\.snow\.css"\)/);
+  assert.doesNotMatch(inlineEditor, /^import Quill from "quill"/m);
   assert.match(experience, /remainInLayout: true/);
   assert.match(experience, /setWorkspaceMode\("layout"\)/);
   assert.match(experience, /onDraftChange=\{handleDraftChange\}/);
@@ -100,5 +114,6 @@ test("Layout exposes formatting, matching, preview, generation, and rerender", (
   assert.match(experience, /updateDecision\(match, "confirmed"\)/);
   assert.match(editorService, /queue_generated_version_previews/);
   assert.match(editorService, /"preview_jobs": preview_jobs/);
-  assert.match(app, /New Word previews are rendering in the background/);
+  assert.doesNotMatch(app, /processing-notifications/);
+  assert.doesNotMatch(app, /Processing interrupted/);
 });

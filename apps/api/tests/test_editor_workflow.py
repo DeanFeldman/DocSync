@@ -1041,7 +1041,13 @@ def test_editor_generation_can_be_queued_and_reconciled_by_status(
         assert completed.json()["status"] == "completed"
         assert completed.json()["stage"] == "completed"
         assert len(completed.json()["versions"]) == 2
-        assert completed.json()["document_set"]["id"] == workspace["id"]
+        assert {
+            item["id"] for item in completed.json()["document_updates"]
+        } == {
+            documents["Alpha.docx"]["id"],
+            documents["Beta.docx"]["id"],
+        }
+        assert "document_set" not in completed.json()
         assert completed.json()["download_url"].endswith(
             f"/{operation_id}/download"
         )
@@ -1402,6 +1408,14 @@ def test_preview_is_side_effect_free_and_generation_is_target_specific_and_versi
             assert expected_replacements[name] in [
                 paragraph.text for paragraph in edited_docx.paragraphs
             ]
+            generated_content = read_editor_content(
+                client,
+                version["version_id"],
+            )
+            assert block_with_text(
+                generated_content,
+                expected_replacements[name],
+            )["element_id"] == blocks[name]["element_id"]
             unexpected = (
                 expected_replacements["Beta.docx"]
                 if name == "Alpha.docx"

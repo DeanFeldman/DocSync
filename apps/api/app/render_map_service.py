@@ -10,6 +10,7 @@ import math
 from pathlib import Path
 import re
 import threading
+from time import perf_counter
 import unicodedata
 from uuid import uuid4
 
@@ -581,6 +582,7 @@ def _extract_pdf(
 
 
 def _generate_render_map(context: _RenderContext, key: str) -> None:
+    total_started = perf_counter()
     processing = _status_payload(
         context,
         "processing",
@@ -588,7 +590,9 @@ def _generate_render_map(context: _RenderContext, key: str) -> None:
     )
     _write_cache(context.cache_path, processing)
     try:
+        stage_started = perf_counter()
         pdf_sha256 = _sha256_file(context.pdf_path)
+        pdf_read_ms = (perf_counter() - stage_started) * 1000
         identity = json.dumps(
             {
                 "version_id": context.version_id,
@@ -602,7 +606,9 @@ def _generate_render_map(context: _RenderContext, key: str) -> None:
             separators=(",", ":"),
         )
         render_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+        stage_started = perf_counter()
         pages, tokens = _extract_pdf(context, render_id)
+        image_and_text_extraction_ms = (perf_counter() - stage_started) * 1000
 
         # Publish controlled page images before contextual coordinate matching.
         progressive = {
@@ -616,7 +622,9 @@ def _generate_render_map(context: _RenderContext, key: str) -> None:
         }
         _write_cache(context.cache_path, progressive)
 
+        stage_started = perf_counter()
         matches, unmapped = _match_blocks(context.blocks, tokens)
+        block_matching_ms = (perf_counter() - stage_started) * 1000
         regions = [
             region
             for match in matches.values()
@@ -655,6 +663,18 @@ def _generate_render_map(context: _RenderContext, key: str) -> None:
             "generated_at": _utc_now(),
         }
         _write_cache(context.cache_path, payload)
+        logger.info(
+            "docsync.render_map_timing version_id=%s pages=%s blocks=%s "
+            "pdf_read_ms=%.2f image_and_text_extraction_ms=%.2f "
+            "block_matching_ms=%.2f total_ms=%.2f",
+            context.version_id,
+            len(pages),
+            len(context.blocks),
+            pdf_read_ms,
+            image_and_text_extraction_ms,
+            block_matching_ms,
+            (perf_counter() - total_started) * 1000,
+        )
     except Exception as exc:
         logger.exception("docsync.render_map.failed version_id=%s", context.version_id)
         failed = {

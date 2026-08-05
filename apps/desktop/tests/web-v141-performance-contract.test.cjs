@@ -58,15 +58,20 @@ test("Word preview auto-loads while near matching and version history remain laz
   assert.match(wordPreviewHandler, /createPreviewJob\(activeVersionId/);
   assert.match(wordPreviewHandler, /fetchPreviewJob\(job\.job_id/);
   assert.match(wordPreviewHandler, /fetchWordPreview\(activeVersionId/);
+  assert.match(wordPreviewHandler, /job\.cached_preview/);
+  assert.match(wordPreviewHandler, /refreshWorkspaceResource/);
   assert.match(
     experience,
-    /layoutStatus !== "idle"[\s\S]*void loadWordPreview\(\)/,
+    /previewVersionStartedRef\.current === activeVersionId[\s\S]*void loadWordPreview\(\)/,
   );
   assert.doesNotMatch(experience, /Load Word Preview/);
   assert.match(
     experience,
-    /onRetryPreview=\{\(\) => void loadWordPreview\(\)\}/,
+    /onRetryPreview=\{\(\) => void loadWordPreview\(true\)\}/,
   );
+  assert.match(experience, /"Updating preview/);
+  assert.match(experience, /"Opening document/);
+  assert.match(experience, /showLayoutStructure \|\|[\s\S]*!layoutView/);
   assert.match(experience, /onToggle=\{\(event\) =>/);
   assert.match(experience, /setHistoryRequested\(true\)/);
   assert.match(
@@ -112,7 +117,11 @@ test("generation is accepted immediately and reconciled by the application shell
   assert.match(experience, /optimisticTarget\.replacement_text/);
   assert.match(experience, /onGenerationQueued\(queued\)/);
   assert.match(app, /fetchEditorGeneration\(jobId/);
-  assert.match(app, /processing-indicator/);
+  assert.doesNotMatch(app, /processing-indicator/);
+  assert.doesNotMatch(app, /fetchRecoverableEditorGenerationJobs/);
+  assert.doesNotMatch(app, /retryEditorGeneration/);
+  assert.doesNotMatch(app, /processing-notifications/);
+  assert.doesNotMatch(app, /pushProcessingNotification/);
   assert.match(app, /A newer version of this document is available/);
   assert.match(experience, /Update accepted/);
   assert.match(experience, /creating and validating the Word versions in the background/);

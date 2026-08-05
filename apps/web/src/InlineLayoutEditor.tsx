@@ -1,7 +1,18 @@
-import { useEffect, useRef } from "react";
-import Quill from "quill";
-import type { EditorBlock, QuillDelta } from "./types";
-import type { QuillDraft } from "./QuillBlockEditor";
+import { useEffect, useRef, useState } from "react";
+import type Quill from "quill";
+import type { EditorBlock, QuillDelta, QuillDraft } from "./types";
+
+let quillModulePromise: Promise<typeof import("quill")> | null = null;
+
+function loadQuill() {
+  if (!quillModulePromise) {
+    quillModulePromise = Promise.all([
+      import("quill"),
+      import("quill/dist/quill.snow.css"),
+    ]).then(([module]) => module);
+  }
+  return quillModulePromise;
+}
 
 export type InlineEditorCommand =
   | { id: number; action: "bold" | "italic" | "underline" }
@@ -47,17 +58,45 @@ export default function InlineLayoutEditor({
   const onExitRef = useRef(onExit);
   const lastRangeRef = useRef({ index: 0, length: 0 });
   const handledCommandRef = useRef(0);
+  const disabledRef = useRef(disabled);
+  const [editorStatus, setEditorStatus] = useState<
+    "loading" | "ready" | "error"
+  >("loading");
 
   onChangeRef.current = onChange;
   onExitRef.current = onExit;
+  disabledRef.current = disabled;
 
   useEffect(() => {
     const host = hostRef.current;
     if (!host) return;
-    host.replaceChildren();
-    const editor = document.createElement("div");
-    host.appendChild(editor);
-    const quill = new Quill(editor, {
+    let cancelled = false;
+    let quill: Quill | null = null;
+    let frame: number | null = null;
+    let handleTextChange: (
+      delta: unknown,
+      oldDelta: unknown,
+      source: string,
+    ) => void = () => undefined;
+    let handleSelectionChange: (
+      range: { index: number; length: number } | null,
+    ) => void = () => undefined;
+    let handlePaste: (event: ClipboardEvent) => void = () => undefined;
+    let handleKeyDown: (event: KeyboardEvent) => void = () => undefined;
+    const importStarted = performance.now();
+    setEditorStatus("loading");
+
+    void loadQuill().then(({ default: QuillConstructor }) => {
+      if (cancelled || hostRef.current !== host) return;
+      const initializationStarted = performance.now();
+      console.info("docsync.quill_import_timing", {
+        element_id: block.element_id,
+        duration_ms: Number((initializationStarted - importStarted).toFixed(2)),
+      });
+      host.replaceChildren();
+      const editor = document.createElement("div");
+      host.appendChild(editor);
+      quill = new QuillConstructor(editor, {
       theme: "snow",
       modules: {
         toolbar: false,
@@ -68,37 +107,34 @@ export default function InlineLayoutEditor({
           },
         },
       },
-    });
-    quillRef.current = quill;
-    quill.setContents(value as never, "silent");
-    quill.history.clear();
-    quill.enable(!disabled);
-    quill.root.dataset.inlineEditorElementId = block.element_id;
-    quill.root.setAttribute(
+      });
+      quillRef.current = quill;
+      quill.setContents(value as never, "silent");
+      quill.history.clear();
+      quill.enable(!disabledRef.current);
+      quill.root.dataset.inlineEditorElementId = block.element_id;
+      quill.root.setAttribute(
       "aria-label",
       `Edit ${block.element_type.replaceAll("_", " ")}, paragraph ${block.paragraph_index + 1}`,
-    );
-    quill.root.setAttribute("aria-multiline", "false");
+      );
+      quill.root.setAttribute("aria-multiline", "false");
 
-    function publish() {
-      const delta = quill.getContents() as unknown as QuillDelta;
-      onChangeRef.current({ delta, text: plainText(delta) });
-    }
+      function publish() {
+        if (!quill) return;
+        const delta = quill.getContents() as unknown as QuillDelta;
+        onChangeRef.current({ delta, text: plainText(delta) });
+      }
 
-    function handleTextChange(
-      _delta: unknown,
-      _oldDelta: unknown,
-      source: string,
-    ) {
-      if (source === "user") publish();
-    }
+      handleTextChange = (_delta, _oldDelta, source) => {
+        if (source === "user") publish();
+      };
 
-    function handleSelectionChange(range: { index: number; length: number } | null) {
-      if (range) lastRangeRef.current = range;
-    }
+      handleSelectionChange = (range) => {
+        if (range) lastRangeRef.current = range;
+      };
 
-    function handlePaste(event: ClipboardEvent) {
-      if (disabled) return;
+      handlePaste = (event) => {
+      if (disabledRef.current || !quill) return;
       const pastedText = event.clipboardData?.getData("text/plain") ?? "";
       if (!/[\r\n]/.test(pastedText)) return;
       event.preventDefault();
@@ -107,22 +143,22 @@ export default function InlineLayoutEditor({
       if (range.length) quill.deleteText(range.index, range.length, "user");
       quill.insertText(range.index, flattened, "user");
       quill.setSelection(range.index + flattened.length, 0, "silent");
-    }
+      };
 
-    function handleKeyDown(event: KeyboardEvent) {
+      handleKeyDown = (event) => {
       if (event.key !== "Escape") return;
       event.preventDefault();
       event.stopPropagation();
       onExitRef.current();
-    }
+      };
 
-    quill.on("text-change", handleTextChange);
-    quill.on("selection-change", handleSelectionChange);
-    quill.root.addEventListener("paste", handlePaste, true);
-    quill.root.addEventListener("keydown", handleKeyDown, true);
+      quill.on("text-change", handleTextChange);
+      quill.on("selection-change", handleSelectionChange);
+      quill.root.addEventListener("paste", handlePaste, true);
+      quill.root.addEventListener("keydown", handleKeyDown, true);
 
-    const frame = window.requestAnimationFrame(() => {
-      if (quillRef.current !== quill || disabled) return;
+      frame = window.requestAnimationFrame(() => {
+      if (quillRef.current !== quill || disabledRef.current || !quill) return;
       const textLength = Math.max(0, quill.getLength() - 1);
       const index = Math.min(
         textLength,
@@ -131,19 +167,36 @@ export default function InlineLayoutEditor({
       lastRangeRef.current = { index, length: 0 };
       quill.focus();
       quill.setSelection(index, 0, "silent");
+      });
+      setEditorStatus("ready");
+      console.info("docsync.editor_initialization_timing", {
+        element_id: block.element_id,
+        duration_ms: Number(
+          (performance.now() - initializationStarted).toFixed(2),
+        ),
+      });
+    }).catch((error: unknown) => {
+      if (cancelled) return;
+      setEditorStatus("error");
+      console.error("docsync.editor_initialization_failed", error);
     });
 
     return () => {
-      window.cancelAnimationFrame(frame);
-      quill.off("text-change", handleTextChange);
-      quill.off("selection-change", handleSelectionChange);
-      quill.root.removeEventListener("paste", handlePaste, true);
-      quill.root.removeEventListener("keydown", handleKeyDown, true);
-      quill.disable();
+      cancelled = true;
+      if (frame !== null) window.cancelAnimationFrame(frame);
+      quill?.off("text-change", handleTextChange);
+      quill?.off("selection-change", handleSelectionChange);
+      quill?.root.removeEventListener("paste", handlePaste, true);
+      quill?.root.removeEventListener("keydown", handleKeyDown, true);
+      quill?.disable();
       if (quillRef.current === quill) quillRef.current = null;
       host.replaceChildren();
     };
-  }, [block.element_id, disabled, resetToken]);
+  }, [block.element_id, resetToken]);
+
+  useEffect(() => {
+    quillRef.current?.enable(!disabled);
+  }, [disabled]);
 
   useEffect(() => {
     const quill = quillRef.current;
@@ -189,6 +242,13 @@ export default function InlineLayoutEditor({
       aria-label={`Inline editor for ${block.element_type.replaceAll("_", " ")}`}
     >
       <div ref={hostRef} className="inline-layout-editor-host" />
+      {editorStatus !== "ready" && (
+        <span className="inline-layout-editor-status" role="status">
+          {editorStatus === "error"
+            ? "The editor could not start. The document preview remains available."
+            : "Preparing editor…"}
+        </span>
+      )}
     </div>
   );
 }

@@ -1,5 +1,11 @@
-import type { QuillDraft } from "./QuillBlockEditor";
-import type { DocumentView, EditorContentResponse, MatchDiscovery, SimilarMatchesResponse } from "./types";
+import type {
+  DocumentView,
+  EditorContentResponse,
+  MatchDiscovery,
+  QuillDraft,
+  RenderMapResponse,
+  SimilarMatchesResponse,
+} from "./types";
 
 export type WorkspaceMode = "layout" | "edit" | "compare";
 
@@ -14,6 +20,7 @@ type WorkspaceResource =
   | DocumentView
   | EditorContentResponse
   | MatchDiscovery
+  | RenderMapResponse
   | SimilarMatchesResponse
   | unknown;
 
@@ -100,6 +107,35 @@ class WorkspaceResourceStore {
     return request;
   }
 
+  refresh<T extends WorkspaceResource>(
+    key: string,
+    loader: () => Promise<T>,
+  ): Promise<T> {
+    const requestKey = `refresh:${key}`;
+    const pending = this.inFlight.get(requestKey);
+    if (pending) return pending as Promise<T>;
+
+    const keyEpoch = this.epochs.get(key) ?? 0;
+    const storeEpoch = this.globalEpoch;
+    const request = loader()
+      .then((value) => {
+        if (
+          storeEpoch === this.globalEpoch &&
+          keyEpoch === (this.epochs.get(key) ?? 0)
+        ) {
+          this.values.set(key, value);
+        }
+        return value;
+      })
+      .finally(() => {
+        if (this.inFlight.get(requestKey) === request) {
+          this.inFlight.delete(requestKey);
+        }
+      });
+    this.inFlight.set(requestKey, request);
+    return request;
+  }
+
   deleteWhere(predicate: (key: string) => boolean): void {
     const knownKeys = new Set([
       ...this.values.keys(),
@@ -139,6 +175,13 @@ export function wordPreviewResourceKey(
   versionId: string,
 ): string {
   return key("word-preview", documentSetId, documentId, versionId);
+}
+
+export function renderMapResourceKey(
+  documentSetId: string,
+  versionId: string,
+): string {
+  return key("render-map", documentSetId, versionId);
 }
 
 export function exactMatchesResourceKey(
@@ -193,6 +236,13 @@ export function loadWorkspaceResource<T extends WorkspaceResource>(
   loader: () => Promise<T>,
 ): Promise<T> {
   return resources.load(resourceKey, loader);
+}
+
+export function refreshWorkspaceResource<T extends WorkspaceResource>(
+  resourceKey: string,
+  loader: () => Promise<T>,
+): Promise<T> {
+  return resources.refresh(resourceKey, loader);
 }
 
 export function getWorkspaceViewState(
