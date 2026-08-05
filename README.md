@@ -36,15 +36,48 @@ DocSync-Setup-latest.exe
 
 ---
 
+## Version 1.9.0
+
+DocSync `v1.9.0` makes opening large Word documents and generating new versions
+substantially faster. Selecting a document checks version-keyed memory and SQLite
+preview caches first, displays readable structured content as soon as it is
+available, and refreshes the high-fidelity Word layout in the background. Fresh or
+stale cached previews remain usable while one deduplicated refresh completes.
+
+Generation now reads, indexes, updates, and validates each affected DOCX with less
+repeated work. Stable block identities are retained, only changed exact-match groups
+are rebuilt, database writes are batched, and already-compressed DOCX files are not
+recompressed in the output ZIP. The measured three-document generation median is
+33.1% faster, while a cached 1,000-block structured preview returned in a 26.98 ms
+median.
+
+The initial frontend is smaller because Quill and its CSS load only when an editable
+region is selected, and obsolete editor/viewer code has been removed. The open
+workspace fills the desktop window, prevents outer-page scrolling, and keeps long
+content scrolling inside the file rail, Word preview, and operation sidebar.
+
+The global **Processing** button, history popover, retry control, and floating
+processing notifications have been removed. Durable jobs and reconciliation still
+run in the background, with relevant progress and actionable errors shown inline
+for the active document.
+
+Schema migration 6 adds the durable structured/Word preview cache and stale-preview
+metadata. Existing migration backup and automatic recovery rules continue to apply.
+
+See [the v1.9.0 release notes](docs/v1.9.0-release-notes.md),
+[manual test plan](docs/v1.9.0-manual-testing.md), and the
+[document performance report](docs/performance-optimisation-2026-08.md).
+
+---
+
 ## Version 1.8.0
 
 DocSync `v1.8.0` turns the high-fidelity Word layout into a controlled inline
-editing workspace. Selecting a document first checks version-keyed memory and
-SQLite preview caches, displays readable structured content as soon as it is
-available, and starts the durable Word-preview job automatically. Microsoft Word
-rendering is serialized for COM safety, immutable-version PDF caches are reused,
-controlled page images appear before coordinate matching finishes, and visible or
-nearby pages are mounted first.
+editing workspace. **Load Word Preview** creates a durable background job and
+returns control immediately. Microsoft Word rendering is serialized for COM
+safety, immutable-version PDF caches are reused, controlled page images appear
+before coordinate matching finishes, and visible or nearby pages are mounted
+first.
 
 Reliable page-relative regions can be focused or clicked without leaving
 **Layout**. A restricted Quill editor appears over the selected paragraph and
@@ -60,22 +93,9 @@ text boxes, watermarks, and other unsafe structures remain preserved and
 read-only. **Select from structure** and the structured **Edit** view remain the
 safe fallback and advanced diagnostic surface.
 
-The open workspace now fills the remaining window height and prevents the outer
-application page from scrolling. Long content scrolls only inside the file rail,
-Word preview, or operation sidebar. The global **Processing** button, processing
-history popover, retry control, and floating interrupted/error notifications have
-been removed. Durable generation and reconciliation still run in the background;
-relevant progress or action errors stay inline with the active document.
-
-Performance work for the current build reduced the median three-document generation
-benchmark by 33.1%. A cached 1,000-block structured preview returned in a 26.98 ms
-median, and Quill now loads as a separate lazy chunk only after an editable region
-is selected.
-
 See [the v1.8.0 release notes](docs/v1.8.0-release-notes.md),
 [inline-layout requirements](docs/v1.8.0-inline-layout-editing-requirements.md),
-[manual test plan](docs/v1.8.0-manual-testing.md), and the
-[document performance report](docs/performance-optimisation-2026-08.md).
+[manual test plan](docs/v1.8.0-manual-testing.md).
 
 ---
 
@@ -551,14 +571,16 @@ Do not commit the `release/` directory. Installer files belong on the GitHub Rel
 
 The release workflow runs whenever a tag beginning with `v` is pushed.
 
-The workflow reads the application version from the Git tag, so the source `package.json` version does not need to be changed manually for each release.
+The workflow reads the application version from the Git tag and applies it again
+during the release build. Checked-in package and API metadata should still match the
+planned release so local builds, tests, the version badge, and audit logs agree.
 
 ### Create a release
 
 From the repository root:
 
 ```powershell
-$version = "1.8.0"
+$version = "1.9.0"
 
 git switch main
 git pull origin main
