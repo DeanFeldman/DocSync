@@ -48,6 +48,11 @@ jobs:
             --no-git-tag-version `
             --allow-same-version
 
+          npm version $version `
+            --workspace documentsync-web `
+            --no-git-tag-version `
+            --allow-same-version
+
       - name: Run tests
         run: npm test
 
@@ -107,7 +112,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = "${{ github.ref_name }}"
+          $version = $tag.TrimStart("v")
           $releaseDirectory = "release/v1"
+          $releaseNotes = "docs/v$version-release-notes.md"
 
           $versionedInstaller = Get-ChildItem `
             "$releaseDirectory/DocSync-Setup-*.exe" `
@@ -140,18 +147,35 @@ jobs:
               throw "Uploading the updated release files failed."
             }
 
-            gh release edit $tag `
-              --title "DocSync $tag" `
-              --latest
+            if (Test-Path $releaseNotes) {
+              gh release edit $tag `
+                --title "DocSync $tag" `
+                --notes-file $releaseNotes `
+                --latest
+            }
+            else {
+              gh release edit $tag `
+                --title "DocSync $tag" `
+                --latest
+            }
           }
           else {
             Write-Host "Creating release $tag."
 
-            gh release create $tag $assets `
-              --title "DocSync $tag" `
-              --generate-notes `
-              --verify-tag `
-              --latest
+            if (Test-Path $releaseNotes) {
+              gh release create $tag $assets `
+                --title "DocSync $tag" `
+                --notes-file $releaseNotes `
+                --verify-tag `
+                --latest
+            }
+            else {
+              gh release create $tag $assets `
+                --title "DocSync $tag" `
+                --generate-notes `
+                --verify-tag `
+                --latest
+            }
           }
 
           if ($LASTEXITCODE -ne 0) {

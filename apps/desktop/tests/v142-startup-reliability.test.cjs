@@ -96,11 +96,17 @@ test("startup diagnostics are bounded, redact secrets, and include recovery cont
 
 test("version badge is injected from the root package and precedes the theme control", () => {
   const rootPackage = JSON.parse(read("package.json"));
+  const webPackage = JSON.parse(read("apps/web/package.json"));
+  const apiMain = read("apps/api/app/main.py");
+  const auditLogger = read("apps/api/app/audit_logger.py");
   const vite = read("apps/web/vite.config.ts");
   const app = read("apps/web/src/App.tsx");
   const styles = read("apps/web/src/styles.css");
 
-  assert.equal(rootPackage.version, "1.8.0");
+  assert.equal(rootPackage.version, "1.9.0");
+  assert.equal(webPackage.version, rootPackage.version);
+  assert.match(apiMain, /version="1\.9\.0"/);
+  assert.match(auditLogger, /APP_VERSION = "1\.9\.0"/);
   assert.match(vite, /new URL\("\.\.\/\.\.\/package\.json", import\.meta\.url\)/);
   assert.match(vite, /__DOCSYNC_VERSION__/);
   assert.match(vite, /valid semantic version/);
