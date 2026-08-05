@@ -1,9 +1,7 @@
 import {
   Fragment,
-  KeyboardEvent as ReactKeyboardEvent,
   ReactNode,
   UIEvent as ReactUIEvent,
-  memo,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -50,12 +48,9 @@ import {
   editorContentFromView,
   normaliseEditorContent,
   normaliseMatch,
-  textFromDelta,
   wordDifferenceSpans,
 } from "./editorUtils";
-import QuillBlockEditor, {
-  type QuillDraft,
-} from "./QuillBlockEditor";
+import type { QuillDraft } from "./QuillBlockEditor";
 import WordPreviewOverlay, {
   type LayoutSelectionIntent,
 } from "./WordPreviewOverlay";
@@ -104,28 +99,6 @@ interface DocumentExperienceProps {
   onDirtyChange: (dirty: boolean) => void;
 }
 
-const WORKSPACE_MODES: Array<{
-  id: WorkspaceMode;
-  label: string;
-  description: string;
-}> = [
-  {
-    id: "layout",
-    label: "Layout",
-    description: "Inline Word layout editor",
-  },
-  {
-    id: "edit",
-    label: "Edit",
-    description: "Structured Quill editor",
-  },
-  {
-    id: "compare",
-    label: "Compare",
-    description: "Exact and near matches",
-  },
-];
-
 function previewStageLabel(stage?: string): string {
   const labels: Record<string, string> = {
     queued: "Queued",
@@ -139,9 +112,6 @@ function previewStageLabel(stage?: string): string {
   };
   return labels[stage ?? ""] ?? "Preparing Word preview";
 }
-
-const INITIAL_VISIBLE_BLOCKS = 200;
-const VISIBLE_BLOCK_BATCH = 200;
 
 function isUnavailable(error: unknown): boolean {
   return (
@@ -350,95 +320,15 @@ function inlineDelta(
   });
 }
 
-function findEditorBlockCard(elementId: string): HTMLElement | null {
+function findLayoutElement(elementId: string): HTMLElement | null {
   return (
     Array.from(
       window.document.querySelectorAll<HTMLElement>(
-        ".editor-block-card[data-element-id]",
+        "[data-element-id]",
       ),
-    ).find((card) => card.dataset.elementId === elementId) ?? null
+    ).find((element) => element.dataset.elementId === elementId) ?? null
   );
 }
-
-const BlockCard = memo(function BlockCard({
-  block,
-  selected,
-  searchRange,
-  onSelect,
-}: {
-  block: EditorBlock;
-  selected: boolean;
-  searchRange?: { start: number; end: number };
-  onSelect: (block: EditorBlock) => void;
-}) {
-  const alignment = block.alignment ?? "left";
-  const isUnsupported = !block.supported || block.read_only;
-
-  function handleKeyDown(event: ReactKeyboardEvent<HTMLDivElement>) {
-    if (event.key !== "Enter" && event.key !== " ") return;
-    event.preventDefault();
-    onSelect(block);
-  }
-
-  return (
-    <div
-      className={`editor-block-card ${block.element_type} ${
-        selected ? "selected" : ""
-      } ${isUnsupported ? "read-only" : ""} ${
-        searchRange ? "search-target" : ""
-      }`}
-      role="button"
-      tabIndex={0}
-      aria-pressed={selected}
-      aria-label={`${isUnsupported ? "Inspect read-only" : "Edit"} ${
-        block.element_type
-      }: ${block.text}`}
-      data-element-id={block.element_id}
-      data-block-order={block.order}
-      onClick={() => onSelect(block)}
-      onKeyDown={handleKeyDown}
-    >
-      <div className="editor-block-meta">
-        <span>
-          {["header_paragraph", "footer_paragraph"].includes(block.element_type) && (
-            <strong className="header-footer-identifier">
-              {block.element_type === "header_paragraph" ? "HEADER" : "FOOTER"}
-            </strong>
-          )}
-          {locationLabel(block)}
-        </span>
-        <span className={`support-label ${isUnsupported ? "read-only" : ""}`}>
-          {isUnsupported
-            ? "Read-only"
-            : block.section_indexes && block.section_indexes.length > 1
-              ? `Shared with ${block.section_indexes.length} sections`
-              : selected
-                ? "Editing"
-                : "Supported"}
-        </span>
-      </div>
-      <div
-        className={`editor-block-content align-${alignment} indent-${Math.min(
-          8,
-          Math.max(0, block.indent ?? 0),
-        )}`}
-      >
-        {block.element_type === "list_item" && (
-          <span className="editor-list-marker" aria-hidden="true">
-            {block.list_type === "ordered" ? "1." : "•"}
-          </span>
-        )}
-        <span>{inlineDelta(block.delta, searchRange)}</span>
-      </div>
-      {block.unsupported_reason && (
-        <p className="editor-block-reason">{block.unsupported_reason}</p>
-      )}
-      {linkedContentExplanation(block) && (
-        <p className="editor-block-link-note">{linkedContentExplanation(block)}</p>
-      )}
-    </div>
-  );
-});
 
 function LayoutFallbackBlock({
   block,
@@ -925,7 +815,7 @@ export default function DocumentExperience({
     document && activeVersionId
       ? workspaceViewStateKey(documentSet.id, document.id, activeVersionId)
       : "";
-  const [mode, setMode] = useState<WorkspaceMode>("edit");
+  const [mode, setMode] = useState<WorkspaceMode>("layout");
   const [editorContent, setEditorContent] =
     useState<EditorContentResponse | null>(null);
   const [contentStatus, setContentStatus] =
@@ -942,8 +832,6 @@ export default function DocumentExperience({
     useState<InlineEditorCommand | null>(null);
   const [selectedElementId, setSelectedElementId] = useState("");
   const [draft, setDraft] = useState<QuillDraft | null>(null);
-  const [visibleBlockCount, setVisibleBlockCount] =
-    useState(INITIAL_VISIBLE_BLOCKS);
   const [editorResetToken, setEditorResetToken] = useState(0);
   const [pendingBlockSelection, setPendingBlockSelection] =
     useState<PendingBlockSelection | null>(null);
@@ -993,8 +881,6 @@ export default function DocumentExperience({
   const layoutRequestRef = useRef(0);
   const layoutAbortRef = useRef<AbortController | null>(null);
   const inlineCommandIdRef = useRef(0);
-  const wordPreviewRequestedRef = useRef(false);
-  const viewDocumentRef = useRef(document?.id ?? "");
   const matchRequestRef = useRef(0);
   const editorActionRequestRef = useRef(0);
   const editorActionAbortRef = useRef<AbortController | null>(null);
@@ -1104,15 +990,11 @@ export default function DocumentExperience({
     setVersions(null);
     setVersionStatus("idle");
     setNearMatchStatus("idle");
-    setVisibleBlockCount(INITIAL_VISIBLE_BLOCKS);
 
     const savedState = activeViewStateKey
       ? getWorkspaceViewState(activeViewStateKey)
       : undefined;
-    const sameDocument = viewDocumentRef.current === (document?.id ?? "");
-    const nextMode = savedState?.mode ?? (sameDocument ? modeRef.current : "edit");
-    if (!sameDocument) wordPreviewRequestedRef.current = false;
-    viewDocumentRef.current = document?.id ?? "";
+    const nextMode: WorkspaceMode = "layout";
     setMode(nextMode);
     modeRef.current = nextMode;
     setSelectedElementId(savedState?.selectedElementId ?? "");
@@ -1137,7 +1019,7 @@ export default function DocumentExperience({
       setLayoutView(null);
       setLayoutStatus("idle");
     }
-    setShowLayoutStructure(!wordPreviewRequestedRef.current);
+    setShowLayoutStructure(false);
   }, [activeViewStateKey, activeVersionId, document?.id, documentSet.id]);
 
   useEffect(() => {
@@ -1208,18 +1090,6 @@ export default function DocumentExperience({
             : "";
         setSelectedElementId(restoredElementId);
         setDraft(restoredElementId ? savedState?.draft ?? null : null);
-        if (restoredElementId) {
-          const restoredIndex = response.blocks.findIndex(
-            (block) => block.element_id === restoredElementId,
-          );
-          setVisibleBlockCount((current) =>
-            Math.max(
-              current,
-              Math.ceil((restoredIndex + 1) / VISIBLE_BLOCK_BATCH) *
-                VISIBLE_BLOCK_BATCH,
-            ),
-          );
-        }
         loaded = true;
       } catch (error) {
         if (requestId !== contentRequestRef.current) return;
@@ -1261,6 +1131,7 @@ export default function DocumentExperience({
     selectElementById(searchTarget.element_id, {
       skipDiscardConfirmation: true,
       sourceLabel: "search result",
+      remainInLayout: true,
     });
   }, [
     contentStatus,
@@ -1273,43 +1144,20 @@ export default function DocumentExperience({
     if (
       !searchTarget ||
       searchTarget.element_id !== selectedElementId ||
-      mode !== "edit"
+      mode !== "layout"
     ) {
       return;
     }
 
     const frame = window.requestAnimationFrame(() => {
-      const card = findEditorBlockCard(searchTarget.element_id);
-      const scrollContainer = card?.closest<HTMLElement>(
-        ".editor-mode-scroll",
-      );
-      const stickyEditor = scrollContainer?.querySelector<HTMLElement>(
-        ".quill-block-editor",
-      );
-      if (!card) return;
+      const target = findLayoutElement(searchTarget.element_id);
+      if (!target) return;
 
-      if (scrollContainer) {
-        const cardTop =
-          scrollContainer.scrollTop +
-          card.getBoundingClientRect().top -
-          scrollContainer.getBoundingClientRect().top;
-        const top = Math.max(
-          0,
-          cardTop - (stickyEditor?.offsetHeight ?? 0) - 18,
-        );
-        if (typeof scrollContainer.scrollTo === "function") {
-          scrollContainer.scrollTo({ top, behavior: "auto" });
-        } else {
-          scrollContainer.scrollTop = top;
-        }
-      } else {
-        card.scrollIntoView({ behavior: "auto", block: "center" });
-      }
-
+      target.scrollIntoView({ behavior: "auto", block: "center" });
       try {
-        card.focus({ preventScroll: true });
+        target.focus({ preventScroll: true });
       } catch {
-        card.focus();
+        target.focus();
       }
     });
 
@@ -1448,7 +1296,7 @@ export default function DocumentExperience({
 
     const requestId = ++matchRequestRef.current;
     const controller = new AbortController();
-    const loadNearMatches = mode === "compare" || mode === "layout";
+    const loadNearMatches = true;
     setMatchStatus("loading");
     setNearMatchStatus(loadNearMatches ? "loading" : "idle");
     setMatches([]);
@@ -1726,7 +1574,6 @@ export default function DocumentExperience({
 
   async function loadWordPreview() {
     if (!document || !activeVersionId || layoutStatus === "loading") return;
-    wordPreviewRequestedRef.current = true;
     layoutAbortRef.current?.abort();
     const controller = new AbortController();
     layoutAbortRef.current = controller;
@@ -1792,7 +1639,7 @@ export default function DocumentExperience({
       setLocalError(
         `${document.name}: ${errorMessage(
           error,
-          "Microsoft Word could not prepare the preview. Editing remains available.",
+          "Microsoft Word could not prepare the preview. The selectable Layout structure remains available.",
         )}`,
       );
     } finally {
@@ -1805,7 +1652,6 @@ export default function DocumentExperience({
   useEffect(() => {
     if (
       mode !== "layout" ||
-      !wordPreviewRequestedRef.current ||
       !document ||
       !activeVersionId ||
       layoutStatus !== "idle" ||
@@ -1850,33 +1696,10 @@ export default function DocumentExperience({
         modeScrollRef.current.scrollTop =
           savedState?.scrollTop[nextMode] ?? 0;
       }
-      window.document
-        .getElementById(`workspace-tab-${nextMode}`)
-        ?.focus();
     });
   }
 
-  function handleTabKeyDown(
-    event: ReactKeyboardEvent<HTMLButtonElement>,
-    modeIndex: number,
-  ) {
-    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
-      return;
-    }
-    event.preventDefault();
-    let nextIndex = modeIndex;
-    if (event.key === "ArrowLeft") {
-      nextIndex =
-        (modeIndex - 1 + WORKSPACE_MODES.length) % WORKSPACE_MODES.length;
-    } else if (event.key === "ArrowRight") {
-      nextIndex = (modeIndex + 1) % WORKSPACE_MODES.length;
-    } else if (event.key === "Home") {
-      nextIndex = 0;
-    } else if (event.key === "End") {
-      nextIndex = WORKSPACE_MODES.length - 1;
-    }
-    setWorkspaceMode(WORKSPACE_MODES[nextIndex].id);
-  }
+
 
   function handleModeScroll(event: ReactUIEvent<HTMLDivElement>) {
     if (activeViewStateKey) {
@@ -1894,75 +1717,9 @@ export default function DocumentExperience({
       });
     }
 
-    if (
-      mode === "edit" &&
-      editorContent &&
-      visibleBlockCount < editorContent.blocks.length &&
-      event.currentTarget.scrollHeight -
-        event.currentTarget.scrollTop -
-        event.currentTarget.clientHeight <
-        1000
-    ) {
-      setVisibleBlockCount((current) =>
-        Math.min(
-          editorContent.blocks.length,
-          current + VISIBLE_BLOCK_BATCH,
-        ),
-      );
-    }
   }
 
-  function focusEditorForElement(elementId: string) {
-    const attemptFocus = () => {
-      const editor = Array.from(
-        window.document.querySelectorAll<HTMLElement>(
-          ".quill-editor-host .ql-editor[data-editor-element-id]",
-        ),
-      ).find(
-        (candidate) => candidate.dataset.editorElementId === elementId,
-      );
 
-      if (!editor) {
-        return false;
-      }
-
-      editor.closest(".ql-container")?.classList.remove("ql-disabled");
-      editor.classList.remove("ql-disabled");
-      editor.setAttribute("contenteditable", "true");
-      editor.removeAttribute("aria-disabled");
-      editor.removeAttribute("aria-readonly");
-      editor.removeAttribute("inert");
-      editor.style.pointerEvents = "auto";
-
-      try {
-        editor.focus({ preventScroll: true });
-      } catch {
-        editor.focus();
-      }
-
-      return true;
-    };
-
-    /*
-     * DOCSYNC_DIALOG_EDITOR_RECOVERY_V5
-     *
-     * The former native window.confirm blocked Electron's renderer and could
-     * leave Quill's selection manager stale. The in-app dialog no longer
-     * blocks the renderer, but the editor is still remounted and recovered
-     * after either OK or Cancel.
-     */
-    window.setTimeout(() => {
-      window.requestAnimationFrame(() => {
-        if (attemptFocus()) {
-          return;
-        }
-
-        window.requestAnimationFrame(() => {
-          attemptFocus();
-        });
-      });
-    }, 0);
-  }
 
   function selectElementById(
     elementId: string,
@@ -2004,16 +1761,6 @@ export default function DocumentExperience({
       );
       return;
     }
-    const blockIndex = editorContent.blocks.findIndex(
-      (candidate) => candidate.element_id === elementId,
-    );
-    if (blockIndex >= visibleBlockCount) {
-      setVisibleBlockCount(
-        Math.ceil((blockIndex + 1) / VISIBLE_BLOCK_BATCH) *
-          VISIBLE_BLOCK_BATCH,
-      );
-    }
-
     if (
       block.document_id !== document.id ||
       block.version_id !== editorContent.version_id
@@ -2028,7 +1775,7 @@ export default function DocumentExperience({
       setLocalError(
         `${document.name} · ${locationLabel(block)}: ${
           block.unsupported_reason ??
-          "This Word element is preserved as read-only and cannot be opened in the structured editor."
+          "This Word element is preserved as read-only and cannot be edited in Layout."
         }`,
       );
       return;
@@ -2070,13 +1817,8 @@ export default function DocumentExperience({
     setInlineSelection(remainInLayout ? selection : null);
 
     if (block.supported && !block.read_only) {
-      if (remainInLayout) {
-        setShowLayoutStructure(false);
-        setWorkspaceMode("layout");
-      } else {
-        setWorkspaceMode("edit");
-        focusEditorForElement(block.element_id);
-      }
+      setShowLayoutStructure(selection ? false : true);
+      setWorkspaceMode("layout");
     }
   }
 
@@ -2092,13 +1834,8 @@ export default function DocumentExperience({
       if (block.supported && !block.read_only) {
         setEditorResetToken((current) => current + 1);
         setInlineSelection(remainInLayout ? selection : null);
-        if (remainInLayout) {
-          setShowLayoutStructure(false);
-          setWorkspaceMode("layout");
-        } else {
-          setWorkspaceMode("edit");
-          focusEditorForElement(block.element_id);
-        }
+        setShowLayoutStructure(selection ? false : true);
+        setWorkspaceMode("layout");
       }
       return;
     }
@@ -2147,22 +1884,18 @@ export default function DocumentExperience({
       return;
     }
 
-    /*
-     * Cancel keeps the current draft, but forces a fresh Quill instance so the
-     * editor is immediately clickable after the confirmation dialog closes.
-     */
     setEditorResetToken((current) => current + 1);
-    if (modeRef.current === "edit") {
-      focusEditorForElement(currentElementId);
-    } else if (inlineSelection?.regionId) {
-      window.requestAnimationFrame(() => {
+    window.requestAnimationFrame(() => {
+      if (inlineSelection?.regionId) {
         window.document
           .querySelector<HTMLElement>(
             `[data-render-region-id="${CSS.escape(inlineSelection.regionId)}"]`,
           )
           ?.focus();
-      });
-    }
+        return;
+      }
+      findLayoutElement(currentElementId)?.focus();
+    });
   }
 
   function exitInlineEditing(regionId: string) {
@@ -2224,7 +1957,7 @@ export default function DocumentExperience({
     setPreviewOpen(false);
     setPreviewSignature("");
     window.requestAnimationFrame(() => {
-      findEditorBlockCard(selectedBlock.element_id)?.focus();
+      findLayoutElement(selectedBlock.element_id)?.focus();
     });
   }
 
@@ -2757,7 +2490,7 @@ export default function DocumentExperience({
       setLayoutView(null);
       setLayoutStatus("idle");
       setShowLayoutStructure(true);
-      setWorkspaceMode("edit");
+      setWorkspaceMode("layout");
       setRestoreNotice(
         `Version ${result.version.version_number} was created from Version ${result.restored_from_version_number}.`,
       );
@@ -2890,29 +2623,6 @@ export default function DocumentExperience({
           </div>
         </header>
 
-        <div
-          className="workspace-mode-tabs"
-          role="tablist"
-          aria-label="Document workspace mode"
-        >
-          {WORKSPACE_MODES.map((item, index) => (
-            <button
-              id={`workspace-tab-${item.id}`}
-              type="button"
-              role="tab"
-              aria-selected={mode === item.id}
-              aria-controls={`workspace-panel-${item.id}`}
-              tabIndex={mode === item.id ? 0 : -1}
-              className={mode === item.id ? "active" : ""}
-              onClick={() => setWorkspaceMode(item.id)}
-              onKeyDown={(event) => handleTabKeyDown(event, index)}
-              key={item.id}
-            >
-              <strong>{item.label}</strong>
-              <span>{item.description}</span>
-            </button>
-          ))}
-        </div>
 
         {restoreNotice && (
           <div className="editor-restore-notice" role="status">
@@ -2943,57 +2653,9 @@ export default function DocumentExperience({
         >
           <section
             id="workspace-panel-layout"
-            role="tabpanel"
-            aria-labelledby="workspace-tab-layout"
-            hidden={mode !== "layout"}
+            aria-label="Document layout"
             className="editor-mode-panel layout-mode-panel"
           >
-            <div className="mode-panel-heading">
-              <div>
-                {/* <p className="eyebrow">Authoritative layout</p> */}
-                <h2>
-                  {showLayoutStructure || !layoutView?.pdf_url
-                    ? "Select from document structure"
-                    : "Inline Word layout"}
-                </h2>
-                <p>
-                  {showLayoutStructure || !layoutView?.pdf_url
-                    ? "Choose a supported structure as a safe fallback, or load the Word preview for direct inline editing."
-                    : "Click supported text, place the cursor where you need it, and use the complete editing sidebar without leaving Layout."}
-                </p>
-              </div>
-              <div className="layout-heading-actions">
-                {layoutView?.pdf_url && (
-                  <button
-                    type="button"
-                    className="quiet-button layout-selection-toggle"
-                    onClick={() => {
-                      if (!showLayoutStructure) setInlineSelection(null);
-                      setShowLayoutStructure((current) => !current);
-                    }}
-                    aria-pressed={showLayoutStructure}
-                  >
-                    {showLayoutStructure
-                      ? "Show Word preview"
-                      : "Select from structure"}
-                  </button>
-                )}
-                {!layoutView?.pdf_url && (
-                  <button
-                    type="button"
-                    className="primary-button"
-                    disabled={layoutStatus === "loading"}
-                    onClick={() => void loadWordPreview()}
-                  >
-                    {layoutStatus === "loading"
-                      ? "Loading Word Previewâ€¦"
-                      : layoutStatus === "error"
-                        ? "Retry Word Preview"
-                        : "Load Word Preview"}
-                  </button>
-                )}
-              </div>
-            </div>
             {layoutStatus === "loading" && (
               <div className="editor-loading-state nonblocking" role="status">
                 <span className="spinner" aria-hidden="true" />
@@ -3004,8 +2666,8 @@ export default function DocumentExperience({
               <div className="editor-empty-state">
                 <strong>Layout preview unavailable</strong>
                 <p>
-                  Use Edit for supported blocks or retry the Word preview after
-                  closing any Word dialogue.
+                  Retry the Word preview after closing any Word dialogue. The
+                  selectable structure remains available in Layout.
                 </p>
               </div>
             )}
@@ -3053,8 +2715,8 @@ export default function DocumentExperience({
                     <strong>Selectable structure</strong>
                     <span>
                       {layoutStatus === "error"
-                        ? "The rendered layout could not be loaded. Supported elements below still open their current mapped block safely in Edit."
-                        : "Supported elements open the same stable block used by Edit and search. Read-only Word structures remain protected."}
+                        ? "The rendered layout could not be loaded. Supported elements below remain selectable in Layout."
+                        : "Supported elements remain mapped to stable Word blocks. Read-only Word structures remain protected."}
                     </span>
                   </div>
                   {groupStructuredBlocks(editorContent.blocks).map((group) => (
@@ -3076,6 +2738,7 @@ export default function DocumentExperience({
                                 layoutView?.version_id ??
                                 editorContent.version_id,
                               sourceLabel: "Layout element",
+                              remainInLayout: true,
                             })
                           }
                           key={block.element_id}
@@ -3087,338 +2750,6 @@ export default function DocumentExperience({
               )}
           </section>
 
-          <section
-            id="workspace-panel-edit"
-            role="tabpanel"
-            aria-labelledby="workspace-tab-edit"
-            hidden={mode !== "edit"}
-            className="editor-mode-panel edit-mode-panel"
-          >
-            {/* DOCSYNC_QUILL_REMOUNT_V2 */}
-            {selectedBlock && (
-              <div className="selected-block-context" role="status">
-                <strong>Document: {document.name}</strong>
-                <span>{locationLabel(selectedBlock)}</span>
-                {linkedContentExplanation(selectedBlock) && (
-                  <small>{linkedContentExplanation(selectedBlock)}</small>
-                )}
-              </div>
-            )}
-            <QuillBlockEditor
-              key={`${selectedBlock?.element_id ?? "empty"}:${editorResetToken}`}
-              block={mode === "edit" ? selectedBlock : null}
-              value={draft?.delta ?? null}
-              resetToken={editorResetToken}
-              disabled={action === "generate"}
-              onChange={handleDraftChange}
-            />
-            <div className="structured-document-heading">
-              <div>
-                <p className="eyebrow">Stable block mapping</p>
-                <h2>Document blocks</h2>
-                <p>
-                  Every card maps one-to-one to a stored Word element. Select
-                  one supported card to edit it above.
-                </p>
-              </div>
-              <div className="block-counts">
-                <span>
-                  <strong>{editorContent?.blocks.length ?? 0}</strong> total
-                </span>
-                <span>
-                  <strong>{editorContent?.unsupported_count ?? 0}</strong>{" "}
-                  read-only
-                </span>
-              </div>
-            </div>
-            {editorContent?.notice && (
-              <div className="editor-content-notice" role="note">
-                {editorContent.notice}
-              </div>
-            )}
-            {editorContent?.unsupported.length ? (
-              <details className="unsupported-diagnostics">
-                <summary>
-                  {editorContent.unsupported.length} preserved unsupported
-                  structure
-                  {editorContent.unsupported.length === 1 ? "" : "s"}
-                </summary>
-                <div>
-                  {editorContent.unsupported.map((diagnostic, index) => (
-                    <article
-                      key={
-                        diagnostic.id ??
-                        `${diagnostic.element_type}-${index}`
-                      }
-                    >
-                      <strong>
-                        {diagnostic.element_type.replaceAll("_", " ")}
-                      </strong>
-                      {diagnostic.location && (
-                        <small>{diagnostic.location}</small>
-                      )}
-                      <p>{diagnostic.reason}</p>
-                      {diagnostic.text && <blockquote>{diagnostic.text}</blockquote>}
-                    </article>
-                  ))}
-                </div>
-              </details>
-            ) : null}
-            {contentStatus === "loading" && (
-              <div className="editor-loading-state" role="status">
-                <span className="spinner" aria-hidden="true" />
-                Loading structured editor content…
-              </div>
-            )}
-            {contentStatus === "error" && (
-              <div className="editor-empty-state">
-                <strong>Editor content unavailable</strong>
-                <p>Choose another document or return home and reopen the set.</p>
-              </div>
-            )}
-            {contentStatus === "ready" &&
-              editorContent?.blocks.length === 0 && (
-                <div className="editor-empty-state">
-                  <strong>No editable text blocks</strong>
-                  <p>
-                    The document remains available in Layout. Unsupported Word
-                    structures are preserved and are not rewritten.
-                  </p>
-                </div>
-              )}
-            <div className="editor-block-list">
-              {groupStructuredBlocks(
-                editorContent?.blocks.slice(0, visibleBlockCount) ?? [],
-              ).map((group) => (
-                <section
-                  className={`structured-block-group ${group.region}`}
-                  aria-labelledby={`edit-group-${group.key.replaceAll(":", "-")}`}
-                  key={group.key}
-                >
-                  <h3 id={`edit-group-${group.key.replaceAll(":", "-")}`}>
-                    {group.label}
-                  </h3>
-                  {group.blocks.map((block) => (
-                    <BlockCard
-                      block={block}
-                      selected={block.element_id === selectedElementId}
-                      searchRange={
-                        searchTarget?.document_id === document.id &&
-                        searchTarget.element_id === block.element_id
-                          ? {
-                              start: searchTarget.match_start,
-                              end: searchTarget.match_end,
-                            }
-                          : undefined
-                      }
-                      onSelect={handleBlockSelect}
-                      key={block.element_id}
-                    />
-                  ))}
-                </section>
-              ))}
-            </div>
-            {editorContent &&
-              visibleBlockCount < editorContent.blocks.length && (
-                <button
-                  type="button"
-                  className="quiet-button editor-load-more"
-                  onClick={() =>
-                    setVisibleBlockCount((current) =>
-                      Math.min(
-                        editorContent.blocks.length,
-                        current + VISIBLE_BLOCK_BATCH,
-                      ),
-                    )
-                  }
-                >
-                  Show next{" "}
-                  {Math.min(
-                    VISIBLE_BLOCK_BATCH,
-                    editorContent.blocks.length - visibleBlockCount,
-                  )}{" "}
-                  blocks
-                </button>
-              )}
-          </section>
-
-          <section
-            id="workspace-panel-compare"
-            role="tabpanel"
-            aria-labelledby="workspace-tab-compare"
-            hidden={mode !== "compare"}
-            className="editor-mode-panel compare-mode-panel"
-          >
-            <div className="mode-panel-heading">
-              <div>
-                <p className="eyebrow">Cross-document comparison</p>
-                <h2>Exact and near matches</h2>
-                <p>
-                  Exact matches start included. Near matches require an
-                  explicit decision before they can be changed.
-                </p>
-              </div>
-              {selectedBlock && (
-                <button
-                  type="button"
-                  className="quiet-button"
-                  onClick={() => setWorkspaceMode("edit")}
-                >
-                  Back to selected block
-                </button>
-              )}
-            </div>
-            {!selectedBlock ? (
-              <div className="editor-empty-state">
-                <strong>Select a block in Edit first</strong>
-                <p>
-                  Comparison is anchored to one stable source element so every
-                  target remains traceable.
-                </p>
-                <button
-                  type="button"
-                  className="primary-button"
-                  onClick={() => setWorkspaceMode("edit")}
-                >
-                  Go to Edit
-                </button>
-              </div>
-            ) : !selectedBlock.supported || selectedBlock.read_only ? (
-              <div className="editor-empty-state">
-                <strong>This block is read-only</strong>
-                <p>
-                  {selectedBlock.unsupported_reason ??
-                    "It cannot be safely compared or edited in this release."}
-                </p>
-              </div>
-            ) : (
-              <>
-                <article className="compare-source-card">
-                  <header>
-                    <span>Source</span>
-                    <strong>{document.name}</strong>
-                    <small>{locationLabel(selectedBlock)}</small>
-                  </header>
-                  <p>{draft?.text ?? selectedBlock.text}</p>
-                </article>
-                {nearMatchStatus === "loading" && (
-                  <div className="editor-loading-state" role="status">
-                    <span className="spinner" aria-hidden="true" />
-                    Finding exact and near matches…
-                  </div>
-                )}
-                {matchStatus === "ready" &&
-                  nearMatchStatus !== "loading" &&
-                  matches.filter(
-                    (match) => match.match_type !== "source",
-                  ).length === 0 && (
-                    <div className="editor-empty-state">
-                      <strong>No related blocks found</strong>
-                      <p>
-                        You can still use Whole-paragraph override for the
-                        selected source block.
-                      </p>
-                    </div>
-                  )}
-                <div className="comparison-list">
-                  {matches
-                    .filter((match) => match.match_type !== "source")
-                    .map((match) => {
-                      const included = includedElementIds.has(match.element_id);
-                      const nearUnavailable =
-                        match.match_type === "near" &&
-                        (match.decision !== "confirmed" ||
-                          editMode === "shared");
-                      return (
-                        <article
-                          className={`comparison-card ${match.match_type} ${
-                            included ? "included" : "excluded"
-                          }`}
-                          key={match.element_id}
-                        >
-                          <header>
-                            <label>
-                              <input
-                                type="checkbox"
-                                checked={included}
-                                disabled={nearUnavailable}
-                                onChange={() => toggleTarget(match)}
-                              />
-                              <span>
-                                <strong>{match.document_name}</strong>
-                                <small>{locationLabel(match)}</small>
-                              </span>
-                            </label>
-                            <span className={`match-kind ${match.match_type}`}>
-                              {match.match_type === "exact"
-                                ? "Exact · 100%"
-                                : `Near · ${Math.round(
-                                    match.similarity_score * 100,
-                                  )}%`}
-                            </span>
-                          </header>
-                          <p>
-                            <DifferenceText spans={match.difference_spans} />
-                          </p>
-                          {match.match_type === "near" && (
-                            <footer>
-                              <span>
-                                Decision:{" "}
-                                <strong>{match.decision}</strong>
-                              </span>
-                              <div
-                                role="group"
-                                aria-label={`Decision for ${match.document_name}`}
-                              >
-                                <button
-                                  type="button"
-                                  className={
-                                    match.decision === "confirmed"
-                                      ? "active"
-                                      : ""
-                                  }
-                                  onClick={() =>
-                                    updateDecision(match, "confirmed")
-                                  }
-                                >
-                                  Confirm
-                                </button>
-                                <button
-                                  type="button"
-                                  className={
-                                    match.decision === "ignored"
-                                      ? "active"
-                                      : ""
-                                  }
-                                  onClick={() =>
-                                    updateDecision(match, "ignored")
-                                  }
-                                >
-                                  Ignore
-                                </button>
-                                <button
-                                  type="button"
-                                  className={
-                                    match.decision === "removed"
-                                      ? "active"
-                                      : ""
-                                  }
-                                  onClick={() =>
-                                    updateDecision(match, "removed")
-                                  }
-                                >
-                                  Remove
-                                </button>
-                              </div>
-                            </footer>
-                          )}
-                        </article>
-                      );
-                    })}
-                </div>
-              </>
-            )}
-          </section>
         </div>
       </section>
 
@@ -3426,7 +2757,7 @@ export default function DocumentExperience({
         className="edit-sidebar editor-operation-sidebar"
         aria-labelledby="editor-operation-title"
       >
-        {mode === "layout" && !selectedBlock ? (
+        {!selectedBlock ? (
           <>
             <div className="sidebar-heading">
               <div>
@@ -3440,30 +2771,6 @@ export default function DocumentExperience({
               <p>
                 A restricted editor will appear over the selected paragraph.
                 Uncertain mappings and complex Word structures stay read-only.
-              </p>
-              <button
-                type="button"
-                className="quiet-button"
-                onClick={() => setWorkspaceMode("edit")}
-              >
-                Use structured Edit
-              </button>
-            </div>
-          </>
-        ) : !selectedBlock ? (
-          <>
-            <div className="sidebar-heading">
-              <div>
-                <span className="eyebrow">Controlled edit</span>
-                <h2 id="editor-operation-title">Edit operation</h2>
-              </div>
-            </div>
-            <div className="sidebar-empty">
-              <span aria-hidden="true">T</span>
-              <h3>Select one stable block</h3>
-              <p>
-                Choose a supported block in Edit to configure shared wording,
-                per-document values, or a whole-paragraph override.
               </p>
             </div>
           </>
@@ -3492,7 +2799,7 @@ export default function DocumentExperience({
             <div className="sidebar-heading">
               <div>
                 <span className="eyebrow">Controlled edit</span>
-                <h2 id="editor-operation-title">Edit operation</h2>
+                <h2 id="editor-operation-title">Layout editing</h2>
               </div>
               <span className={`draft-status ${dirty ? "dirty" : ""}`}>
                 {dirty || perDocumentDirty ? "Unsaved draft" : "No changes"}
@@ -3561,7 +2868,7 @@ export default function DocumentExperience({
               )}
 
               <fieldset className="edit-mode-options">
-                <legend>Edit mode</legend>
+                <legend>Update mode</legend>
                 <label className={editMode === "shared" ? "selected" : ""}>
                   <input
                     type="radio"
@@ -3573,7 +2880,7 @@ export default function DocumentExperience({
                   <span>
                     <strong>Shared wording</strong>
                     <small>
-                      Use the Quill draft for checked exact matches. Near
+                      Apply the Layout draft to checked exact matches. Near
                       matches stay protected.
                     </small>
                   </span>
@@ -3621,8 +2928,8 @@ export default function DocumentExperience({
                   <div>
                     <h3>Selected targets</h3>
                     <p>
-                      Exact matches are safe by default. Confirm near matches
-                      in Compare.
+                      Exact matches are safe by default. Review near matches
+                      below before including them.
                     </p>
                   </div>
                   <span>
