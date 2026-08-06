@@ -718,6 +718,7 @@ Planned work includes:
 - PostgreSQL
 - Cloud storage and synchronisation
 - Find and replace
+- make it so we can do x amount of changes then hit the generate button that will update it all
 
 ---
 
