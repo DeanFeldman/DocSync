@@ -529,8 +529,8 @@ http://localhost:8001/docs
 
 Planned improvements include:
 
-- Support for additional complex Word structures
 - Batch multiple reviewed edits before generation
+- Support for additional complex Word structures
 - Find and replace
 - Linux and macOS feasibility
 - Commercial code signing
