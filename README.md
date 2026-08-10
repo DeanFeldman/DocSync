@@ -601,8 +601,6 @@ Report exposed credentials immediately and rotate any real secret that entered G
 
 **Dean Feldman**
 
-Student number: **2803899**
-
 ---
 
 ## License
