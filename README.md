@@ -4,7 +4,7 @@
 [![Release](https://github.com/DeanFeldman/DocSync/actions/workflows/release.yml/badge.svg)](https://github.com/DeanFeldman/DocSync/actions/workflows/release.yml)
 [![Latest Release](https://img.shields.io/github/v/release/DeanFeldman/DocSync)](https://github.com/DeanFeldman/DocSync/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-Windows-0078D4)](#requirements)
-[![Version](https://img.shields.io/badge/version-1.9.0-blue)](#latest-release)
+[![Version](https://img.shields.io/badge/version-1.10.0-blue)](#latest-release)
 
 DocSync is a local-first Windows desktop application for safely coordinating edits across related Microsoft Word documents.
 
@@ -36,28 +36,28 @@ SHA256SUMS.txt
 
 ## Latest Release
 
-### Version 1.9.0
+### Version 1.10.0
 
-DocSync `v1.9.0` improves the speed of opening large Word documents and generating new versions.
+DocSync `v1.10.0` substantially reduces workspace-ingestion, exact-match,
+search, preview, and desktop-startup overhead while preserving immutable document
+history and Word fidelity.
 
 The application now:
 
-- Checks memory and SQLite preview caches before rebuilding previews.
-- Displays structured content while the high-fidelity Word preview refreshes.
-- Keeps stale cached previews usable during a refresh.
-- Avoids repeated DOCX parsing and indexing during generation.
-- Retains stable block identities.
-- Rebuilds only changed exact-match groups.
-- Batches database writes.
-- Avoids recompressing files that are already compressed.
-- Loads Quill only when an editable region is selected.
-- Keeps document and sidebar scrolling inside the workspace.
-- Shows processing progress and actionable errors inline.
+- Reuses one serial Microsoft Word process for high-fidelity PDF exports.
+- Extracts PDF structure without rasterizing every page up front.
+- Renders immutable page images lazily and safely reuses the cache.
+- Coordinates preview jobs through events instead of database polling.
+- Persists workspace rows in batches and groups exact matches in SQL.
+- Uses a trigger-maintained FTS5 index for current-version search, with fallback.
+- Starts development services directly without rebuilding production assets.
+- Ships a 98.98% smaller lossless logo asset.
+- Reduces the measured workspace-ingestion median from 5.78 seconds to 1.36 seconds.
 
 See:
 
-- [v1.9.0 release notes](docs/v1.9.0-release-notes.md)
-- [v1.9.0 manual test plan](docs/v1.9.0-manual-testing.md)
+- [v1.10.0 release notes](docs/v1.10.0-release-notes.md)
+- [v1.10.0 manual test plan](docs/v1.10.0-manual-testing.md)
 - [Performance optimisation report](docs/performance-optimisation-2026-08.md)
 
 ---
@@ -457,7 +457,7 @@ The release workflow runs when a tag beginning with `v` is pushed.
 Example:
 
 ```powershell
-$version = "1.9.0"
+$version = "1.10.0"
 
 git switch main
 git pull origin main
