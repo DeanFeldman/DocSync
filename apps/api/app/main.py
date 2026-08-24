@@ -137,7 +137,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="DocumentSync API",
-    version="1.11.0",
+    version="1.12.0",
     description="DocSync structured DOCX viewing and controlled editing service.",
     lifespan=lifespan,
 )

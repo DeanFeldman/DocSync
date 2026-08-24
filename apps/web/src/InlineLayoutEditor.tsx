@@ -103,7 +103,18 @@ export default function InlineLayoutEditor({
         history: { delay: 450, maxStack: 100, userOnly: true },
         keyboard: {
           bindings: {
-            docsyncInlineEnter: { key: "Enter", handler: () => false },
+            docsyncSoftLineBreak: {
+              key: "Enter",
+              handler: (range: { index: number; length: number }) => {
+                if (!quill) return false;
+                if (range.length) {
+                  quill.deleteText(range.index, range.length, "user");
+                }
+                quill.insertText(range.index, "\n", "user");
+                quill.setSelection(range.index + 1, 0, "silent");
+                return false;
+              },
+            },
           },
         },
       },
@@ -117,7 +128,7 @@ export default function InlineLayoutEditor({
       "aria-label",
       `Edit ${block.element_type.replaceAll("_", " ")}, paragraph ${block.paragraph_index + 1}`,
       );
-      quill.root.setAttribute("aria-multiline", "false");
+      quill.root.setAttribute("aria-multiline", "true");
 
       function publish() {
         if (!quill) return;
@@ -138,11 +149,11 @@ export default function InlineLayoutEditor({
       const pastedText = event.clipboardData?.getData("text/plain") ?? "";
       if (!/[\r\n]/.test(pastedText)) return;
       event.preventDefault();
-      const flattened = pastedText.replace(/\s*[\r\n]+\s*/g, " ").trim();
+      const normalized = pastedText.replace(/\r\n?/g, "\n");
       const range = quill.getSelection(true) ?? lastRangeRef.current;
       if (range.length) quill.deleteText(range.index, range.length, "user");
-      quill.insertText(range.index, flattened, "user");
-      quill.setSelection(range.index + flattened.length, 0, "silent");
+      quill.insertText(range.index, normalized, "user");
+      quill.setSelection(range.index + normalized.length, 0, "silent");
       };
 
       handleKeyDown = (event) => {

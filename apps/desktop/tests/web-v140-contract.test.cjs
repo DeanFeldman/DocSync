@@ -29,18 +29,20 @@ test("theme is applied before React and persists the explicit preference", () =>
   assert.match(styles, /:root\[data-theme="dark"\]/);
 });
 
-test("structured Layout selection uses the central version-safe inline editor path", () => {
+test("controlled Word selection uses the central version-safe inline editor path", () => {
   const experience = read("apps/web/src/DocumentExperience.tsx");
+  const overlay = read("apps/web/src/WordPreviewOverlay.tsx");
   const types = read("apps/web/src/types.ts");
 
-  assert.match(experience, /function LayoutFallbackBlock/);
+  assert.doesNotMatch(experience, /LayoutFallbackBlock|showLayoutStructure/);
+  assert.match(overlay, /data-element-id=\{region\.element_id\}/);
   assert.match(experience, /function selectElementById/);
   assert.match(
     experience,
     /options\.sourceVersionId !== editorContent\.version_id/,
   );
   assert.match(experience, /selectBlock\(\s*block,/);
-  assert.match(experience, /aria-pressed=\{selected\}/);
+  assert.match(overlay, /region\.element_id === selectedElementId/);
   assert.match(experience, /setWorkspaceMode\("layout"\)/);
   assert.match(
     experience,

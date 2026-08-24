@@ -824,7 +824,7 @@ def _unsupported_reason(
                 "safely edit. The content will remain unchanged in the "
                 "generated document."
             )
-        if _cell_uses_merged_structure(cell):
+        if _cell_uses_merged_structure(cell) and not allow_multiple_paragraphs:
             return (
                 "This table cell uses a merged structure that DocSync cannot "
                 "safely edit. The content will remain unchanged in the "
@@ -977,7 +977,7 @@ def _revision_values(
         "list_level": list_level,
         "alignment": alignment,
         "location_json": location,
-        "shared_state": shared_state,
+        "shared_state": "detached" if not normalized else shared_state,
         "supported": reason is None,
         "unsupported_reason": reason,
     }
@@ -1954,14 +1954,6 @@ def _delta_visible_text(delta: QuillDelta) -> str:
     normalized = inserted.replace("\r\n", "\n").replace("\r", "\n")
     if normalized.endswith("\n"):
         normalized = normalized[:-1]
-    if "\n" in normalized:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "Splitting, merging, inserting, deleting, or reordering blocks is "
-                "unsupported in this release."
-            ),
-        )
     return normalized
 
 
@@ -1977,11 +1969,11 @@ def _validate_delta(target: EditorTarget) -> dict | None:
             ),
         )
     operations = target.delta.model_dump(exclude_none=True)["ops"]
-    for index, operation in enumerate(operations):
+    for operation in operations:
         attributes = set((operation.get("attributes") or {}).keys())
         allowed = (
             ALLOWED_BLOCK_ATTRIBUTES
-            if operation.get("insert") == "\n" and index == len(operations) - 1
+            if operation.get("insert") == "\n"
             else ALLOWED_INLINE_ATTRIBUTES
         )
         unsupported = attributes - allowed

@@ -100,9 +100,11 @@ def make_read_only_table_docx(shared_text: str) -> bytes:
     document = Document()
     document.add_heading("Read-only structures", level=1)
     document.add_paragraph(shared_text)
-    table = document.add_table(rows=1, cols=2)
-    cell = table.cell(0, 0).merge(table.cell(0, 1))
-    cell.paragraphs[0].text = "Read-only merged content"
+    table = document.add_table(rows=1, cols=1)
+    cell = table.cell(0, 0)
+    cell.paragraphs[0].text = "Read-only nested content"
+    nested = cell.add_table(rows=1, cols=1)
+    nested.cell(0, 0).text = "Nested value"
     return save_docx(document)
 
 
@@ -127,6 +129,16 @@ def make_expanded_table_docx(
     secondary.alignment = WD_ALIGN_PARAGRAPH.RIGHT
     table.cell(0, 1).text = f"{title} untouched value"
     document.add_paragraph("Body content after the table.")
+    return save_docx(document)
+
+
+def make_blank_merged_field_docx(title: str) -> bytes:
+    document = Document()
+    document.add_heading(title, level=1)
+    table = document.add_table(rows=1, cols=3)
+    table.cell(0, 0).text = "Signature:"
+    target = table.cell(0, 1).merge(table.cell(0, 2))
+    target.text = ""
     return save_docx(document)
 
 
@@ -690,7 +702,73 @@ def test_table_paragraphs_are_individual_safe_rich_versioned_blocks(
         assert updated_cell.paragraphs[1].runs[0].italic is True
 
 
-def test_unsafe_table_structures_are_visible_once_and_read_only(
+def test_blank_merged_table_field_accepts_content_and_soft_line_breaks(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    app = load_test_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        workspace = upload_set(
+            client,
+            {
+                "Alpha.docx": make_blank_merged_field_docx("Alpha"),
+                "Beta.docx": make_blank_merged_field_docx("Beta"),
+            },
+        )
+        alpha = documents_by_name(workspace)["Alpha.docx"]
+        content = read_editor_content(client, alpha["version_id"])
+        target = next(
+            block
+            for block in content["blocks"]
+            if block["element_type"] == "table_paragraph"
+            and block["text"] == ""
+        )
+        assert target["supported"] is True
+        assert target["read_only"] is False
+        assert target["shared_state"] == "detached"
+
+        matches = client.get(
+            f"/api/document-elements/{target['element_id']}/matches"
+        )
+        assert matches.status_code == 200, matches.text
+        assert matches.json()["exact_matches"] == []
+
+        replacement = "Dean Feldman\nAuthorised signatory"
+        generated = client.post(
+            f"/api/document-sets/{workspace['id']}/editor-generate",
+            json={
+                "base_versions": {alpha["id"]: alpha["version_id"]},
+                "source_element_id": target["element_id"],
+                "edit_mode": "override",
+                "targets": [
+                    {
+                        "element_id": target["element_id"],
+                        "replacement_text": replacement,
+                        "delta": {
+                            "ops": [
+                                {"insert": "Dean Feldman"},
+                                {"insert": "\n"},
+                                {
+                                    "insert": "Authorised signatory",
+                                    "attributes": {"italic": True},
+                                },
+                                {"insert": "\n"},
+                            ]
+                        },
+                    }
+                ],
+            },
+        )
+        assert generated.status_code == 201, generated.text
+        downloaded = client.get(generated.json()["versions"][0]["download_url"])
+        assert downloaded.status_code == 200
+        result = Document(io.BytesIO(downloaded.content))
+        merged = result.tables[0].cell(0, 1)
+        assert merged.paragraphs[0].text == replacement
+        assert merged.paragraphs[0].runs[-1].italic is True
+
+
+def test_unsafe_table_structures_remain_read_only_while_merged_text_is_editable(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -717,9 +795,8 @@ def test_unsafe_table_structures_are_visible_once_and_read_only(
             if block["text"] == "Merged content appears once"
         ] == ["Merged content appears once"]
         by_text = {block["text"]: block for block in table_blocks}
-        assert "merged structure" in by_text[
-            "Merged content appears once"
-        ]["unsupported_reason"]
+        assert by_text["Merged content appears once"]["supported"] is True
+        assert by_text["Merged content appears once"]["read_only"] is False
         assert "nested structure" in by_text[
             "Outer text beside a nested table"
         ]["unsupported_reason"]
@@ -729,9 +806,10 @@ def test_unsafe_table_structures_are_visible_once_and_read_only(
         assert all(
             block["read_only"] and not block["supported"]
             for block in table_blocks
+            if block["text"] != "Merged content appears once"
         )
         assert all(block["text"] for block in table_blocks)
-        assert content["unsupported_count"] >= 3
+        assert content["unsupported_count"] >= 2
 
 
 def test_document_view_exposes_safe_optional_layout_region_contract(
@@ -1547,7 +1625,7 @@ def test_invalid_delta_and_unsupported_block_leave_no_version_or_operation(
         )
         assert read_only["supported"] is False
         assert read_only["read_only"] is True
-        assert "merged structure" in read_only["unsupported_reason"]
+        assert "nested structure" in read_only["unsupported_reason"]
 
         invalid_delta = client.post(
             f"/api/document-sets/{workspace['id']}/editor-generate",
@@ -1584,7 +1662,7 @@ def test_invalid_delta_and_unsupported_block_leave_no_version_or_operation(
             },
         )
         assert unsupported.status_code == 422
-        assert "merged structure" in unsupported.json()["detail"]
+        assert "nested structure" in unsupported.json()["detail"]
 
         for document in documents.values():
             versions = client.get(

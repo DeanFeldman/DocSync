@@ -261,7 +261,7 @@ def test_repeated_real_startup_does_not_duplicate_version_foundation(
             for table in baseline
         }
     assert after == baseline
-    assert detect_schema_version(database_path) == 8
+    assert detect_schema_version(database_path) == 9
     backups = list((data_directory / "migration-backups").glob("*.db"))
     assert len(backups) == 1
 
@@ -271,6 +271,17 @@ def _table_docx(text: str) -> bytes:
     document.add_heading("Legacy table", level=1)
     table = document.add_table(rows=1, cols=1)
     table.cell(0, 0).text = text
+    stream = io.BytesIO()
+    document.save(stream)
+    return stream.getvalue()
+
+
+def _blank_table_docx() -> bytes:
+    document = Document()
+    document.add_heading("Blank form field", level=1)
+    table = document.add_table(rows=1, cols=2)
+    table.cell(0, 0).text = "Name:"
+    table.cell(0, 1).text = ""
     stream = io.BytesIO()
     document.save(stream)
     return stream.getvalue()
@@ -371,7 +382,7 @@ def test_v15_migration_regenerates_legacy_table_cells_after_verified_backup(
     database.init_db()
 
     assert cached_revision_calls > 0
-    assert detect_schema_version(database_path) == 8
+    assert detect_schema_version(database_path) == 9
     backups = list((data_directory / "migration-backups").glob("*.db"))
     assert len(backups) == 1
     assert backups[0].stat().st_size > 0
@@ -391,6 +402,120 @@ def test_v15_migration_regenerates_legacy_table_cells_after_verified_backup(
         assert table_blocks[0]["text"] == "Shared legacy cell"
         assert table_blocks[0]["paragraph_index"] == 0
         assert table_blocks[0]["supported"] is True
+
+
+def test_schema_9_migration_backfills_blank_table_fields_from_immutable_docx(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    data_directory = tmp_path / "data"
+    database_path = tmp_path / "schema-8-workspace.db"
+    monkeypatch.setenv("DOCUMENTSYNC_DATA_DIR", str(data_directory))
+    monkeypatch.setenv("DOCUMENTSYNC_DATABASE_URL", database_url(database_path))
+    monkeypatch.setenv("DOCUMENTSYNC_SESSION_TOKEN", "")
+    monkeypatch.delenv("DOCUMENTSYNC_WEB_DIST", raising=False)
+    for module_name in list(sys.modules):
+        if module_name == "app" or module_name.startswith("app."):
+            del sys.modules[module_name]
+
+    main = importlib.import_module("app.main")
+    with TestClient(main.app) as client:
+        response = client.post(
+            "/api/document-sets",
+            data={"name": "Blank field workspace"},
+            files=[
+                (
+                    "files",
+                    (
+                        name,
+                        _blank_table_docx(),
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    ),
+                )
+                for name in ("form-one.docx", "form-two.docx")
+            ],
+        )
+        assert response.status_code == 201, response.text
+        document = response.json()["documents"][0]
+        content = client.get(
+            f"/api/document-versions/{document['version_id']}/editor-content"
+        )
+        blank = next(
+            block
+            for block in content.json()["blocks"]
+            if block["element_type"] == "table_paragraph" and block["text"] == ""
+        )
+        stable_element_ids = {
+            block["text"]: block["element_id"]
+            for block in content.json()["blocks"]
+            if block["text"]
+        }
+
+    database = importlib.import_module("app.database")
+    with database.engine.begin() as connection:
+        connection.exec_driver_sql(
+            "DELETE FROM link_members WHERE element_id = ?",
+            (blank["element_id"],),
+        )
+        connection.exec_driver_sql(
+            "DELETE FROM document_block_revisions WHERE element_id = ?",
+            (blank["element_id"],),
+        )
+        connection.exec_driver_sql(
+            "DELETE FROM document_elements WHERE id = ?",
+            (blank["element_id"],),
+        )
+        connection.exec_driver_sql(
+            "DELETE FROM docsync_schema_migrations WHERE version >= 9"
+        )
+
+    monkeypatch.setattr(
+        database,
+        "_migrate_table_paragraph_foundation",
+        lambda _session: pytest.fail(
+            "Schema 9 must not rebuild all document revisions"
+        ),
+    )
+    database.init_db()
+
+    assert detect_schema_version(database_path) == 9
+    with TestClient(main.app) as client:
+        content = client.get(
+            f"/api/document-versions/{document['version_id']}/editor-content"
+        )
+        assert content.status_code == 200, content.text
+        blank_fields = [
+            block
+            for block in content.json()["blocks"]
+            if block["element_type"] == "table_paragraph" and block["text"] == ""
+        ]
+        assert len(blank_fields) == 1
+        assert blank_fields[0]["supported"] is True
+        assert blank_fields[0]["read_only"] is False
+        assert blank_fields[0]["shared_state"] == "detached"
+        assert {
+            block["text"]: block["element_id"]
+            for block in content.json()["blocks"]
+            if block["text"]
+        } == stable_element_ids
+        migrated_blank_id = blank_fields[0]["element_id"]
+
+    with database.engine.begin() as connection:
+        connection.exec_driver_sql(
+            "DELETE FROM docsync_schema_migrations WHERE version >= 9"
+        )
+    database.init_db()
+
+    with TestClient(main.app) as client:
+        content = client.get(
+            f"/api/document-versions/{document['version_id']}/editor-content"
+        )
+        blank_fields = [
+            block
+            for block in content.json()["blocks"]
+            if block["element_type"] == "table_paragraph" and block["text"] == ""
+        ]
+        assert [block["element_id"] for block in blank_fields] == [migrated_blank_id]
 
 
 def test_v17_migration_backfills_linked_headers_from_immutable_docx(
@@ -448,7 +573,7 @@ def test_v17_migration_backfills_linked_headers_from_immutable_docx(
 
     database.init_db()
 
-    assert detect_schema_version(database_path) == 8
+    assert detect_schema_version(database_path) == 9
     backups = list((data_directory / "migration-backups").glob("*.db"))
     assert len(backups) == 1
     with TestClient(main.app) as client:

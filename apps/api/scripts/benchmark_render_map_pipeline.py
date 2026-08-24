@@ -72,7 +72,7 @@ def main() -> int:
     )
 
     extraction_started = perf_counter()
-    pages, tokens = _extract_pdf_structure(context, "1" * 24)
+    pages, tokens, _geometry = _extract_pdf_structure(context, "1" * 24)
     extraction_ms = (perf_counter() - extraction_started) * 1000
     assert not list(args.data_dir.glob("benchmark-version.pages/**/*.png"))
 

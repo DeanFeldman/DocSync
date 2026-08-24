@@ -32,7 +32,7 @@ test("v1.8 queues durable preview work and reports progressive readiness", () =>
   assert.match(types, /interface PreviewRenderJobResponse/);
 });
 
-test("controlled preview publishes pages, overlays, zoom, and structure fallback", () => {
+test("controlled preview publishes pages, overlays, zoom, and retry controls", () => {
   const overlay = read("apps/web/src/WordPreviewOverlay.tsx");
   const backend = read("apps/api/app/render_map_service.py");
   const styles = read("apps/web/src/styles.css");
@@ -44,7 +44,8 @@ test("controlled preview publishes pages, overlays, zoom, and structure fallback
   assert.match(overlay, /Fit width/);
   assert.match(overlay, /Fit page/);
   assert.match(overlay, /Show selectable areas/);
-  assert.match(overlay, /Select from structure/);
+  assert.match(overlay, /data-element-id=\{region\.element_id\}/);
+  assert.doesNotMatch(overlay, /Select from structure|onShowStructure/);
   assert.match(overlay, /Retry preview/);
   assert.match(overlay, /IntersectionObserver/);
   assert.match(overlay, /ResizeObserver/);
@@ -69,13 +70,14 @@ test("open workspaces fill the viewport and keep scrolling inside the preview", 
   assert.doesNotMatch(styles, /height: calc\(100vh - 390px\)/);
 });
 
-test("inline Quill enforces one paragraph and shares the central draft", () => {
+test("inline Quill supports soft lines and shares the central draft", () => {
   const inlineEditor = read("apps/web/src/InlineLayoutEditor.tsx");
   const experience = read("apps/web/src/DocumentExperience.tsx");
 
-  assert.match(inlineEditor, /docsyncInlineEnter/);
-  assert.match(inlineEditor, /handler: \(\) => false/);
-  assert.match(inlineEditor, /replace\(\/\\s\*\[\\r\\n\]\+\\s\*\/g, " "\)/);
+  assert.match(inlineEditor, /docsyncSoftLineBreak/);
+  assert.match(inlineEditor, /insertText\(range\.index, "\\n", "user"\)/);
+  assert.match(inlineEditor, /aria-multiline", "true"/);
+  assert.match(inlineEditor, /replace\(\/\\r\\n\?\/g, "\\n"\)/);
   assert.match(inlineEditor, /event\.key !== "Escape"/);
   assert.match(inlineEditor, /quill\.history\.undo/);
   assert.match(inlineEditor, /quill\.history\.redo/);

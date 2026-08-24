@@ -52,7 +52,6 @@ interface WordPreviewOverlayProps {
   onSelect: (intent: LayoutSelectionIntent) => void;
   onDraftChange: (draft: QuillDraft) => void;
   onExitInline: (regionId: string) => void;
-  onShowStructure: () => void;
   onRetryPreview: () => void;
 }
 
@@ -259,6 +258,7 @@ function MapPage({
                 type="button"
                 key={region.region_id}
                 data-render-region-id={region.region_id}
+                data-element-id={region.element_id}
                 className={`render-map-region${region.interactive ? " interactive" : " read-only"}${region.element_id === selectedElementId ? " selected" : ""}`}
                 style={{
                   left: `${region.x * 100}%`,
@@ -325,7 +325,6 @@ export default function WordPreviewOverlay({
   onSelect,
   onDraftChange,
   onExitInline,
-  onShowStructure,
   onRetryPreview,
 }: WordPreviewOverlayProps) {
   const [renderMap, setRenderMap] = useState<RenderMapResponse | null>(null);
@@ -485,7 +484,6 @@ export default function WordPreviewOverlay({
         >
           Show selectable areas
         </button>
-        <button type="button" onClick={onShowStructure}>Select from structure</button>
         <button type="button" onClick={onRetryPreview}>Retry preview</button>
       </div>
       <div className="render-map-status" role="status" aria-live="polite">
