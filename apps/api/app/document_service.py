@@ -5,7 +5,6 @@ import logging
 import math
 import re
 import shutil
-import subprocess
 import threading
 from time import perf_counter
 import unicodedata
@@ -20,7 +19,8 @@ from docx.document import Document as DocxDocument
 from docx.oxml.ns import qn
 from docx.text.paragraph import Paragraph
 from fastapi import HTTPException, UploadFile, status
-from sqlalchemy import delete, func, select
+from sqlalchemy import column, delete, func, insert, select, table, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, selectinload
 from datetime import datetime, timezone
 
@@ -118,6 +118,11 @@ PAGE_LAYOUT_UNITS = 18
 WORD_RENDER_LOCK = threading.Lock()
 LARGE_SET_LINK_GROUP_LIMIT = 100
 logger = logging.getLogger(__name__)
+DOCUMENT_BLOCK_FTS = table(
+    "document_block_fts",
+    column("revision_id"),
+    column("normalized_text"),
+)
 
 def utc_isoformat(value: datetime) -> str:
     """Return a consistent timezone-aware UTC timestamp."""
@@ -628,8 +633,9 @@ async def create_document_set(
         "persistence_ms": 0.0,
         "matching_setup_ms": 0.0,
     }
-    document_set = DocumentSet(id=new_id(), name=cleaned_name)
-    original_dir = settings.data_dir / "originals" / document_set.id
+    document_set_id = new_id()
+    created_at = datetime.now(timezone.utc)
+    original_dir = settings.data_dir / "originals" / document_set_id
     seen_names: set[str] = set()
     prepared: list[
         tuple[
@@ -669,60 +675,75 @@ async def create_document_set(
 
         persistence_started = perf_counter()
         original_dir.mkdir(parents=True, exist_ok=False)
-        records: list[
-            tuple[DocumentRecord, DocxDocument, list[DocumentElement]]
-        ] = []
-        all_elements: list[DocumentElement] = []
-        for original_name, payload, parsed_document, extracted in prepared:
+        document_rows: list[dict] = []
+        element_rows: list[dict] = []
+        version_rows: list[dict] = []
+        head_rows: list[dict] = []
+        revision_rows: list[dict] = []
+        from .editor_service import prepare_original_version_rows
 
+        for original_name, payload, parsed_document, extracted in prepared:
             document_id = new_id()
-            stored_name = f"{document_set.id}/{document_id}.docx"
+            stored_name = f"{document_set_id}/{document_id}.docx"
             target = settings.data_dir / "originals" / stored_name
             target.write_bytes(payload)
-
-            record = DocumentRecord(
-                id=document_id,
-                document_set=document_set,
-                original_name=original_name,
-                stored_name=stored_name,
-                checksum_sha256=hashlib.sha256(payload).hexdigest(),
-            )
-            elements = [
-                DocumentElement(
-                    id=new_id(),
-                    document=record,
-                    document_id=record.id,
-                    paragraph_index=paragraph_index,
-                    text=text,
-                    normalized_text=normalise_text(text),
-                    style_name=style_name,
-                )
+            document_row = {
+                "id": document_id,
+                "document_set_id": document_set_id,
+                "original_name": original_name,
+                "stored_name": stored_name,
+                "checksum_sha256": hashlib.sha256(payload).hexdigest(),
+                "created_at": created_at,
+            }
+            current_element_rows = [
+                {
+                    "id": new_id(),
+                    "document_id": document_id,
+                    "paragraph_index": paragraph_index,
+                    "text": text,
+                    "normalized_text": normalise_text(text),
+                    "style_name": style_name,
+                }
                 for paragraph_index, text, style_name in extracted
             ]
-            records.append((record, parsed_document, elements))
-            all_elements.extend(elements)
-
-        session.add(document_set)
-        session.add_all(
-            [record for record, _parsed, _elements in records]
-        )
-        session.add_all(all_elements)
-        from .editor_service import initialise_original_version
-
-        for record, parsed_document, elements in records:
-            initialise_original_version(
-                session,
-                record,
-                parsed_document=parsed_document,
-                elements=elements,
+            version_row, head_row, current_revision_rows = (
+                prepare_original_version_rows(
+                    document_row,
+                    parsed_document,
+                    current_element_rows,
+                )
             )
-        session.flush()
+            document_rows.append(document_row)
+            element_rows.extend(current_element_rows)
+            version_rows.append(version_row)
+            head_rows.append(head_row)
+            revision_rows.extend(current_revision_rows)
+
+        insert_started = perf_counter()
+        session.execute(
+            insert(DocumentSet.__table__),
+            [{"id": document_set_id, "name": cleaned_name, "created_at": created_at}],
+        )
+        session.execute(insert(DocumentRecord.__table__), document_rows)
+        session.execute(insert(DocumentElement.__table__), element_rows)
+        session.execute(insert(DocumentVersion.__table__), version_rows)
+        session.execute(insert(DocumentHead.__table__), head_rows)
+        session.execute(insert(DocumentBlockRevision.__table__), revision_rows)
+        bulk_insert_ms = (perf_counter() - insert_started) * 1000
+        logger.info(
+            "docsync.workspace_bulk_insert_timing document_set_id=%s documents=%s "
+            "blocks=%s duration_ms=%.2f",
+            document_set_id,
+            len(document_rows),
+            len(element_rows),
+            bulk_insert_ms,
+        )
         timings["persistence_ms"] = (
             perf_counter() - persistence_started
         ) * 1000
 
         matching_started = perf_counter()
-        _create_exact_link_groups(session, document_set.id)
+        _create_exact_link_groups(session, document_set_id)
         session.commit()
         timings["matching_setup_ms"] = (
             perf_counter() - matching_started
@@ -733,7 +754,7 @@ async def create_document_set(
         raise
 
     timings["service_total_ms"] = (perf_counter() - started_at) * 1000
-    result = get_document_set_or_404(session, document_set.id)
+    result = get_document_set_or_404(session, document_set_id)
     result._docsync_creation_timings = timings
     logger.info(
         "docsync.create_set.timing %s",
@@ -764,9 +785,8 @@ async def add_documents_to_set(
 
     seen_names = {document.original_name.casefold() for document in document_set.documents}
     created_paths: list[Path] = []
-    prepared_records: list[
-        tuple[DocumentRecord, DocxDocument, list[DocumentElement]]
-    ] = []
+    prepared_records: list[tuple[dict, DocxDocument, list[dict]]] = []
+    created_at = datetime.now(timezone.utc)
 
     try:
         for upload in files:
@@ -792,39 +812,50 @@ async def add_documents_to_set(
             target.write_bytes(payload)
             created_paths.append(target)
 
-            record = DocumentRecord(
-                id=document_id,
-                document_set=document_set,
-                original_name=original_name,
-                stored_name=stored_name,
-                checksum_sha256=hashlib.sha256(payload).hexdigest(),
-            )
-            session.add(record)
+            record = {
+                "id": document_id,
+                "document_set_id": document_set_id,
+                "original_name": original_name,
+                "stored_name": stored_name,
+                "checksum_sha256": hashlib.sha256(payload).hexdigest(),
+                "created_at": created_at,
+            }
             elements = [
-                DocumentElement(
-                    id=new_id(),
-                    document=record,
-                    document_id=record.id,
-                    paragraph_index=paragraph_index,
-                    text=text,
-                    normalized_text=normalise_text(text),
-                    style_name=style_name,
-                )
+                {
+                    "id": new_id(),
+                    "document_id": document_id,
+                    "paragraph_index": paragraph_index,
+                    "text": text,
+                    "normalized_text": normalise_text(text),
+                    "style_name": style_name,
+                }
                 for paragraph_index, text, style_name in extracted
             ]
-            session.add_all(elements)
             prepared_records.append((record, parsed_document, elements))
 
-        session.flush()
-        from .editor_service import initialise_original_version
+        from .editor_service import prepare_original_version_rows
 
-        for record, parsed_document, elements in prepared_records:
-            initialise_original_version(
-                session,
-                record,
-                parsed_document=parsed_document,
-                elements=elements,
+        document_rows: list[dict] = []
+        element_rows: list[dict] = []
+        version_rows: list[dict] = []
+        head_rows: list[dict] = []
+        revision_rows: list[dict] = []
+        for record_row, parsed_document, current_element_rows in prepared_records:
+            version_row, head_row, current_revision_rows = prepare_original_version_rows(
+                record_row,
+                parsed_document,
+                current_element_rows,
             )
+            document_rows.append(record_row)
+            element_rows.extend(current_element_rows)
+            version_rows.append(version_row)
+            head_rows.append(head_row)
+            revision_rows.extend(current_revision_rows)
+        session.execute(insert(DocumentRecord.__table__), document_rows)
+        session.execute(insert(DocumentElement.__table__), element_rows)
+        session.execute(insert(DocumentVersion.__table__), version_rows)
+        session.execute(insert(DocumentHead.__table__), head_rows)
+        session.execute(insert(DocumentBlockRevision.__table__), revision_rows)
         _rebuild_exact_link_groups(session, document_set_id)
         session.commit()
         session.expire_all()
@@ -994,7 +1025,8 @@ def search_document_set(
             "truncated": False,
         }
 
-    rows = session.execute(
+    search_started = perf_counter()
+    base_statement = (
         select(DocumentBlockRevision, DocumentRecord)
         .join(
             DocumentHead,
@@ -1004,18 +1036,51 @@ def search_document_set(
             DocumentRecord,
             DocumentRecord.id == DocumentBlockRevision.document_id,
         )
-        .where(
-            DocumentRecord.document_set_id == document_set_id,
-            DocumentBlockRevision.normalized_text.contains(
-                normalised_query,
-                autoescape=True,
-            ),
-        )
+        .where(DocumentRecord.document_set_id == document_set_id)
         .order_by(
             func.lower(DocumentRecord.original_name),
             DocumentBlockRevision.ordinal,
         )
-    ).all()
+    )
+    search_engine = "substring_fallback"
+    rows = None
+    if len(normalised_query) >= 3 and session.bind is not None:
+        try:
+            fts_exists = bool(
+                session.scalar(
+                    text(
+                        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                        "AND name = 'document_block_fts'"
+                    )
+                )
+            ) if session.bind.dialect.name == "sqlite" else False
+            if fts_exists:
+                fts_query = f'"{normalised_query.replace(chr(34), chr(34) * 2)}"'
+                rows = session.execute(
+                    base_statement
+                    .join(
+                        DOCUMENT_BLOCK_FTS,
+                        DOCUMENT_BLOCK_FTS.c.revision_id
+                        == DocumentBlockRevision.id,
+                    )
+                    .where(DOCUMENT_BLOCK_FTS.c.normalized_text.match(fts_query))
+                ).all()
+                search_engine = "fts5_trigram"
+        except OperationalError:
+            logger.warning(
+                "docsync.search_fts_unavailable document_set_id=%s",
+                document_set_id,
+                exc_info=True,
+            )
+    if rows is None:
+        rows = session.execute(
+            base_statement.where(
+                DocumentBlockRevision.normalized_text.contains(
+                    normalised_query,
+                    autoescape=True,
+                )
+            )
+        ).all()
 
     all_results: list[dict] = []
     counts_by_document: dict[str, dict] = {}
@@ -1083,7 +1148,7 @@ def search_document_set(
 
     result_count = len(all_results)
     results = all_results if limit is None else all_results[:limit]
-    return {
+    payload = {
         "query": cleaned_query,
         "results": results,
         "result_count": result_count,
@@ -1092,6 +1157,16 @@ def search_document_set(
         "document_counts": list(counts_by_document.values()),
         "truncated": len(results) < result_count,
     }
+    logger.info(
+        "docsync.search_fts_timing document_set_id=%s engine=%s candidates=%s "
+        "results=%s duration_ms=%.2f",
+        document_set_id,
+        search_engine,
+        len(rows),
+        result_count,
+        (perf_counter() - search_started) * 1000,
+    )
+    return payload
 
 def _create_exact_link_groups(
     session: Session,
@@ -1100,8 +1175,50 @@ def _create_exact_link_groups(
 ) -> None:
     if match_hashes is not None and not match_hashes:
         return
-    statement = (
-        select(DocumentBlockRevision, DocumentElement)
+    started_at = perf_counter()
+    candidate_statement = (
+        select(DocumentBlockRevision.exact_match_hash)
+        .join(
+            DocumentHead,
+            DocumentHead.current_version_id == DocumentBlockRevision.version_id,
+        )
+        .join(
+            DocumentRecord,
+            DocumentRecord.id == DocumentBlockRevision.document_id,
+        )
+        .where(
+            DocumentRecord.document_set_id == document_set_id,
+            DocumentBlockRevision.shared_state == "shared",
+            DocumentBlockRevision.supported.is_(True),
+            DocumentBlockRevision.exact_match_hash.is_not(None),
+            DocumentBlockRevision.normalized_text != "",
+        )
+        .group_by(DocumentBlockRevision.exact_match_hash)
+        .having(func.count(func.distinct(DocumentBlockRevision.document_id)) >= 2)
+    )
+    if match_hashes is not None:
+        candidate_statement = candidate_statement.where(
+            DocumentBlockRevision.exact_match_hash.in_(match_hashes)
+        )
+    candidate_hashes = set(session.scalars(candidate_statement))
+    if not candidate_hashes:
+        logger.info(
+            "docsync.exact_match_sql_timing document_set_id=%s candidates=0 "
+            "members=0 duration_ms=%.2f",
+            document_set_id,
+            (perf_counter() - started_at) * 1000,
+        )
+        return
+
+    # SQLite first eliminates hashes that cannot span documents. Python only
+    # assembles the small set of actual group/member insert mappings.
+    member_rows = session.execute(
+        select(
+            DocumentBlockRevision.exact_match_hash,
+            DocumentBlockRevision.normalized_text,
+            DocumentBlockRevision.text,
+            DocumentBlockRevision.element_id,
+        )
         .join(
             DocumentHead,
             DocumentHead.current_version_id == DocumentBlockRevision.version_id,
@@ -1118,49 +1235,51 @@ def _create_exact_link_groups(
             DocumentRecord.document_set_id == document_set_id,
             DocumentBlockRevision.shared_state == "shared",
             DocumentBlockRevision.supported.is_(True),
+            DocumentBlockRevision.exact_match_hash.in_(candidate_hashes),
         )
+        .order_by(
+            DocumentBlockRevision.exact_match_hash,
+            func.lower(DocumentRecord.original_name),
+            DocumentBlockRevision.ordinal,
+            DocumentBlockRevision.element_id,
+        )
+    ).all()
+
+    groups_by_hash: dict[str, str] = {}
+    group_rows: list[dict] = []
+    link_member_rows: list[dict] = []
+    for match_hash, normalized_text, text, element_id in member_rows:
+        group_id = groups_by_hash.get(match_hash)
+        if group_id is None:
+            group_id = new_id()
+            groups_by_hash[match_hash] = group_id
+            group_rows.append(
+                {
+                    "id": group_id,
+                    "document_set_id": document_set_id,
+                    "representative_text": text,
+                    "normalized_text": normalized_text,
+                    "match_type": "exact",
+                }
+            )
+        link_member_rows.append(
+            {
+                "id": new_id(),
+                "link_group_id": group_id,
+                "element_id": element_id,
+            }
+        )
+
+    session.execute(insert(LinkGroup.__table__), group_rows)
+    session.execute(insert(LinkMember.__table__), link_member_rows)
+    logger.info(
+        "docsync.exact_match_sql_timing document_set_id=%s candidates=%s "
+        "members=%s duration_ms=%.2f",
+        document_set_id,
+        len(group_rows),
+        len(link_member_rows),
+        (perf_counter() - started_at) * 1000,
     )
-    if match_hashes is not None:
-        statement = statement.where(
-            DocumentBlockRevision.exact_match_hash.in_(match_hashes)
-        )
-    current_blocks = session.execute(statement).all()
-
-    by_hash: dict[str, list[DocumentElement]] = defaultdict(list)
-    normalized_by_hash: dict[str, str] = {}
-    for revision, element in current_blocks:
-        normalized_text = revision.normalized_text or normalise_text(revision.text)
-        element.normalized_text = normalized_text
-        if not normalized_text:
-            continue
-        # The revision hash includes both normalized text and the block type
-        # derived from the actual DOCX structure. DocumentElement.style_name
-        # alone cannot distinguish a custom-styled paragraph from one carrying
-        # Word numbering metadata.
-        by_hash[revision.exact_match_hash].append(element)
-        normalized_by_hash[revision.exact_match_hash] = normalized_text
-
-    records: list[object] = []
-    for match_hash, matches in by_hash.items():
-        distinct_documents = {match.document_id for match in matches}
-        if len(distinct_documents) < 2:
-            continue
-
-        group = LinkGroup(
-            id=new_id(),
-            document_set_id=document_set_id,
-            representative_text=matches[0].text,
-            normalized_text=normalized_by_hash[match_hash],
-            match_type="exact",
-        )
-        records.append(group)
-        records.extend(
-            LinkMember(id=new_id(), link_group=group, element=element)
-            for element in matches
-        )
-
-    if records:
-        session.add_all(records)
 
 
 def _rebuild_exact_link_groups(session: Session, document_set_id: str) -> None:
@@ -1538,6 +1657,11 @@ def render_document_with_word(
 
     cache_id = version.id if version is not None else document.id
     output_path = rendered_pdf_path(document, cache_id)
+    observed_pdf_identity = (
+        (output_path.stat().st_size, output_path.stat().st_mtime_ns)
+        if output_path.exists()
+        else None
+    )
     force_render = False
     if version is not None and output_path.exists() and output_path.stat().st_size > 0:
         from .preview_cache_service import cached_word_preview
@@ -1551,55 +1675,61 @@ def render_document_with_word(
     conversion_started = perf_counter()
     rendered_now = False
     if force_render or not output_path.exists() or output_path.stat().st_size == 0:
-        powershell = shutil.which("powershell.exe") or shutil.which("powershell")
-        render_script = settings.render_script
-        if powershell is None or not render_script.exists():
-            raise HTTPException(
-                status_code=503,
-                detail="Microsoft Word rendering is unavailable on this server.",
-            )
-
         output_path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path = output_path.with_name(f"{cache_id}-{new_id()}.tmp.pdf")
         try:
+            from .word_render_service import (
+                WordRenderFailed,
+                WordWorkerTimedOut,
+                WordWorkerUnavailable,
+                render_docx_with_word_worker,
+            )
+
             with WORD_RENDER_LOCK:
-                if (
-                    not force_render
-                    and output_path.exists()
-                    and output_path.stat().st_size > 0
-                ):
-                    temporary_path.unlink(missing_ok=True)
-                else:
-                    result = subprocess.run(
-                        [
-                            powershell,
-                            "-NoProfile",
-                            "-NonInteractive",
-                            "-ExecutionPolicy",
-                            "Bypass",
-                            "-File",
-                            str(render_script),
-                            "-SourcePath",
-                            str(source_path),
-                            "-OutputPath",
-                            str(temporary_path),
-                        ],
-                        capture_output=True,
-                        text=True,
-                        timeout=120,
-                        check=False,
-                    )
-                    if result.returncode != 0 or not temporary_path.exists():
+                current_pdf_identity = (
+                    (output_path.stat().st_size, output_path.stat().st_mtime_ns)
+                    if output_path.exists()
+                    else None
+                )
+                current_pdf_ready = bool(
+                    current_pdf_identity is not None
+                    and current_pdf_identity[0] > 0
+                )
+                another_request_rendered = bool(
+                    current_pdf_ready
+                    and current_pdf_identity != observed_pdf_identity
+                )
+                if not force_render and current_pdf_ready:
+                    another_request_rendered = True
+                if not another_request_rendered:
+                    try:
+                        render_docx_with_word_worker(source_path, temporary_path)
+                    except WordWorkerUnavailable as exc:
+                        raise HTTPException(
+                            status_code=503,
+                            detail="Microsoft Word rendering is unavailable on this server.",
+                        ) from exc
+                    except WordWorkerTimedOut as exc:
+                        raise HTTPException(
+                            status_code=504,
+                            detail="Microsoft Word took too long to render this document.",
+                        ) from exc
+                    except WordRenderFailed as exc:
                         raise HTTPException(
                             status_code=422,
                             detail=(
                                 "Microsoft Word could not render this document. Close any Word "
                                 "dialogues and confirm the file opens normally in Word."
                             ),
+                        ) from exc
+                    if not temporary_path.exists() or temporary_path.stat().st_size == 0:
+                        raise HTTPException(
+                            status_code=422,
+                            detail="Microsoft Word did not create a complete PDF preview.",
                         )
                     temporary_path.replace(output_path)
                     rendered_now = True
-        except subprocess.TimeoutExpired as exc:
+        except TimeoutError as exc:
             raise HTTPException(
                 status_code=504,
                 detail="Microsoft Word took too long to render this document.",

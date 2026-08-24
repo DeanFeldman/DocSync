@@ -553,6 +553,74 @@ def test_exact_text_does_not_link_incompatible_element_types(tmp_path: Path) -> 
             group["representative_text"] != shared for group in uploaded.json()["link_groups"]
         )
 
+
+def test_duplicate_text_in_only_one_document_does_not_create_exact_group(
+    tmp_path: Path,
+) -> None:
+    duplicate = "Repeated only in the first document"
+    app = load_test_app(tmp_path)
+    with TestClient(app) as client:
+        uploaded = client.post(
+            "/api/document-sets",
+            data={"name": "Single-document duplicates"},
+            files=[
+                (
+                    "files",
+                    (
+                        "Repeated.docx",
+                        io.BytesIO(make_search_docx("Repeated", [duplicate, duplicate])),
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    ),
+                ),
+                (
+                    "files",
+                    (
+                        "Different.docx",
+                        io.BytesIO(make_search_docx("Different", ["Unrelated wording"])),
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    ),
+                ),
+            ],
+        )
+        assert uploaded.status_code == 201, uploaded.text
+        assert all(
+            group["representative_text"] != duplicate
+            for group in uploaded.json()["link_groups"]
+        )
+
+
+def test_bulk_workspace_failure_rolls_back_rows_and_files(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    app = load_test_app(tmp_path)
+    document_service = importlib.import_module("app.document_service")
+
+    def fail_matching(*_args, **_kwargs):
+        raise RuntimeError("forced post-insert failure")
+
+    monkeypatch.setattr(document_service, "_create_exact_link_groups", fail_matching)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        uploaded = client.post(
+            "/api/document-sets",
+            data={"name": "Rollback bulk import"},
+            files=[
+                (
+                    "files",
+                    (
+                        name,
+                        io.BytesIO(make_search_docx(name, ["Shared"])),
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    ),
+                )
+                for name in ("One.docx", "Two.docx")
+            ],
+        )
+        assert uploaded.status_code == 500
+        assert client.get("/api/document-sets").json() == {"document_sets": []}
+    originals = tmp_path / "data" / "originals"
+    assert list(originals.iterdir()) == []
+
 def test_set_management_and_global_search(tmp_path: Path) -> None:
     shared = "The manager must submit a monthly compliance report."
     app = load_test_app(tmp_path)
@@ -748,6 +816,22 @@ def test_global_search_returns_every_occurrence_across_all_current_documents(
         assert literal.status_code == 200, literal.text
         assert literal.json()["result_count"] == 1
         assert literal.json()["results"][0]["matched_text"] == "%_"
+
+        database = importlib.import_module("app.database")
+        with database.engine.begin() as connection:
+            for trigger in (
+                "document_block_fts_insert",
+                "document_block_fts_update",
+                "document_block_fts_delete",
+            ):
+                connection.exec_driver_sql(f"DROP TRIGGER IF EXISTS {trigger}")
+            connection.exec_driver_sql("DROP TABLE document_block_fts")
+        fallback = client.get(
+            f"/api/document-sets/{workspace['id']}/search",
+            params={"q": "IRREGULAR spacing"},
+        )
+        assert fallback.status_code == 200, fallback.text
+        assert fallback.json()["result_count"] == 1
 
 
 def test_table_paragraphs_are_extracted_matched_and_edited(tmp_path: Path) -> None:

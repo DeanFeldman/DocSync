@@ -28,9 +28,6 @@ PREVIEW_JOB_QUEUE: Queue[str] = Queue()
 PREVIEW_WORKER: threading.Thread | None = None
 PREVIEW_RENDER_LOCK = threading.RLock()
 ACTIVE_PREVIEW_JOBS: set[str] = set()
-TERMINAL_MAP_STATUSES = {"completed", "partial", "failed"}
-
-
 def _now() -> datetime:
     return datetime.now(UTC)
 
@@ -63,6 +60,9 @@ def _set_stage(
     *,
     status: str | None = None,
 ) -> None:
+    changed = job.stage != stage or (status is not None and job.status != status)
+    if not changed:
+        return
     job.stage = stage
     if status is not None:
         job.status = status
@@ -213,7 +213,7 @@ def _process_preview_job(job_id: str) -> None:
         rendered_pdf_path,
         serialize_cached_word_preview,
     )
-    from .render_map_service import request_render_map
+    from .render_map_service import wait_for_render_map
 
     with SessionLocal() as session:
         job = session.get(PreviewRenderJob, job_id)
@@ -258,8 +258,6 @@ def _process_preview_job(job_id: str) -> None:
                     "updating_preview" if cached_preview else "starting_microsoft_word",
                     status="processing",
                 )
-                _set_stage(session, job, "opening_document")
-                _set_stage(session, job, "rendering_pdf")
                 conversion_started = time.perf_counter()
                 render_document_with_word(session, document, version)
                 logger.info(
@@ -276,17 +274,8 @@ def _process_preview_job(job_id: str) -> None:
                 _set_stage(session, job, "displaying_document")
 
             _set_stage(session, job, "preparing_selectable_text")
-            deadline = time.monotonic() + 180
-            render_map: dict = {"status": "processing"}
-            while time.monotonic() < deadline:
-                render_map = request_render_map(session, version.id)
-                map_status = str(render_map.get("status", "processing"))
-                job.render_map_status = map_status
-                job.updated_at = _now()
-                session.commit()
-                if map_status in TERMINAL_MAP_STATUSES:
-                    break
-                time.sleep(0.08)
+            render_map = wait_for_render_map(session, version.id, timeout=180)
+            job.render_map_status = str(render_map.get("status", "processing"))
 
             job.status = "completed"
             job.stage = "ready_to_edit"

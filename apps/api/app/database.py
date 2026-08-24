@@ -10,6 +10,7 @@ from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
 from sqlalchemy import create_engine, delete, select, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from .config import settings
@@ -88,6 +89,11 @@ def init_db() -> None:
                 version=6,
                 name="durable_document_preview_cache",
                 apply=_migrate_document_preview_cache,
+            ),
+            WorkspaceMigration(
+                version=7,
+                name="current_block_fts5",
+                apply=_migrate_current_block_fts,
             ),
         ),
         report_stage=report_stage,
@@ -880,6 +886,52 @@ def _migrate_document_preview_cache(session: Session) -> None:
             "ALTER TABLE preview_render_jobs ADD COLUMN "
             "stale_preview_available BOOLEAN NOT NULL DEFAULT 0"
         )
+
+
+def _migrate_current_block_fts(session: Session) -> None:
+    """Create a trigger-maintained trigram FTS5 index for immutable block text."""
+
+    connection = session.connection()
+    if connection.dialect.name != "sqlite":
+        return
+    try:
+        connection.exec_driver_sql(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS document_block_fts "
+            "USING fts5(revision_id UNINDEXED, normalized_text, "
+            "tokenize='trigram case_sensitive 0')"
+        )
+    except OperationalError as exc:
+        # Some embedded SQLite builds omit FTS5 or the trigram tokenizer. The
+        # application keeps its semantically equivalent LIKE fallback.
+        detail = str(exc).casefold()
+        if "no such module: fts5" in detail or "no such tokenizer: trigram" in detail:
+            logger.warning("docsync.search_fts_unavailable detail=%s", exc)
+            return
+        raise
+
+    connection.exec_driver_sql(
+        "CREATE TRIGGER IF NOT EXISTS document_block_fts_insert "
+        "AFTER INSERT ON document_block_revisions BEGIN "
+        "INSERT INTO document_block_fts(revision_id, normalized_text) "
+        "VALUES (new.id, new.normalized_text); END"
+    )
+    connection.exec_driver_sql(
+        "CREATE TRIGGER IF NOT EXISTS document_block_fts_update "
+        "AFTER UPDATE OF normalized_text ON document_block_revisions BEGIN "
+        "DELETE FROM document_block_fts WHERE revision_id = old.id; "
+        "INSERT INTO document_block_fts(revision_id, normalized_text) "
+        "VALUES (new.id, new.normalized_text); END"
+    )
+    connection.exec_driver_sql(
+        "CREATE TRIGGER IF NOT EXISTS document_block_fts_delete "
+        "AFTER DELETE ON document_block_revisions BEGIN "
+        "DELETE FROM document_block_fts WHERE revision_id = old.id; END"
+    )
+    connection.exec_driver_sql("DELETE FROM document_block_fts")
+    connection.exec_driver_sql(
+        "INSERT INTO document_block_fts(revision_id, normalized_text) "
+        "SELECT id, normalized_text FROM document_block_revisions"
+    )
 
 
 def get_session() -> Generator[Session, None, None]:

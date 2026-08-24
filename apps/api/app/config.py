@@ -54,6 +54,10 @@ class Settings:
     max_files_per_set: int
     web_dist_dir: Path
     render_script: Path
+    word_worker_script: Path
+    word_worker_max_renders: int
+    word_worker_timeout_seconds: int
+    word_worker_autostart: bool
     session_token: str
     near_match_threshold: float
     near_match_candidate_limit: int
@@ -78,6 +82,11 @@ def _build_settings() -> Settings:
         str(api_dir / "scripts" / "render_docx_to_pdf.ps1"),
     )
     render_script = Path(raw_render_script).resolve()
+    raw_word_worker_script = os.getenv(
+        "DOCUMENTSYNC_WORD_WORKER_SCRIPT",
+        str(api_dir / "scripts" / "render_docx_worker.ps1"),
+    )
+    word_worker_script = Path(raw_word_worker_script).resolve()
     cors_origins = tuple(
         origin.strip()
         for origin in os.getenv(
@@ -104,6 +113,23 @@ def _build_settings() -> Settings:
         max_files_per_set=int(os.getenv("DOCUMENTSYNC_MAX_FILES_PER_SET", "20")),
         web_dist_dir=web_dist_dir,
         render_script=render_script,
+        word_worker_script=word_worker_script,
+        word_worker_max_renders=_bounded_int_env(
+            "DOCUMENTSYNC_WORD_WORKER_MAX_RENDERS",
+            25,
+            minimum=1,
+            maximum=500,
+        ),
+        word_worker_timeout_seconds=_bounded_int_env(
+            "DOCUMENTSYNC_WORD_WORKER_TIMEOUT_SECONDS",
+            120,
+            minimum=10,
+            maximum=600,
+        ),
+        word_worker_autostart=os.getenv(
+            "DOCUMENTSYNC_WORD_WORKER_AUTOSTART",
+            "1",
+        ).strip().casefold() not in {"0", "false", "no", "off"},
         session_token=os.getenv("DOCUMENTSYNC_SESSION_TOKEN", ""),
         near_match_threshold=_bounded_float_env(
             "DOCUMENTSYNC_NEAR_MATCH_THRESHOLD",

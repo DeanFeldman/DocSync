@@ -10,8 +10,10 @@
     "apps/web"
   ],
   "scripts": {
-    "prestart": "npm run build:web",
-    "start": "electron .",
+    "start": "node scripts/start-desktop.cjs",
+    "dev": "node scripts/dev-desktop.cjs",
+    "dev:web": "npm run dev --workspace documentsync-web -- --host 127.0.0.1",
+    "dev:api": "python apps/api/desktop_backend.py",
     "start:api": "python apps/api/desktop_backend.py",
     "build:web": "npm run build --workspace documentsync-web",
     "build:api:win": "python -m PyInstaller --noconfirm --clean --distpath apps/api/dist --workpath apps/api/build apps/api/docsync-api.spec",
@@ -52,6 +54,10 @@
       {
         "from": "apps/api/scripts/render_docx_to_pdf.ps1",
         "to": "phase2-api/scripts/render_docx_to_pdf.ps1"
+      },
+      {
+        "from": "apps/api/scripts/render_docx_worker.ps1",
+        "to": "phase2-api/scripts/render_docx_worker.ps1"
       },
       {
         "from": "apps/web/dist",

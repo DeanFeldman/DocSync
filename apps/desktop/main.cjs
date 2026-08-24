@@ -32,6 +32,8 @@ let backendExitDetails = { exitCode: null, signal: null };
 let backendSessionToken = "";
 let backendWorkspacePath = "";
 let mainWindow = null;
+const developmentWebUrl = process.env.DOCUMENTSYNC_WEB_DEV_URL || "";
+const externalBackendOrigin = process.env.DOCUMENTSYNC_BACKEND_ORIGIN || "";
 
 function applicationPaths() {
   if (app.isPackaged) {
@@ -41,6 +43,7 @@ function applicationPaths() {
       workingDirectory: path.join(process.resourcesPath, "phase2-api"),
       webDist: path.join(process.resourcesPath, "web"),
       renderScript: path.join(process.resourcesPath, "phase2-api", "scripts", "render_docx_to_pdf.ps1"),
+      wordWorkerScript: path.join(process.resourcesPath, "phase2-api", "scripts", "render_docx_worker.ps1"),
     };
   }
 
@@ -52,6 +55,7 @@ function applicationPaths() {
     workingDirectory: apiDirectory,
     webDist: path.join(repositoryRoot, "apps", "web", "dist"),
     renderScript: path.join(apiDirectory, "scripts", "render_docx_to_pdf.ps1"),
+    wordWorkerScript: path.join(apiDirectory, "scripts", "render_docx_worker.ps1"),
   };
 }
 
@@ -115,6 +119,18 @@ function healthRequest() {
 }
 
 async function startBackend() {
+  if (externalBackendOrigin) {
+    backendOrigin = new URL(externalBackendOrigin).origin;
+    backendPort = Number(new URL(backendOrigin).port);
+    backendWorkspacePath = process.env.DOCUMENTSYNC_DATA_DIR || "development workspace";
+    await waitForHealthy({
+      requestHealth: healthRequest,
+      isRunning: () => true,
+      getExitDetails: () => ({ exitCode: null, signal: null }),
+      timeoutMs: startupTimeoutMs(false),
+    });
+    return;
+  }
   const paths = applicationPaths();
   backendPort = await findAvailablePort();
   backendOrigin = `http://127.0.0.1:${backendPort}`;
@@ -131,6 +147,7 @@ async function startBackend() {
       DOCUMENTSYNC_DATA_DIR: backendWorkspacePath,
       DOCUMENTSYNC_WEB_DIST: paths.webDist,
       DOCUMENTSYNC_RENDER_SCRIPT: paths.renderScript,
+      DOCUMENTSYNC_WORD_WORKER_SCRIPT: paths.wordWorkerScript,
       DOCUMENTSYNC_SESSION_TOKEN: backendSessionToken,
       DOCUMENTSYNC_CORS_ORIGINS: backendOrigin,
       DOCUMENTSYNC_PORT: String(backendPort),
@@ -183,7 +200,8 @@ async function startBackend() {
 function isTrustedUrl(targetUrl) {
   if (!backendOrigin) return false;
   try {
-    return new URL(targetUrl).origin === backendOrigin;
+    const origin = new URL(targetUrl).origin;
+    return origin === backendOrigin || Boolean(developmentWebUrl && origin === new URL(developmentWebUrl).origin);
   } catch {
     return false;
   }
@@ -238,7 +256,7 @@ function createWindow() {
   });
   mainWindow.once("ready-to-show", () => mainWindow.show());
   mainWindow.on("closed", () => { mainWindow = null; });
-  mainWindow.loadURL(backendOrigin).catch((error) => {
+  mainWindow.loadURL(developmentWebUrl || backendOrigin).catch((error) => {
     dialog.showErrorBox("DocSync could not open", error.message);
   });
 }

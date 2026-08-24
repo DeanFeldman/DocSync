@@ -126,3 +126,38 @@ test("generation is accepted immediately and reconciled by the application shell
   assert.match(experience, /Update accepted/);
   assert.match(experience, /creating and validating the Word versions in the background/);
 });
+
+test("Word rendering reuses one serial worker and packaged assets include its script", () => {
+  const worker = read("apps/api/app/word_render_service.py");
+  const powershell = read("apps/api/scripts/render_docx_worker.ps1");
+  const packageJson = JSON.parse(read("package.json"));
+
+  assert.match(worker, /class PersistentWordRenderWorker/);
+  assert.match(worker, /self\._lock = threading\.Lock/);
+  assert.match(worker, /docsync\.word_worker_startup_timing/);
+  assert.match(worker, /reason="render_failure"/);
+  assert.match(powershell, /New-Object -ComObject Word\.Application/);
+  assert.match(powershell, /while \(\$null -ne \(\$line = \[Console\]::In\.ReadLine\(\)\)\)/);
+  assert.match(powershell, /\$document\.Close\(0\)/);
+  assert.match(powershell, /\$script:word\.Quit\(\)/);
+  assert.ok(
+    packageJson.build.extraResources.some(
+      (resource) => resource.from === "apps/api/scripts/render_docx_worker.ps1",
+    ),
+  );
+});
+
+test("development startup skips production builds and launches the live stack", () => {
+  const packageJson = JSON.parse(read("package.json"));
+  const development = read("scripts/dev-desktop.cjs");
+  const desktop = read("apps/desktop/main.cjs");
+
+  assert.equal(packageJson.scripts.prestart, undefined);
+  assert.equal(packageJson.scripts.start, "node scripts/start-desktop.cjs");
+  assert.match(read("scripts/start-desktop.cjs"), /delete electronEnvironment\.ELECTRON_RUN_AS_NODE/);
+  assert.equal(packageJson.scripts.dev, "node scripts/dev-desktop.cjs");
+  assert.match(development, /desktop_backend\.py/);
+  assert.match(development, /node_modules", "vite", "bin", "vite\.js/);
+  assert.match(development, /DOCUMENTSYNC_WEB_DEV_URL/);
+  assert.match(desktop, /developmentWebUrl \|\| backendOrigin/);
+});

@@ -81,6 +81,16 @@ def write_pdf(path: Path, lines: list[tuple[float, float, str, float | None]]) -
     pdf.close()
 
 
+def write_multipage_pdf(path: Path, page_texts: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pdf = pymupdf.open()
+    for text in page_texts:
+        page = pdf.new_page(width=612, height=792)
+        page.insert_text((72, 100), text, fontsize=11)
+    pdf.save(path)
+    pdf.close()
+
+
 def poll_job(client: TestClient, job_id: str, timeout: float = 8) -> dict:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -306,6 +316,46 @@ def test_controlled_pages_are_published_before_coordinate_matching(
         ]
         assert len(wrapped_regions) >= 2
         assert all(0 <= region[axis] <= 1 for region in mapped["regions"] for axis in ("x", "y", "width", "height"))
+
+
+def test_later_pdf_pages_render_only_on_demand_and_reuse_cache(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    page_texts = [f"Unique selectable content for page {page}" for page in range(1, 7)]
+    app = load_test_app(tmp_path, monkeypatch)
+
+    with TestClient(app) as client:
+        workspace, primary = upload(client, docx_bytes(*page_texts))
+        version_id = primary["version_id"]
+        pdf_path = (
+            tmp_path / "data" / "renders" / workspace["id"] / f"{version_id}.pdf"
+        )
+        write_multipage_pdf(pdf_path, page_texts)
+
+        mapped = poll_map(client, version_id)
+        assert mapped["page_count"] == 6
+        render_id = mapped["render_id"]
+        page_directory = pdf_path.parent / f"{version_id}.pages" / render_id
+        assert not (page_directory / "page-5.png").exists()
+        assert not (page_directory / "page-6.png").exists()
+
+        page_url = mapped["pages"][4]["image_url"]
+        first = client.get(page_url)
+        assert first.status_code == 200
+        assert first.content.startswith(b"\x89PNG")
+        page_five = page_directory / "page-5.png"
+        first_mtime = page_five.stat().st_mtime_ns
+
+        second = client.get(page_url)
+        assert second.status_code == 200
+        assert page_five.stat().st_mtime_ns == first_mtime
+        assert client.get(
+            f"/api/document-versions/{version_id}/render-pages/{'0' * 24}/5.png"
+        ).status_code == 404
+        assert client.get(
+            f"/api/document-versions/{version_id}/render-pages/{render_id}/7.png"
+        ).status_code == 404
 
 
 def test_failed_preview_can_be_retried_without_blocking_the_workspace(

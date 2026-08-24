@@ -229,3 +229,181 @@ Word's own work. The 2.1 MB logo is still the largest initial asset, and Quill's
 chunk is sizeable when editing begins. PDF page generation and coordinate matching can
 still take time on image-heavy documents, though neither blocks first text and both are
 timed for further tuning.
+
+---
+
+# Deep performance follow-up — 24 August 2026
+
+## Scope and baseline method
+
+This follow-up targeted the remaining measured bottlenecks rather than changing
+DOCX parsing or the already-fast cached structured response. The required tests,
+web build, and three existing benchmarks were run before implementation on the
+same Windows/Python installation used for the post-change measurements.
+
+The pre-change measurements in this worktree were:
+
+| Benchmark | Pre-change result |
+| --- | ---: |
+| 10 documents × 500 blocks workspace median | 5,777.51 ms |
+| Workspace p95 | 6,021.07 ms |
+| Workspace persistence median | 3,316.86 ms |
+| Workspace exact-match median | 1,547.49 ms |
+| 3 documents × 300 blocks generation median | 1,111.95 ms |
+| 1,000-block cached structured opening median | 36.50 ms |
+| Production logo asset | 2,107.10 kB |
+
+The older v1.4.1 report remains historical evidence; its 3.19 second workspace
+median was produced on a different run state and is not substituted for this
+turn's before/after comparison.
+
+## Persistent Microsoft Word worker
+
+The old renderer launched `powershell.exe`, created `Word.Application`, rendered
+one document, called `Quit`, and exited for every cache miss. The new
+`word_render_service.py` owns one long-lived PowerShell JSON-lines worker. The
+worker creates one invisible Word COM application, disables alerts, macros, and
+link updates, opens each DOCX read-only, exports one temporary PDF, closes the
+document, and keeps Word available for the next serial request.
+
+The worker recycles Word after `DOCUMENTSYNC_WORD_WORKER_MAX_RENDERS` (25 by
+default), restarts the complete worker once after COM/process failure, detects an
+unexpected child exit immediately, and shuts down through the FastAPI lifespan.
+The PowerShell worker records its owned WINWORD process and force-stops only that
+PID if `Word.Quit()` does not complete, including when the backend disappears and
+stdin closes. A forced-backend-stop verification confirmed the owned Word PID was
+removed. The final PDF is still published only by temporary-file atomic replace;
+a failed refresh cannot overwrite the previous valid PDF.
+
+Final local sequential-render measurement:
+
+| Measurement | Result |
+| --- | ---: |
+| Worker/Word startup | 1,808.87 ms |
+| First uncached render | 49,808.44 ms |
+| Cold first render including startup | 51,617.31 ms |
+| Second uncached render | 251.19 ms |
+| Third uncached render | 236.89 ms |
+| Warm worker median | 244.04 ms |
+
+There was no equivalent pre-change sequential-worker benchmark, so no percentage
+claim is made. The unusually high first export is specific to this Microsoft Word
+installation; the meaningful observation is that the same PowerShell/Word worker
+PID served all three renders and the warm jobs did not repeat that startup/export
+penalty.
+
+## Lazy PDF page rendering and preview state
+
+Render-map schema 2 separates `_extract_pdf_structure` from `_render_pdf_page`.
+The initial worker validates the immutable PDF, extracts page dimensions and word
+coordinates, performs the unchanged contextual matching, and publishes page URLs
+without rasterising the full PDF. The first two pages are queued for background
+prefetch. Any page endpoint request checks the immutable render ID, page bounds,
+PDF size/mtime, source checksum, engine, PyMuPDF version, and DPI, then renders
+only the missing page under a striped per-page lock and atomically caches it.
+
+The preview job now waits on the render-map worker's completion event. It no
+longer polls every 80 ms or commits an unchanged map status repeatedly. The map
+remains file-backed and a restarted application can resubmit any nonterminal map,
+so durable recovery semantics are unchanged.
+
+The new 40-page synthetic benchmark measured:
+
+| Stage | Result |
+| --- | ---: |
+| Text/coordinate extraction | 31.94 ms |
+| Block matching | 1.16 ms |
+| First-page rasterisation | 24.05 ms |
+| Explicit full-document rasterisation | 984.28 ms |
+| Initial PNG count before a page request | 0 |
+
+The pre-change pipeline did not have a stage-separated benchmark. The architectural
+result is directly verified: the initial text/map path produced zero PNGs, while
+all 40 appeared only when the benchmark explicitly requested full rasterisation.
+
+## Bulk persistence and SQL exact matching
+
+Initial workspace creation now prepares immutable element/version/head/revision
+mappings and executes batched SQLAlchemy Core inserts. It avoids tracking thousands
+of equivalent `DocumentElement` and `DocumentBlockRevision` ORM instances while
+preserving preassigned UUIDs, JSON formatting/Delta/location metadata, lineage,
+hashes, order, transaction rollback, and file cleanup. The optimisation is isolated
+to initial import and add-document creation; editing/generation retains its ORM and
+versioning behaviour.
+
+Exact matching now asks SQLite to group current, shared, supported revisions by
+their indexed exact hash and retain only hashes with at least two distinct document
+IDs. Only those candidate members are returned to Python, and link groups/members
+are inserted in batches. Incremental hash rebuilds remain in place.
+
+| Workspace measurement | Before | After | Absolute change | Change |
+| --- | ---: | ---: | ---: | ---: |
+| HTTP median | 5,777.51 ms | 1,360.00 ms | −4,417.51 ms | 76.46% lower |
+| p95 | 6,021.07 ms | 1,530.22 ms | −4,490.85 ms | 74.58% lower |
+| Persistence median | 3,316.86 ms | 1,015.22 ms | −2,301.64 ms | 69.39% lower |
+| Exact-match median | 1,547.49 ms | 121.46 ms | −1,426.03 ms | 92.15% lower |
+
+The 1.36 second median meets the 2.0 second target and 1.5 second stretch goal on
+this machine. A forced post-insert failure test verifies that both database rows
+and newly written workspace files roll back.
+
+## SQLite FTS5
+
+Schema migration 7 creates `document_block_fts` with the SQLite FTS5 trigram
+tokenizer. Insert/update/delete triggers transactionally index every immutable
+block revision; the existing `document_heads` join selects only current versions,
+so generation and restore need no separate manual refresh path. Document removal
+cannot return stale hits because candidates still join live revisions/documents.
+
+FTS identifies candidate revisions; the existing Unicode-normalised occurrence
+scanner still calculates exact source offsets, context, matched text, result counts,
+and document counts. Queries shorter than three characters, non-SQLite databases,
+and SQLite builds without FTS5/trigram safely use the prior escaped substring path.
+
+For 50 documents × 1,000 blocks (50,000 revisions, five runs):
+
+| Candidate retrieval | Median |
+| --- | ---: |
+| Previous substring scan | 20.93 ms |
+| FTS5 trigram | 7.46 ms |
+| Absolute change | −13.47 ms |
+| Change | 64.36% lower |
+
+End-to-end FTS search, including exact occurrences and response construction for
+500 results, was 23.78 ms median.
+
+## Frontend asset and startup
+
+The logo was resized from 1,536 × 1,024 to 384 × 256 using high-quality Lanczos
+resampling and lossless PNG optimisation. Its source/bundle size fell from
+2,107.10 kB to 21.42 kB (2,085.68 kB and 98.98% lower) without changing the
+design or file format. The production application and lazy Quill JavaScript chunks
+remain 293.21 kB and 200.03 kB respectively.
+
+The root `prestart` production build was removed. `npm start` now launches the
+already-built application; production assets are built explicitly through
+`build:web`/`build:desktop`. `npm run dev` starts FastAPI on port 8001, Vite with
+hot reload on port 5173, and an Electron shell pointed at the live frontend. Its
+default data directory is isolated under ignored `.artifacts/dev-workspace`; an
+explicit `DOCUMENTSYNC_DATA_DIR` still wins.
+
+## Regression measurements and limitations
+
+The post-change generation median was 578.29 ms (baseline 1,111.95 ms), and the
+cached structured-opening median was 26.50 ms (baseline 36.50 ms). These were
+regression guards, not targeted optimisations, so the lower values may include
+filesystem/OS cache variance and are not attributed to a particular code change.
+
+Microsoft Word remains serial by design and its first export can still dominate an
+uncached preview. Page rasterisation remains proportional to requested pages and
+image/DPI complexity. Initial import still spends about one second preparing rich
+revision metadata and writing the FTS-triggered rows. Search response construction
+still scales with the number of exact occurrences returned even though candidate
+retrieval is indexed.
+
+The live development frontend, direct API, Vite-proxied API, Electron processes,
+and served 21,429-byte logo were verified. Full click-through of the 20-item manual
+UI checklist was not automated in this environment because the in-app browser
+automation surface was unavailable; API/workflow tests cover upload, search,
+editing, generation, restore, preview retry, stale cache, headers/footers, tables,
+formatting, and rollback.

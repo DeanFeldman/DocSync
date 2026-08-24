@@ -103,8 +103,18 @@ async def lifespan(_: FastAPI):
     DocumentStorageService.init_storage()
     logger.warning("docsync.startup.stage=temporary_file_cleanup")
     DocumentStorageService.cleanup_stale_temp_files()
+    from .word_render_service import (
+        shutdown_word_render_worker,
+        start_word_render_worker,
+    )
+
+    if settings.word_worker_autostart:
+        start_word_render_worker()
     logger.warning("docsync.startup.stage=ready")
-    yield
+    try:
+        yield
+    finally:
+        shutdown_word_render_worker()
 
 
 app = FastAPI(
