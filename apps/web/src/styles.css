@@ -68,6 +68,313 @@ body {
   color: var(--ink);
   background: var(--app-bg);
 }
+
+/* Workspace-wide exhaustive Find & Replace and durable pending batches. */
+.find-replace-panel {
+  margin: 0 0 1rem;
+}
+
+.find-replace-launcher {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.65rem;
+}
+
+.find-replace-launcher > button,
+.pending-change-button {
+  border: 1px solid var(--line);
+  border-radius: 0.55rem;
+  background: var(--surface);
+  color: var(--ink);
+  padding: 0.62rem 0.85rem;
+  font-weight: 700;
+}
+
+.pending-batch-button strong {
+  display: inline-grid;
+  min-width: 1.4rem;
+  min-height: 1.4rem;
+  margin-left: 0.35rem;
+  place-items: center;
+  border-radius: 999px;
+  background: #175cd3;
+  color: #fff;
+}
+
+.find-replace-workspace {
+  display: grid;
+  grid-template-columns: minmax(22rem, 1.15fr) minmax(20rem, 0.85fr);
+  gap: 1rem;
+  margin-top: 0.75rem;
+  padding: 1rem;
+  border: 1px solid var(--line);
+  border-radius: 0.85rem;
+  background: var(--surface);
+  box-shadow: 0 14px 40px rgb(24 39 75 / 9%);
+}
+
+.find-replace-workspace > header,
+.pending-batch > header,
+.find-replace-results > header,
+.pending-operation-list article > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.find-replace-workspace > header,
+.batch-error {
+  grid-column: 1 / -1;
+}
+
+.find-replace-workspace h2,
+.find-replace-workspace h3,
+.find-replace-workspace p {
+  margin: 0;
+}
+
+.batch-error {
+  padding: 0.7rem 0.8rem;
+  border: 1px solid #f4b4b4;
+  border-radius: 0.55rem;
+  background: #fff2f2;
+  color: #9b1c1c;
+}
+
+.find-replace-form,
+.pending-batch {
+  display: grid;
+  align-content: start;
+  gap: 0.8rem;
+}
+
+.find-replace-form > label,
+.find-replace-options,
+.find-replace-scope {
+  display: grid;
+  gap: 0.38rem;
+  font-weight: 700;
+}
+
+.find-replace-form input[type="text"],
+.find-replace-form > label > input,
+.pending-replacement-edit input {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 0.48rem;
+  background: var(--surface);
+  color: inherit;
+  padding: 0.65rem 0.72rem;
+}
+
+.find-replace-options,
+.find-replace-scope {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 0;
+  padding: 0.65rem;
+  border: 1px solid var(--line);
+  border-radius: 0.55rem;
+  font-weight: 500;
+}
+
+.find-replace-options legend,
+.find-replace-scope legend {
+  padding: 0 0.3rem;
+  font-weight: 700;
+}
+
+.find-replace-options label,
+.find-replace-scope label {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.find-replace-scope-shortcuts {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 0.4rem;
+}
+
+.find-replace-results {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 0.7rem;
+  max-height: 34rem;
+  overflow: auto;
+  padding: 0.85rem;
+  border: 1px solid var(--line);
+  border-radius: 0.7rem;
+  background: var(--surface-2);
+}
+
+.find-replace-results > header div,
+.pending-operation-list article > header div {
+  display: grid;
+  gap: 0.15rem;
+}
+
+.find-replace-document {
+  display: grid;
+  gap: 0.4rem;
+}
+
+.find-replace-document h3 {
+  display: flex;
+  justify-content: space-between;
+  padding-bottom: 0.3rem;
+  border-bottom: 1px solid var(--line);
+  font-size: 0.95rem;
+}
+
+.find-replace-occurrence {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.6rem;
+  align-items: start;
+  padding: 0.55rem;
+  border-radius: 0.48rem;
+  background: var(--surface);
+}
+
+.find-replace-occurrence > span {
+  display: grid;
+  gap: 0.2rem;
+  min-width: 0;
+}
+
+.find-replace-occurrence > button {
+  align-self: center;
+  white-space: nowrap;
+}
+
+.find-replace-occurrence small,
+.find-replace-occurrence em,
+.pending-operation-list span,
+.batch-preview-summary span {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.find-replace-occurrence em,
+.batch-preview-summary em {
+  color: #a04400;
+}
+
+.find-replace-occurrence.locked {
+  border-left: 3px solid #d97706;
+  background: #fff9ed;
+}
+
+.pending-batch {
+  grid-column: 2;
+  grid-row: 2 / span 2;
+  padding-left: 1rem;
+  border-left: 1px solid var(--line);
+}
+
+.pending-batch-empty {
+  padding: 1rem;
+  border: 1px dashed var(--line);
+  border-radius: 0.6rem;
+  color: var(--muted);
+}
+
+.pending-operation-list {
+  display: grid;
+  gap: 0.6rem;
+  max-height: 28rem;
+  overflow: auto;
+}
+
+.pending-operation-list article {
+  display: grid;
+  gap: 0.55rem;
+  padding: 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 0.6rem;
+  background: var(--surface-2);
+}
+
+.pending-operation-list article.disabled {
+  opacity: 0.62;
+}
+
+.pending-replacement-edit,
+.pending-batch-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.pending-replacement-edit input {
+  flex: 1;
+}
+
+.pending-occurrence {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.6rem;
+  padding: 0.28rem 0;
+}
+
+.danger-link {
+  justify-self: start;
+  border: 0;
+  background: transparent;
+  color: #b42318;
+  text-decoration: underline;
+}
+
+.pending-batch-actions > button {
+  flex: 1;
+}
+
+.batch-preview-summary {
+  display: grid;
+  gap: 0.25rem;
+  padding: 0.7rem;
+  border: 1px solid #8ec5a5;
+  border-radius: 0.55rem;
+  background: #effbf3;
+}
+
+.batch-preview-summary.conflicted {
+  border-color: #efb4b4;
+  background: #fff2f2;
+}
+
+:root[data-theme="dark"] .batch-error,
+:root[data-theme="dark"] .batch-preview-summary.conflicted {
+  border-color: #754049;
+  background: #3d2023;
+  color: #fecaca;
+}
+
+:root[data-theme="dark"] .find-replace-occurrence.locked {
+  border-left-color: #d8b237;
+  background: #302a1b;
+}
+
+:root[data-theme="dark"] .batch-preview-summary {
+  border-color: #34776f;
+  background: #173f3b;
+}
+
+@media (max-width: 900px) {
+  .find-replace-workspace {
+    grid-template-columns: 1fr;
+  }
+
+  .pending-batch {
+    grid-column: 1;
+    grid-row: auto;
+    padding-top: 1rem;
+    padding-left: 0;
+    border-top: 1px solid var(--line);
+    border-left: 0;
+  }
+}
 body.workspace-open {
   height: 100vh;
   height: 100dvh;

@@ -567,6 +567,12 @@ export interface EditorGenerationResponse {
   affected_document_count?: number;
   affected_location_count?: number;
   timings?: Record<string, number>;
+  progress?: {
+    phase: string;
+    completed_documents: number;
+    total_documents: number;
+    current_document_name?: string | null;
+  } | null;
   download_url?: string;
   document_set?: DocumentSetResponse;
   document_updates?: DocumentSummary[];
@@ -581,4 +587,159 @@ export interface EditorGenerationResponse {
 
 export interface EditorGenerationListResponse {
   jobs: EditorGenerationResponse[];
+}
+
+export interface FindReplaceSearchOptions {
+  query: string;
+  document_ids?: string[];
+  match_case?: boolean;
+  whole_word?: boolean;
+  include_comments?: boolean;
+  include_historical_tracked_text?: boolean;
+  include_field_instructions?: boolean;
+  limit?: number | null;
+}
+
+export interface FindReplaceOccurrence {
+  occurrence_id: string;
+  result_id: string;
+  segment_id: string;
+  element_id?: string | null;
+  revision_id?: string | null;
+  document_id: string;
+  document_name: string;
+  version_id: string;
+  part_path: string;
+  structure_type: string;
+  segment_structure_type: string;
+  location: Record<string, unknown>;
+  location_label: string;
+  match_start: number;
+  match_end: number;
+  context_before: string;
+  matched_text: string;
+  context_after: string;
+  editable: boolean;
+  read_only: boolean;
+  read_only_reason?: string | null;
+}
+
+export interface FindReplaceSearchResponse {
+  query: string;
+  options: Omit<FindReplaceSearchOptions, "query" | "document_ids" | "limit">;
+  results: FindReplaceOccurrence[];
+  result_count: number;
+  returned_count: number;
+  editable_count: number;
+  read_only_count: number;
+  document_count: number;
+  document_counts: Array<{
+    document_id: string;
+    document_name: string;
+    result_count: number;
+    editable_count: number;
+    read_only_count: number;
+  }>;
+  truncated: boolean;
+  candidate_engine: string;
+  scanned_document_count: number;
+  scanned_segment_count: number;
+  timings: Record<string, number>;
+}
+
+export interface FindReplaceOccurrenceTarget {
+  occurrence_id: string;
+  segment_id: string;
+  document_id: string;
+  version_id: string;
+  element_id?: string | null;
+  part_path: string;
+  structure_type: string;
+  match_start: number;
+  match_end: number;
+  matched_text: string;
+  location: Record<string, unknown>;
+  editable: boolean;
+  read_only_reason?: string | null;
+}
+
+export interface EditBatchOperationInput {
+  operation_type: "find_replace" | "editor_replace";
+  label?: string | null;
+  replacement_text?: string | null;
+  find_request?: FindReplaceSearchOptions | null;
+  occurrences?: FindReplaceOccurrenceTarget[];
+  editor_request?: EditorOperationRequest | null;
+  enabled?: boolean;
+}
+
+export interface EditBatchOccurrence extends FindReplaceOccurrenceTarget {
+  id: string;
+  document_name: string;
+  base_version_id: string;
+  result_version_id?: string | null;
+  selected: boolean;
+}
+
+export interface EditBatchOperation {
+  id: string;
+  operation_index: number;
+  operation_type: "find_replace" | "editor_replace";
+  label?: string | null;
+  replacement_text?: string | null;
+  enabled: boolean;
+  find_request?: FindReplaceSearchOptions | null;
+  editor_request?: EditorOperationRequest | null;
+  occurrences: EditBatchOccurrence[];
+  occurrence_count: number;
+  document_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface EditBatchPreview {
+  batch_id: string;
+  status: "ready" | "conflicted" | string;
+  writes_performed: boolean;
+  conflicts: Array<{
+    code: string;
+    message: string;
+    operation_id?: string;
+    conflicting_operation_id?: string;
+    document_id?: string;
+    occurrence_id?: string;
+  }>;
+  conflict_count: number;
+  documents: Array<{
+    document_id: string;
+    document_name: string;
+    base_version_id: string;
+    find_replacement_count: number;
+    editor_target_count: number;
+    change_count: number;
+  }>;
+  affected_document_count: number;
+  affected_location_count: number;
+  timings: Record<string, number>;
+}
+
+export interface EditBatch {
+  id: string;
+  batch_id: string;
+  document_set_id: string;
+  title: string;
+  status: string;
+  stage: string;
+  base_versions: Record<string, string>;
+  operations: EditBatchOperation[];
+  operation_count: number;
+  enabled_operation_count: number;
+  affected_document_ids: string[];
+  affected_document_count: number;
+  preview?: EditBatchPreview | null;
+  error_detail?: string | null;
+  created_at: string;
+  updated_at: string;
+  completed_at?: string | null;
+  generation_status_url: string;
 }

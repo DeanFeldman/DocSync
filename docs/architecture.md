@@ -44,6 +44,17 @@ erDiagram
 
 A generated edit may only target `DocumentElement` rows that belong to the selected `LinkGroup`. The browser sends the explicitly included element IDs and the backend validates membership and requires the selected source element to remain included. Similarity or exact matching alone does not perform an edit; the user confirms the target list and reviews the impact before generation.
 
+## Complete text inventory and batch boundary
+
+Workspace Find & Replace does not equate editable `DocumentElement` rows with
+all searchable Word text. The OOXML inventory builds logical paragraph/story
+streams with character-to-node mappings for complex Word parts. Protected text
+remains visible in results. Durable batch operations pin immutable base versions
+and compile all rich-editor and substring targets into a conflict-free plan.
+Generation groups that plan by document, stages each affected DOCX once, and
+advances all heads in one completion transaction. See
+[Batch editing and complete Word text inventory](batch-find-replace-text-inventory.md).
+
 ## Viewer and working-version boundary
 
 The visual tab is a PDF exported by the installed Microsoft Word engine, so it uses Word's fonts, pagination, tables, images, headers, and footers. The separate Select text tab derives deterministic logical pages from extracted body elements and provides stable, keyboard-accessible element selection. Direct selection over the PDF awaits an element-to-render coordinate map.

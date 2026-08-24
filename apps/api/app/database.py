@@ -95,6 +95,11 @@ def init_db() -> None:
                 name="current_block_fts5",
                 apply=_migrate_current_block_fts,
             ),
+            WorkspaceMigration(
+                version=8,
+                name="durable_edit_batches",
+                apply=_migrate_durable_edit_batches,
+            ),
         ),
         report_stage=report_stage,
     )
@@ -932,6 +937,17 @@ def _migrate_current_block_fts(session: Session) -> None:
         "INSERT INTO document_block_fts(revision_id, normalized_text) "
         "SELECT id, normalized_text FROM document_block_revisions"
     )
+
+
+def _migrate_durable_edit_batches(session: Session) -> None:
+    """Record the durable batch schema added by ``Base.metadata.create_all``.
+
+    Batch tables are entirely additive. Keeping an explicit migration entry
+    gives existing workspaces a backed-up, monotonic schema transition without
+    rewriting any historical document or operation row.
+    """
+
+    del session
 
 
 def get_session() -> Generator[Session, None, None]:

@@ -25,12 +25,14 @@ import type {
   DocumentSearchTarget,
   DocumentSummary,
   EditorGenerationResponse,
+  FindReplaceOccurrence,
   GlobalSearchResponse,
   GlobalSearchResult,
 } from "./types";
 
 import docSyncLogo from "./assets/Docsync LOGO.png";
 import DocumentExperience from "./DocumentExperience";
+import FindReplacePanel from "./FindReplacePanel";
 import {
   clearWorkspaceResourcesForDocument,
   clearWorkspaceResourcesForSet,
@@ -1288,6 +1290,41 @@ const canUpload = files.length >= 2 && !busyAction;
           {error && (
             <ErrorAlert message={error} onDismiss={() => setError("")} />
           )}
+
+          <FindReplacePanel
+            documentSet={documentSet}
+            activeDocumentId={activeDocumentId}
+            onGenerationQueued={handleGenerationQueued}
+            onOpenOccurrence={(occurrence: FindReplaceOccurrence) => {
+              const target = documentSet.documents.find(
+                (item) => item.id === occurrence.document_id,
+              );
+              if (!target) return;
+              void openDocument(
+                target,
+                occurrence.revision_id
+                  ? {
+                      result_id: occurrence.result_id,
+                      element_id: occurrence.element_id ?? occurrence.segment_id,
+                      document_id: occurrence.document_id,
+                      document_name: occurrence.document_name,
+                      version_id: occurrence.version_id,
+                      paragraph_index: Number(
+                        occurrence.location.paragraph_index ?? 0,
+                      ),
+                      element_type: occurrence.structure_type as GlobalSearchResult["element_type"],
+                      text: `${occurrence.context_before}${occurrence.matched_text}${occurrence.context_after}`,
+                      occurrence_index: 1,
+                      match_start: occurrence.match_start,
+                      match_end: occurrence.match_end,
+                      context_before: occurrence.context_before,
+                      matched_text: occurrence.matched_text,
+                      context_after: occurrence.context_after,
+                    }
+                  : null,
+              );
+            }}
+          />
 
           {newerVersionNotice &&
             newerVersionNotice.document.id === activeDocumentId && (
