@@ -188,3 +188,107 @@ class VersionRestoreRequest(BaseModel):
         if not value.strip():
             raise ValueError("The expected current version ID cannot be blank.")
         return value
+
+
+class TextSearchRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=500)
+    document_ids: list[str] | None = Field(default=None, min_length=1, max_length=20)
+    match_case: bool = False
+    whole_word: bool = False
+    include_comments: bool = False
+    include_historical_tracked_text: bool = False
+    include_field_instructions: bool = False
+    limit: int | None = Field(default=10_000, ge=1, le=20_000)
+
+    @field_validator("query")
+    @classmethod
+    def query_must_contain_searchable_text(cls, value: str) -> str:
+        if not value or not value.strip():
+            raise ValueError("Find text cannot be blank.")
+        return value
+
+    @field_validator("document_ids")
+    @classmethod
+    def document_scope_must_be_unique(
+        cls,
+        value: list[str] | None,
+    ) -> list[str] | None:
+        if value is None:
+            return None
+        if any(not document_id.strip() or len(document_id) > 36 for document_id in value):
+            raise ValueError("Document scope IDs must be non-blank UUID values.")
+        if len(value) != len(set(value)):
+            raise ValueError("Document scope IDs must be unique.")
+        return value
+
+
+class FindReplaceOccurrenceTarget(BaseModel):
+    occurrence_id: str = Field(min_length=1, max_length=36)
+    segment_id: str = Field(min_length=1, max_length=36)
+    document_id: str = Field(min_length=1, max_length=36)
+    version_id: str = Field(min_length=1, max_length=36)
+    element_id: str | None = Field(default=None, max_length=36)
+    part_path: str = Field(min_length=1, max_length=400)
+    structure_type: str = Field(min_length=1, max_length=60)
+    match_start: int = Field(ge=0)
+    match_end: int = Field(gt=0)
+    matched_text: str = Field(min_length=1, max_length=20_000)
+    location: dict[str, Any] = Field(default_factory=dict)
+    editable: bool = True
+    read_only_reason: str | None = Field(default=None, max_length=2_000)
+
+    @model_validator(mode="after")
+    def range_must_match_text(self) -> "FindReplaceOccurrenceTarget":
+        if self.match_end <= self.match_start:
+            raise ValueError("Occurrence end must be after its start.")
+        return self
+
+
+class EditBatchCreate(BaseModel):
+    title: str = Field(default="Pending changes", min_length=1, max_length=200)
+
+    @field_validator("title")
+    @classmethod
+    def title_must_be_visible(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("Batch title cannot be blank.")
+        return cleaned
+
+
+class EditBatchOperationRequest(BaseModel):
+    operation_type: Literal["find_replace", "editor_replace"]
+    label: str | None = Field(default=None, max_length=240)
+    replacement_text: str | None = Field(default=None, max_length=20_000)
+    find_request: TextSearchRequest | None = None
+    occurrences: list[FindReplaceOccurrenceTarget] = Field(
+        default_factory=list,
+        max_length=20_000,
+    )
+    editor_request: EditorEditRequest | None = None
+    enabled: bool = True
+
+    @model_validator(mode="after")
+    def validate_operation_payload(self) -> "EditBatchOperationRequest":
+        if self.operation_type == "find_replace":
+            if self.replacement_text is None:
+                raise ValueError("Find-and-replace operations require replacement text.")
+            if self.find_request is None:
+                raise ValueError("Find-and-replace operations require search options.")
+            if not self.occurrences:
+                raise ValueError("Select at least one editable occurrence.")
+            if self.editor_request is not None:
+                raise ValueError("Find-and-replace operations cannot contain an editor request.")
+            occurrence_ids = [item.occurrence_id for item in self.occurrences]
+            if len(occurrence_ids) != len(set(occurrence_ids)):
+                raise ValueError("Selected occurrence IDs must be unique.")
+        else:
+            if self.editor_request is None:
+                raise ValueError("Editor operations require an editor request.")
+            if self.occurrences or self.find_request is not None:
+                raise ValueError("Editor operations cannot contain find occurrences.")
+        return self
+
+
+class EditBatchOccurrenceSelectionRequest(BaseModel):
+    selected: bool

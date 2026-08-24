@@ -8,9 +8,14 @@ import type {
   EditorContentResponse,
   EditorGenerationResponse,
   EditorGenerationListResponse,
+  EditBatch,
+  EditBatchOperationInput,
+  EditBatchPreview,
   EditorOperationRequest,
   EditorPreviewResponse,
   GenerationResponse,
+  FindReplaceSearchOptions,
+  FindReplaceSearchResponse,
   GlobalSearchResponse,
   MatchDecisionPayload,
   MatchDiscovery,
@@ -355,6 +360,168 @@ export async function fetchEditorGeneration(
     `${API_URL}/generation-jobs/${operationId}`,
     { signal },
   );
+  return parseResponse<EditorGenerationResponse>(response);
+}
+
+export async function findReplaceSearch(
+  documentSetId: string,
+  request: FindReplaceSearchOptions,
+  signal?: AbortSignal,
+): Promise<FindReplaceSearchResponse> {
+  const response = await fetch(
+    `${API_URL}/document-sets/${documentSetId}/find-replace/search`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(request),
+      signal,
+    },
+  );
+  return parseResponse<FindReplaceSearchResponse>(response);
+}
+
+export async function fetchDraftEditBatch(
+  documentSetId: string,
+  signal?: AbortSignal,
+): Promise<EditBatch | null> {
+  const response = await fetch(
+    `${API_URL}/document-sets/${documentSetId}/edit-batches/draft`,
+    { signal },
+  );
+  const payload = await parseResponse<{ batch: EditBatch | null }>(response);
+  return payload.batch;
+}
+
+export async function createEditBatch(
+  documentSetId: string,
+  title = "Pending changes",
+  signal?: AbortSignal,
+): Promise<EditBatch> {
+  const response = await fetch(
+    `${API_URL}/document-sets/${documentSetId}/edit-batches`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title }),
+      signal,
+    },
+  );
+  return parseResponse<EditBatch>(response);
+}
+
+export async function addEditBatchOperation(
+  batchId: string,
+  request: EditBatchOperationInput,
+  signal?: AbortSignal,
+): Promise<EditBatch> {
+  const response = await fetch(`${API_URL}/edit-batches/${batchId}/operations`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+    signal,
+  });
+  return parseResponse<EditBatch>(response);
+}
+
+export async function addEditorEditToPendingBatch(
+  documentSetId: string,
+  request: EditorOperationRequest,
+  label?: string,
+  signal?: AbortSignal,
+): Promise<EditBatch> {
+  const draft =
+    (await fetchDraftEditBatch(documentSetId, signal)) ??
+    (await createEditBatch(documentSetId, "Pending changes", signal));
+  return addEditBatchOperation(
+    draft.id,
+    {
+      operation_type: "editor_replace",
+      label: label ?? "Reviewed editor replacement",
+      editor_request: request,
+      enabled: true,
+    },
+    signal,
+  );
+}
+
+export async function updateEditBatchOperation(
+  batchId: string,
+  operationId: string,
+  request: EditBatchOperationInput,
+  signal?: AbortSignal,
+): Promise<EditBatch> {
+  const response = await fetch(
+    `${API_URL}/edit-batches/${batchId}/operations/${operationId}`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(request),
+      signal,
+    },
+  );
+  return parseResponse<EditBatch>(response);
+}
+
+export async function removeEditBatchOperation(
+  batchId: string,
+  operationId: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const response = await fetch(
+    `${API_URL}/edit-batches/${batchId}/operations/${operationId}`,
+    { method: "DELETE", signal },
+  );
+  if (!response.ok) await parseResponse<never>(response);
+}
+
+export async function setEditBatchOccurrenceSelection(
+  batchId: string,
+  occurrenceRowId: string,
+  selected: boolean,
+  signal?: AbortSignal,
+): Promise<EditBatch> {
+  const response = await fetch(
+    `${API_URL}/edit-batches/${batchId}/occurrences/${occurrenceRowId}`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ selected }),
+      signal,
+    },
+  );
+  return parseResponse<EditBatch>(response);
+}
+
+export async function clearEditBatch(
+  batchId: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const response = await fetch(`${API_URL}/edit-batches/${batchId}`, {
+    method: "DELETE",
+    signal,
+  });
+  if (!response.ok) await parseResponse<never>(response);
+}
+
+export async function previewEditBatch(
+  batchId: string,
+  signal?: AbortSignal,
+): Promise<EditBatchPreview> {
+  const response = await fetch(`${API_URL}/edit-batches/${batchId}/preview`, {
+    method: "POST",
+    signal,
+  });
+  return parseResponse<EditBatchPreview>(response);
+}
+
+export async function generateEditBatch(
+  batchId: string,
+  signal?: AbortSignal,
+): Promise<EditorGenerationResponse> {
+  const response = await fetch(`${API_URL}/edit-batches/${batchId}/generate`, {
+    method: "POST",
+    signal,
+  });
   return parseResponse<EditorGenerationResponse>(response);
 }
 

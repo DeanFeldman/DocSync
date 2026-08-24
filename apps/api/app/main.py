@@ -40,7 +40,6 @@ from .document_service import (
     render_document_with_word,
     rendered_pdf_path,
     serialize_document_set_history,
-    search_document_set,
     serialize_document_set,
     serialize_document_view,
 )
@@ -70,10 +69,29 @@ from .editor_service import (
 )
 from .schemas import (
     CompareRequest,
+    EditBatchCreate,
+    EditBatchOccurrenceSelectionRequest,
+    EditBatchOperationRequest,
     EditRequest,
     EditorEditRequest,
     MatchDecisionBatchRequest,
+    TextSearchRequest,
     VersionRestoreRequest,
+)
+from .find_replace_service import search_document_text_inventory
+from .batch_service import (
+    add_edit_batch_operation,
+    clear_edit_batch,
+    create_edit_batch,
+    get_draft_edit_batch,
+    get_edit_batch,
+    preview_edit_batch,
+    queue_edit_batch,
+    remove_edit_batch_operation,
+    set_edit_batch_occurrence_selection,
+    serialize_edit_batch,
+    submit_edit_batch,
+    update_edit_batch_operation,
 )
 from .render_map_service import render_page_path, request_render_map
 from .preview_job_service import (
@@ -119,7 +137,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="DocumentSync API",
-    version="1.10.0",
+    version="1.11.0",
     description="DocSync structured DOCX viewing and controlled editing service.",
     lifespan=lifespan,
 )
@@ -262,7 +280,136 @@ def search_documents_in_set(
     limit: int | None = Query(default=None, ge=1, le=5000),
     session: Session = Depends(get_session),
 ) -> dict:
-    return search_document_set(session, document_set_id, q, limit)
+    if not q.strip():
+        return {
+            "query": q,
+            "results": [],
+            "result_count": 0,
+            "returned_count": 0,
+            "editable_count": 0,
+            "read_only_count": 0,
+            "document_count": 0,
+            "document_counts": [],
+            "truncated": False,
+        }
+    return search_document_text_inventory(
+        session,
+        document_set_id,
+        TextSearchRequest(query=q, limit=limit),
+    )
+
+
+@app.post("/api/document-sets/{document_set_id}/find-replace/search")
+def search_find_replace_occurrences(
+    document_set_id: str,
+    request: TextSearchRequest,
+    session: Session = Depends(get_session),
+) -> dict:
+    return search_document_text_inventory(session, document_set_id, request)
+
+
+@app.post("/api/document-sets/{document_set_id}/edit-batches", status_code=201)
+def create_document_set_edit_batch(
+    document_set_id: str,
+    request: EditBatchCreate,
+    session: Session = Depends(get_session),
+) -> dict:
+    return create_edit_batch(session, document_set_id, request)
+
+
+@app.get("/api/document-sets/{document_set_id}/edit-batches/draft")
+def read_document_set_draft_edit_batch(
+    document_set_id: str,
+    session: Session = Depends(get_session),
+) -> dict:
+    return get_draft_edit_batch(session, document_set_id)
+
+
+@app.get("/api/edit-batches/{batch_id}")
+def read_edit_batch(
+    batch_id: str,
+    session: Session = Depends(get_session),
+) -> dict:
+    return serialize_edit_batch(session, get_edit_batch(session, batch_id))
+
+
+@app.post("/api/edit-batches/{batch_id}/operations", status_code=201)
+def add_document_set_edit_batch_operation(
+    batch_id: str,
+    request: EditBatchOperationRequest,
+    session: Session = Depends(get_session),
+) -> dict:
+    return add_edit_batch_operation(session, batch_id, request)
+
+
+@app.put("/api/edit-batches/{batch_id}/operations/{operation_id}")
+def update_document_set_edit_batch_operation(
+    batch_id: str,
+    operation_id: str,
+    request: EditBatchOperationRequest,
+    session: Session = Depends(get_session),
+) -> dict:
+    return update_edit_batch_operation(
+        session,
+        batch_id,
+        operation_id,
+        request,
+    )
+
+
+@app.delete(
+    "/api/edit-batches/{batch_id}/operations/{operation_id}",
+    status_code=204,
+)
+def delete_document_set_edit_batch_operation(
+    batch_id: str,
+    operation_id: str,
+    session: Session = Depends(get_session),
+) -> Response:
+    remove_edit_batch_operation(session, batch_id, operation_id)
+    return Response(status_code=204)
+
+
+@app.patch("/api/edit-batches/{batch_id}/occurrences/{occurrence_row_id}")
+def update_document_set_edit_batch_occurrence(
+    batch_id: str,
+    occurrence_row_id: str,
+    request: EditBatchOccurrenceSelectionRequest,
+    session: Session = Depends(get_session),
+) -> dict:
+    return set_edit_batch_occurrence_selection(
+        session,
+        batch_id,
+        occurrence_row_id,
+        selected=request.selected,
+    )
+
+
+@app.delete("/api/edit-batches/{batch_id}", status_code=204)
+def delete_document_set_edit_batch(
+    batch_id: str,
+    session: Session = Depends(get_session),
+) -> Response:
+    clear_edit_batch(session, batch_id)
+    return Response(status_code=204)
+
+
+@app.post("/api/edit-batches/{batch_id}/preview")
+def preview_document_set_edit_batch(
+    batch_id: str,
+    session: Session = Depends(get_session),
+) -> dict:
+    return preview_edit_batch(session, batch_id)
+
+
+@app.post("/api/edit-batches/{batch_id}/generate", status_code=202)
+def generate_document_set_edit_batch(
+    batch_id: str,
+    session: Session = Depends(get_session),
+) -> dict:
+    queued = queue_edit_batch(session, batch_id)
+    submit_edit_batch(batch_id)
+    return queued
 
 
 @app.delete("/api/document-sets/{document_set_id}")

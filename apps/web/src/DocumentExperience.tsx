@@ -11,6 +11,7 @@ import {
 } from "react";
 import {
   absoluteApiUrl,
+  addEditorEditToPendingBatch,
   ApiError,
   currentDocumentDownloadUrl,
   createPreviewJob,
@@ -56,6 +57,7 @@ import WordPreviewOverlay, {
   type LayoutSelectionIntent,
 } from "./WordPreviewOverlay";
 import type { InlineEditorCommand } from "./InlineLayoutEditor";
+import { BATCH_UPDATED_EVENT } from "./FindReplacePanel";
 import type {
   DifferenceSpan,
   DocumentSearchTarget,
@@ -80,7 +82,7 @@ import type {
 } from "./types";
 
 type LoadingStatus = "idle" | "loading" | "ready" | "error";
-type EditorAction = "preview" | "generate" | "restore" | null;
+type EditorAction = "preview" | "generate" | "batch" | "restore" | null;
 type WithoutCommandId<T> = T extends { id: number } ? Omit<T, "id"> : never;
 type InlineEditorCommandInput = WithoutCommandId<InlineEditorCommand>;
 
@@ -853,6 +855,7 @@ export default function DocumentExperience({
   const [preview, setPreview] = useState<EditorPreviewResponse | null>(null);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [previewSignature, setPreviewSignature] = useState("");
+  const [batchAddedSignature, setBatchAddedSignature] = useState("");
   const [action, setAction] = useState<EditorAction>(null);
   const [localError, setLocalError] = useState("");
   const [versions, setVersions] =
@@ -2247,6 +2250,13 @@ export default function DocumentExperience({
       previewSignature === operationSignature &&
       !action,
   );
+  const canAddToBatch = Boolean(
+    operation &&
+      preview &&
+      previewSignature === operationSignature &&
+      !action &&
+      batchAddedSignature !== operationSignature,
+  );
 
   async function handlePreview() {
     if (!operation || !selectedBlock) return;
@@ -2491,6 +2501,52 @@ export default function DocumentExperience({
       }
     } finally {
       generationSubmissionRef.current = false;
+      if (requestId === editorActionRequestRef.current) {
+        if (editorActionAbortRef.current === controller) {
+          editorActionAbortRef.current = null;
+        }
+        setAction(null);
+      }
+    }
+  }
+
+  async function handleAddToBatch() {
+    if (!operation || !selectedBlock || !canAddToBatch) return;
+    editorActionAbortRef.current?.abort();
+    const requestId = ++editorActionRequestRef.current;
+    const controller = new AbortController();
+    editorActionAbortRef.current = controller;
+    setAction("batch");
+    setLocalError("");
+    try {
+      await addEditorEditToPendingBatch(
+        documentSet.id,
+        operation,
+        `${document?.name ?? "Document"} · ${locationLabel(selectedBlock)}`,
+        controller.signal,
+      );
+      if (
+        controller.signal.aborted ||
+        requestId !== editorActionRequestRef.current
+      ) {
+        return;
+      }
+      setBatchAddedSignature(operationSignature);
+      window.dispatchEvent(new Event(BATCH_UPDATED_EVENT));
+    } catch (caught) {
+      if (
+        controller.signal.aborted ||
+        requestId !== editorActionRequestRef.current
+      ) {
+        return;
+      }
+      setLocalError(
+        errorMessage(
+          caught,
+          "The reviewed edit could not be added to pending changes.",
+        ),
+      );
+    } finally {
       if (requestId === editorActionRequestRef.current) {
         if (editorActionAbortRef.current === controller) {
           editorActionAbortRef.current = null;
@@ -3212,6 +3268,18 @@ export default function DocumentExperience({
                   disabled={!canPreview}
                 >
                   {action === "preview" ? "Building preview…" : "Preview changes"}
+                </button>
+                <button
+                  type="button"
+                  className="pending-change-button"
+                  onClick={() => void handleAddToBatch()}
+                  disabled={!canAddToBatch}
+                >
+                  {action === "batch"
+                    ? "Adding to pending…"
+                    : batchAddedSignature === operationSignature
+                      ? "Added to pending changes"
+                      : "Add to pending changes"}
                 </button>
                 <button
                   type="button"

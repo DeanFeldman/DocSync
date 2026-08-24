@@ -15,7 +15,6 @@ import re
 import shutil
 import threading
 from time import perf_counter
-from types import SimpleNamespace
 import unicodedata
 from uuid import uuid4
 import zipfile
@@ -37,6 +36,7 @@ from .models import (
     DocumentRecord,
     DocumentSet,
     DocumentVersion,
+    EditBatchOperation,
     EditorOperation,
     EditorOperationTarget,
     GeneratedVersion,
@@ -3050,6 +3050,11 @@ def serialize_editor_generation_status(
             if isinstance(preview_envelope, dict)
             else {}
         ),
+        "progress": (
+            preview_envelope.get("progress")
+            if isinstance(preview_envelope, dict)
+            else None
+        ),
     }
     if operation.status in {"failed", "interrupted"}:
         payload["error_detail"] = (
@@ -4026,6 +4031,9 @@ def serialize_editor_history(
             .options(
                 selectinload(EditorOperation.targets),
                 selectinload(EditorOperation.versions),
+                selectinload(EditorOperation.batch_operations).selectinload(
+                    EditBatchOperation.occurrences
+                ),
             )
             .order_by(EditorOperation.created_at.desc())
         )
@@ -4037,7 +4045,11 @@ def serialize_editor_history(
             "event_type": (
                 "version_restore"
                 if operation.operation_type == "version_restore"
-                else "editor_edit"
+                else (
+                    "batch_edit"
+                    if operation.operation_type == "batch"
+                    else "editor_edit"
+                )
             ),
             "edit_mode": (
                 None
@@ -4067,8 +4079,50 @@ def serialize_editor_history(
                 if operation.completed_at is not None
                 else None
             ),
-            "target_count": len(operation.targets),
+            "target_count": len(operation.targets) + sum(
+                sum(
+                    1
+                    for occurrence in item.occurrences
+                    if (
+                        occurrence.result_version_id is not None
+                        if operation.status == "completed"
+                        else occurrence.selected
+                    )
+                )
+                for item in operation.batch_operations
+            ),
             "version_count": len(operation.versions),
+            "title": (
+                (operation.preview_json or {}).get("title")
+                if isinstance(operation.preview_json, dict)
+                else None
+            ),
+            "batch_operations": [
+                {
+                    "operation_id": item.id,
+                    "operation_index": item.operation_index,
+                    "operation_type": item.operation_type,
+                    "label": item.label,
+                    "replacement_text": item.replacement_text,
+                    "enabled": item.enabled,
+                    "occurrence_count": sum(
+                        1
+                        for occurrence in item.occurrences
+                        if (
+                            occurrence.result_version_id is not None
+                            if operation.status == "completed"
+                            else occurrence.selected
+                        )
+                    ),
+                    "document_count": len(
+                        {occurrence.document_id for occurrence in item.occurrences}
+                    ),
+                }
+                for item in sorted(
+                    operation.batch_operations,
+                    key=lambda item: item.operation_index,
+                )
+            ],
             "versions": [
                 {
                     "document_id": version.document_id,

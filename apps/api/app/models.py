@@ -512,6 +512,11 @@ class EditorOperation(Base):
         back_populates="operation",
         cascade="all, delete-orphan",
     )
+    batch_operations: Mapped[list[EditBatchOperation]] = relationship(
+        back_populates="batch",
+        cascade="all, delete-orphan",
+        order_by="EditBatchOperation.operation_index",
+    )
     versions: Mapped[list[DocumentVersion]] = relationship(
         back_populates="editor_operation",
         foreign_keys="DocumentVersion.editor_operation_id",
@@ -557,6 +562,112 @@ class EditorOperationTarget(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
     operation: Mapped[EditorOperation] = relationship(back_populates="targets")
+    base_version: Mapped[DocumentVersion] = relationship(
+        foreign_keys=[base_version_id]
+    )
+    result_version: Mapped[DocumentVersion | None] = relationship(
+        foreign_keys=[result_version_id]
+    )
+
+
+class EditBatchOperation(Base):
+    """One ordered, independently reviewable operation in a durable edit batch."""
+
+    __tablename__ = "edit_batch_operations"
+    __table_args__ = (
+        UniqueConstraint(
+            "batch_id",
+            "operation_index",
+            name="uq_edit_batch_operation_index",
+        ),
+        CheckConstraint(
+            "operation_index >= 0",
+            name="ck_edit_batch_operation_index",
+        ),
+        CheckConstraint(
+            "operation_type IN ('find_replace', 'editor_replace')",
+            name="ck_edit_batch_operation_type",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    batch_id: Mapped[str] = mapped_column(
+        ForeignKey("editor_operations.id", ondelete="CASCADE"), index=True
+    )
+    operation_index: Mapped[int] = mapped_column(Integer)
+    operation_type: Mapped[str] = mapped_column(String(40))
+    label: Mapped[str | None] = mapped_column(String(240), nullable=True)
+    replacement_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    request_json: Mapped[dict | list] = mapped_column(JSON)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        onupdate=utc_now,
+    )
+
+    batch: Mapped[EditorOperation] = relationship(back_populates="batch_operations")
+    occurrences: Mapped[list[EditBatchOccurrence]] = relationship(
+        back_populates="batch_operation",
+        cascade="all, delete-orphan",
+        order_by="EditBatchOccurrence.created_at",
+    )
+
+
+class EditBatchOccurrence(Base):
+    """Version-bound occurrence selected for a find-and-replace operation."""
+
+    __tablename__ = "edit_batch_occurrences"
+    __table_args__ = (
+        UniqueConstraint(
+            "batch_operation_id",
+            "occurrence_id",
+            name="uq_edit_batch_occurrence",
+        ),
+        CheckConstraint(
+            "match_start >= 0 AND match_end > match_start",
+            name="ck_edit_batch_occurrence_range",
+        ),
+        Index(
+            "ix_edit_batch_occurrence_document_version",
+            "document_id",
+            "base_version_id",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    batch_operation_id: Mapped[str] = mapped_column(
+        ForeignKey("edit_batch_operations.id", ondelete="CASCADE"), index=True
+    )
+    occurrence_id: Mapped[str] = mapped_column(String(36))
+    document_id: Mapped[str] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), index=True
+    )
+    base_version_id: Mapped[str] = mapped_column(
+        ForeignKey("document_versions.id", ondelete="CASCADE"), index=True
+    )
+    result_version_id: Mapped[str | None] = mapped_column(
+        ForeignKey("document_versions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    segment_id: Mapped[str] = mapped_column(String(36), index=True)
+    element_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    part_path: Mapped[str] = mapped_column(String(400))
+    structure_type: Mapped[str] = mapped_column(String(60))
+    match_start: Mapped[int] = mapped_column(Integer)
+    match_end: Mapped[int] = mapped_column(Integer)
+    matched_text: Mapped[str] = mapped_column(Text)
+    location_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    selected: Mapped[bool] = mapped_column(Boolean, default=True)
+    editable: Mapped[bool] = mapped_column(Boolean, default=True)
+    read_only_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    batch_operation: Mapped[EditBatchOperation] = relationship(
+        back_populates="occurrences"
+    )
     base_version: Mapped[DocumentVersion] = relationship(
         foreign_keys=[base_version_id]
     )
