@@ -100,6 +100,11 @@ def init_db() -> None:
                 name="durable_edit_batches",
                 apply=_migrate_durable_edit_batches,
             ),
+            WorkspaceMigration(
+                version=9,
+                name="empty_table_paragraph_targets",
+                apply=_migrate_empty_table_paragraph_targets,
+            ),
         ),
         report_stage=report_stage,
     )
@@ -948,6 +953,126 @@ def _migrate_durable_edit_batches(session: Session) -> None:
     """
 
     del session
+
+
+def _migrate_empty_table_paragraph_targets(session: Session) -> None:
+    """Add blank fields to current documents without rebuilding their history.
+
+    Schema 9 only needs new targets for empty table cells. Re-running the full
+    table foundation would delete and recreate every revision in every stored
+    version, which is prohibitively expensive for mature desktop workspaces.
+    Historical versions receive the new extraction automatically if restored;
+    current versions are backfilled additively here without changing any
+    existing element or revision identity.
+    """
+
+    from .document_service import _extract_paragraphs
+    from .editor_service import (
+        _element_location,
+        _header_footer_part_map,
+        _load_docx,
+        _location_key,
+        _revision_values,
+        document_version_path,
+    )
+    from .models import (
+        DocumentBlockRevision,
+        DocumentElement,
+        DocumentHead,
+        DocumentVersion,
+    )
+
+    heads = list(
+        session.scalars(
+            select(DocumentHead).order_by(DocumentHead.document_id)
+        )
+    )
+    for head_index, head in enumerate(heads, start=1):
+        version = session.get(DocumentVersion, head.current_version_id)
+        if version is None:
+            raise RuntimeError(
+                f"Document {head.document_id} has no current version during "
+                "blank-field migration."
+            )
+
+        parsed = _load_docx(document_version_path(version))
+        empty_fields = [
+            (paragraph_index, style_name)
+            for paragraph_index, text_value, style_name in _extract_paragraphs(parsed)
+            if not text_value
+            and style_name is not None
+            and _ORDERED_TABLE_PARAGRAPH_STYLE.fullmatch(style_name)
+        ]
+        if not empty_fields:
+            continue
+
+        existing_revisions = list(
+            session.scalars(
+                select(DocumentBlockRevision).where(
+                    DocumentBlockRevision.version_id == version.id
+                )
+            )
+        )
+        existing_locations = {
+            _location_key(revision.location_json)
+            for revision in existing_revisions
+        }
+        next_paragraph_index = (
+            max(
+                session.scalars(
+                    select(DocumentElement.paragraph_index).where(
+                        DocumentElement.document_id == version.document_id
+                    )
+                ),
+                default=-1,
+            )
+            + 1
+        )
+        paragraphs = list(parsed.paragraphs)
+        tables = list(parsed.tables)
+        style_name_cache: dict[str | None, str | None] = {}
+        header_footer_parts = _header_footer_part_map(parsed)
+
+        for extracted_index, style_name in empty_fields:
+            candidate_id = str(
+                uuid5(
+                    NAMESPACE_URL,
+                    f"docsync:v1.9-empty:{version.id}:{extracted_index}:{style_name}",
+                )
+            )
+            candidate = DocumentElement(
+                id=candidate_id,
+                document_id=version.document_id,
+                paragraph_index=next_paragraph_index,
+                text="",
+                normalized_text="",
+                style_name=style_name,
+            )
+            _ordinal, location = _element_location(candidate)
+            location_key = _location_key(location)
+            if location_key in existing_locations:
+                continue
+
+            session.add(candidate)
+            values = _revision_values(
+                parsed,
+                candidate,
+                shared_state="detached",
+                paragraphs=paragraphs,
+                tables=tables,
+                style_name_cache=style_name_cache,
+                header_footer_parts=header_footer_parts,
+            )
+            session.add(
+                DocumentBlockRevision(version_id=version.id, **values)
+            )
+            existing_locations.add(location_key)
+            next_paragraph_index += 1
+
+        if head_index % 10 == 0:
+            session.flush()
+
+    session.flush()
 
 
 def get_session() -> Generator[Session, None, None]:

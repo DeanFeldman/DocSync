@@ -91,6 +91,43 @@ def write_multipage_pdf(path: Path, page_texts: list[str]) -> None:
     pdf.close()
 
 
+def write_split_paragraph_pdf(path: Path, before: str, after: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pdf = pymupdf.open()
+    first_page = pdf.new_page(width=612, height=792)
+    first_page.insert_text((72, 750), before, fontsize=11)
+    second_page = pdf.new_page(width=612, height=792)
+    second_page.insert_text((540, 40), "2", fontsize=11)
+    second_page.insert_text((72, 100), after, fontsize=11)
+    pdf.save(path)
+    pdf.close()
+
+
+def write_empty_table_pdf(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pdf = pymupdf.open()
+    page = pdf.new_page(width=612, height=792)
+    left, middle, right = 72, 300, 540
+    top, middle_y, bottom = 100, 155, 210
+    page.draw_rect(pymupdf.Rect(left, top, right, bottom), width=0.8)
+    page.draw_line((middle, top), (middle, bottom), width=0.8)
+    page.draw_line((left, middle_y), (right, middle_y), width=0.8)
+    page.insert_text((82, 132), "Name", fontsize=11)
+    page.insert_text((82, 187), "Identity number", fontsize=11)
+    pdf.save(path)
+    pdf.close()
+
+
+def write_signature_line_pdf(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pdf = pymupdf.open()
+    page = pdf.new_page(width=612, height=792)
+    page.insert_text((72, 120), "Signature:", fontsize=11)
+    page.draw_line((160, 126), (460, 126), width=0.8)
+    pdf.save(path)
+    pdf.close()
+
+
 def poll_job(client: TestClient, job_id: str, timeout: float = 8) -> dict:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -316,6 +353,270 @@ def test_controlled_pages_are_published_before_coordinate_matching(
         ]
         assert len(wrapped_regions) >= 2
         assert all(0 <= region[axis] <= 1 for region in mapped["regions"] for axis in ("x", "y", "width", "height"))
+
+
+def test_render_map_covers_numbered_toc_and_repeated_legal_paragraphs(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    legal_clause = (
+        "The Occupant was the previous holder of a Life Right in terms of "
+        "a Life Right Agreement entered into between the Occupant and Anson."
+    )
+    document = Document()
+    for text in ("PARTIES", "AGREEMENT", "and", legal_clause, "AGREEMENT"):
+        document.add_paragraph(text)
+    stream = io.BytesIO()
+    document.save(stream)
+
+    app = load_test_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        workspace, primary = upload(client, stream.getvalue())
+        version_id = primary["version_id"]
+        pdf_path = (
+            tmp_path / "data" / "renders" / workspace["id"] / f"{version_id}.pdf"
+        )
+        write_pdf(
+            pdf_path,
+            [
+                (72, 90, "1. PARTIES 4", None),
+                (72, 125, "2. AGREEMENT 4", None),
+                (72, 160, "and", None),
+                (72, 195, "A normal sentence with and inside it", None),
+                (72, 230, f"2.1 {legal_clause}", 460),
+                (72, 315, "AGREEMENT", None),
+            ],
+        )
+
+        mapped = poll_map(client, version_id)
+        assert mapped["status"] == "completed"
+        assert mapped["total_element_count"] == 5
+        assert mapped["mapped_element_count"] == 5
+        assert mapped["interactive_element_count"] == 5
+        assert mapped["unmapped"] == []
+
+        regions_by_text: dict[str, set[str]] = {}
+        for region in mapped["regions"]:
+            regions_by_text.setdefault(region["text_preview"], set()).add(
+                region["element_id"]
+            )
+        assert len(regions_by_text["AGREEMENT"]) == 2
+        assert len(regions_by_text["and"]) == 1
+
+
+def test_render_map_does_not_treat_an_arbitrary_line_substring_as_a_paragraph(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    app = load_test_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        workspace, primary = upload(client, docx_bytes("Agreement"))
+        version_id = primary["version_id"]
+        pdf_path = (
+            tmp_path / "data" / "renders" / workspace["id"] / f"{version_id}.pdf"
+        )
+        write_pdf(pdf_path, [(72, 100, "The Agreement applies", None)])
+
+        mapped = poll_map(client, version_id)
+        assert mapped["status"] == "failed"
+        assert mapped["mapped_element_count"] == 0
+        assert len(mapped["unmapped"]) == 1
+
+
+def test_render_map_uses_neighbouring_blocks_to_resolve_repeated_text(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    document = Document()
+    for text in ("Before anchor", "AGREEMENT", "After anchor"):
+        document.add_paragraph(text)
+    stream = io.BytesIO()
+    document.save(stream)
+
+    app = load_test_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        workspace, primary = upload(client, stream.getvalue())
+        version_id = primary["version_id"]
+        pdf_path = (
+            tmp_path / "data" / "renders" / workspace["id"] / f"{version_id}.pdf"
+        )
+        write_pdf(
+            pdf_path,
+            [
+                (72, 80, "AGREEMENT", None),
+                (72, 120, "Before anchor", None),
+                (72, 160, "AGREEMENT", None),
+                (72, 200, "After anchor", None),
+                (72, 240, "AGREEMENT", None),
+            ],
+        )
+
+        mapped = poll_map(client, version_id)
+        assert mapped["status"] == "completed"
+        assert mapped["mapped_element_count"] == 3
+        agreement_regions = [
+            region
+            for region in mapped["regions"]
+            if region["text_preview"] == "AGREEMENT"
+        ]
+        assert len(agreement_regions) == 1
+        assert agreement_regions[0]["confidence"] == 0.93
+
+
+def test_render_map_ignores_automatic_page_number_inside_split_paragraph(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    before = "This long paragraph begins near the bottom of one page and"
+    after = "continues at the top of the following page without interruption."
+    app = load_test_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        workspace, primary = upload(client, docx_bytes(f"{before} {after}"))
+        version_id = primary["version_id"]
+        pdf_path = (
+            tmp_path / "data" / "renders" / workspace["id"] / f"{version_id}.pdf"
+        )
+        write_split_paragraph_pdf(pdf_path, before, after)
+
+        mapped = poll_map(client, version_id)
+        assert mapped["status"] == "completed"
+        assert mapped["mapped_element_count"] == 1
+        assert {region["page_number"] for region in mapped["regions"]} == {1, 2}
+
+
+def test_body_paragraph_wins_when_header_text_overlaps_its_pdf_range(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    document = Document()
+    document.sections[0].header.paragraphs[0].text = "AGREEMENT"
+    document.add_paragraph("2\tAGREEMENT\t4")
+    stream = io.BytesIO()
+    document.save(stream)
+
+    app = load_test_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        workspace, primary = upload(client, stream.getvalue())
+        version_id = primary["version_id"]
+        pdf_path = (
+            tmp_path / "data" / "renders" / workspace["id"] / f"{version_id}.pdf"
+        )
+        write_pdf(
+            pdf_path,
+            [
+                (500, 40, "AGREEMENT", None),
+                (72, 160, "2 AGREEMENT 4", None),
+            ],
+        )
+
+        mapped = poll_map(client, version_id)
+        assert mapped["status"] == "completed"
+        assert mapped["mapped_element_count"] == 2
+        assert {
+            region["text_preview"] for region in mapped["regions"]
+        } == {"AGREEMENT", "2\tAGREEMENT\t4"}
+
+
+def test_render_map_makes_empty_table_cells_editable(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    document = Document()
+    table = document.add_table(rows=2, cols=2)
+    table.cell(0, 0).text = "Name"
+    table.cell(0, 1).text = ""
+    table.cell(1, 0).text = "Identity number"
+    table.cell(1, 1).text = ""
+    stream = io.BytesIO()
+    document.save(stream)
+
+    app = load_test_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        workspace, primary = upload(client, stream.getvalue())
+        version_id = primary["version_id"]
+        pdf_path = (
+            tmp_path / "data" / "renders" / workspace["id"] / f"{version_id}.pdf"
+        )
+        write_empty_table_pdf(pdf_path)
+
+        mapped = poll_map(client, version_id)
+        assert mapped["status"] == "completed"
+        assert mapped["total_element_count"] == 4
+        assert mapped["mapped_element_count"] == 4
+        empty_regions = [
+            region for region in mapped["regions"] if region["text_preview"] == ""
+        ]
+        assert len(empty_regions) == 2
+        assert all(region["interactive"] for region in empty_regions)
+        assert all(
+            region["mapping_method"] == "word_pdf_empty_table_cell"
+            for region in empty_regions
+        )
+
+
+def test_render_map_makes_blank_signature_line_editable(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    document = Document()
+    table = document.add_table(rows=1, cols=3)
+    table.cell(0, 0).text = "Signature:"
+    table.cell(0, 1).merge(table.cell(0, 2)).text = ""
+    stream = io.BytesIO()
+    document.save(stream)
+
+    app = load_test_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        workspace, primary = upload(client, stream.getvalue())
+        version_id = primary["version_id"]
+        pdf_path = (
+            tmp_path / "data" / "renders" / workspace["id"] / f"{version_id}.pdf"
+        )
+        write_signature_line_pdf(pdf_path)
+
+        mapped = poll_map(client, version_id)
+        assert mapped["status"] == "completed"
+        assert mapped["total_element_count"] == 2
+        assert mapped["mapped_element_count"] == 2
+        empty_region = next(
+            region for region in mapped["regions"] if region["text_preview"] == ""
+        )
+        assert empty_region["interactive"] is True
+        assert (
+            empty_region["mapping_method"]
+            == "word_pdf_empty_signature_line"
+        )
+
+
+def test_signature_line_maps_once_to_the_rightmost_empty_word_cell(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    document = Document()
+    table = document.add_table(rows=1, cols=3)
+    table.cell(0, 0).text = "Signature:"
+    table.cell(0, 1).text = ""
+    table.cell(0, 2).text = ""
+    stream = io.BytesIO()
+    document.save(stream)
+
+    app = load_test_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        workspace, primary = upload(client, stream.getvalue())
+        version_id = primary["version_id"]
+        pdf_path = (
+            tmp_path / "data" / "renders" / workspace["id"] / f"{version_id}.pdf"
+        )
+        write_signature_line_pdf(pdf_path)
+
+        mapped = poll_map(client, version_id)
+        empty_regions = [
+            region for region in mapped["regions"] if region["text_preview"] == ""
+        ]
+        assert mapped["total_element_count"] == 3
+        assert mapped["mapped_element_count"] == 2
+        assert len(empty_regions) == 1
+        assert empty_regions[0]["location"]["column_index"] == 2
 
 
 def test_later_pdf_pages_render_only_on_demand_and_reuse_cache(

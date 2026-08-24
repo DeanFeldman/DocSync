@@ -24,8 +24,8 @@ from .models import DocumentBlockRevision, DocumentVersion
 
 logger = logging.getLogger(__name__)
 
-RENDER_MAP_SCHEMA_VERSION = 2
-RENDER_MAP_ENGINE = "docsync-contextual-pdf-map-v2-lazy-pages"
+RENDER_MAP_SCHEMA_VERSION = 4
+RENDER_MAP_ENGINE = "docsync-contextual-pdf-map-v4-empty-table-fields"
 WORD_RENDER_ENGINE = "Microsoft Word ExportAsFixedFormat PDF"
 TOKEN_PATTERN = re.compile(r"\w+", re.UNICODE)
 RENDER_ID_PATTERN = re.compile(r"^[a-f0-9]{24}$")
@@ -314,6 +314,71 @@ def _candidate_context(block: dict, tokens: list[dict], start: int, end: int) ->
     return True
 
 
+def _line_key(token: dict) -> tuple[int, int, int]:
+    return (
+        int(token["page_number"]),
+        int(token["block_number"]),
+        int(token["line_number"]),
+    )
+
+
+def _same_line_affixes(
+    tokens: list[dict],
+    start: int,
+    end: int,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    first_line = _line_key(tokens[start])
+    last_line = _line_key(tokens[end - 1])
+    prefix: list[str] = []
+    cursor = start - 1
+    while cursor >= 0 and _line_key(tokens[cursor]) == first_line:
+        prefix.append(str(tokens[cursor]["value"]))
+        cursor -= 1
+    prefix.reverse()
+
+    suffix: list[str] = []
+    cursor = end
+    while cursor < len(tokens) and _line_key(tokens[cursor]) == last_line:
+        suffix.append(str(tokens[cursor]["value"]))
+        cursor += 1
+    return tuple(prefix), tuple(suffix)
+
+
+def _safe_decorative_affixes(
+    block: dict,
+    prefix: tuple[str, ...],
+    suffix: tuple[str, ...],
+) -> bool:
+    """Allow Word-rendered numbering and TOC page numbers, not arbitrary substrings.
+
+    Automatic list/legal numbering is visible in Word/PDF but absent from the
+    paragraph's OOXML text stream. TOC fields can similarly render a leading
+    entry number and a trailing page number around the stored display text.
+    These are safe coordinate decorations because they contain only bounded
+    marker tokens. Ordinary surrounding words still reject the candidate.
+    """
+
+    if prefix:
+        numeric_prefix = len(prefix) <= 4 and all(
+            value.isdecimal() for value in prefix
+        )
+        list_prefix = (
+            block.get("element_type") == "list_item"
+            and len(prefix) == 1
+            and (
+                (len(prefix[0]) == 1 and prefix[0].isalpha())
+                or bool(re.fullmatch(r"[ivxlcdm]+", prefix[0]))
+            )
+        )
+        if not numeric_prefix and not list_prefix:
+            return False
+    if suffix and not (
+        len(suffix) <= 2 and all(value.isdecimal() for value in suffix)
+    ):
+        return False
+    return True
+
+
 def _find_candidates(
     block: dict,
     tokens: list[dict],
@@ -329,32 +394,9 @@ def _find_candidates(
             continue
         if tuple(token["value"] for token in tokens[start:end]) != wanted:
             continue
-        first = tokens[start]
-        last = tokens[end - 1]
-        if start > 0:
-            previous = tokens[start - 1]
-            if (
-                previous["page_number"],
-                previous["block_number"],
-                previous["line_number"],
-            ) == (
-                first["page_number"],
-                first["block_number"],
-                first["line_number"],
-            ):
-                continue
-        if end < len(tokens):
-            following = tokens[end]
-            if (
-                following["page_number"],
-                following["block_number"],
-                following["line_number"],
-            ) == (
-                last["page_number"],
-                last["block_number"],
-                last["line_number"],
-            ):
-                continue
+        prefix, suffix = _same_line_affixes(tokens, start, end)
+        if not _safe_decorative_affixes(block, prefix, suffix):
+            continue
         if _candidate_context(block, tokens, start, end):
             candidates.append((start, end))
     return candidates
@@ -388,10 +430,12 @@ def _match_blocks(
         grouped.setdefault(_group_key(block), []).append(block)
 
     matches: dict[str, dict] = {}
-    unmapped: list[dict] = []
+    candidates_by_element_id: dict[str, list[tuple[int, int]]] = {}
     for group_blocks in sorted(grouped.values(), key=lambda items: items[0]["ordinal"]):
         ordered = sorted(group_blocks, key=lambda item: item["ordinal"])
         candidates = _find_candidates(ordered[0], tokens, by_value)
+        for block in ordered:
+            candidates_by_element_id[block["element_id"]] = candidates
         is_header_footer = ordered[0]["element_type"] in {
             "header_paragraph",
             "footer_paragraph",
@@ -407,20 +451,6 @@ def _match_blocks(
                 for block, candidate in zip(ordered, candidates, strict=True)
             )
 
-        assigned = {item[0]["element_id"] for item in assignments}
-        for block in ordered:
-            if block["element_id"] not in assigned:
-                unmapped.append(
-                    {
-                        "element_id": block["element_id"],
-                        "element_type": block["element_type"],
-                        "reason": (
-                            "No reliable PDF text region was found."
-                            if not candidates
-                            else "Repeated PDF text could not be resolved safely from context and order."
-                        ),
-                    }
-                )
         for block, ranges, confidence in assignments:
             matches[block["element_id"]] = {
                 "block": block,
@@ -428,29 +458,346 @@ def _match_blocks(
                 "confidence": confidence,
             }
 
+    body_blocks = tuple(
+        block
+        for block in sorted(blocks, key=lambda item: item["ordinal"])
+        if block["element_type"]
+        not in {"header_paragraph", "footer_paragraph"}
+    )
+    for _pass in range(len(body_blocks)):
+        token_owners: set[int] = {
+            token_index
+            for match in matches.values()
+            for start, end in match["ranges"]
+            for token_index in range(start, end)
+        }
+        contextual_assignments: list[
+            tuple[dict, tuple[int, int]]
+        ] = []
+        for block in body_blocks:
+            element_id = block["element_id"]
+            if element_id in matches:
+                continue
+            candidates = candidates_by_element_id[element_id]
+            if not candidates:
+                continue
+
+            previous = max(
+                (
+                    match
+                    for match in matches.values()
+                    if match["block"]["element_type"]
+                    not in {"header_paragraph", "footer_paragraph"}
+                    and match["block"]["ordinal"] < block["ordinal"]
+                ),
+                key=lambda match: match["block"]["ordinal"],
+                default=None,
+            )
+            following = min(
+                (
+                    match
+                    for match in matches.values()
+                    if match["block"]["element_type"]
+                    not in {"header_paragraph", "footer_paragraph"}
+                    and match["block"]["ordinal"] > block["ordinal"]
+                ),
+                key=lambda match: match["block"]["ordinal"],
+                default=None,
+            )
+            if previous is None and following is None:
+                continue
+            lower_bound = (
+                max(end for _start, end in previous["ranges"])
+                if previous is not None
+                else None
+            )
+            upper_bound = (
+                min(start for start, _end in following["ranges"])
+                if following is not None
+                else None
+            )
+            bounded = [
+                (start, end)
+                for start, end in candidates
+                if (lower_bound is None or start >= lower_bound)
+                and (upper_bound is None or end <= upper_bound)
+                and all(
+                    token_index not in token_owners
+                    for token_index in range(start, end)
+                )
+            ]
+            if len(bounded) == 1:
+                contextual_assignments.append((block, bounded[0]))
+
+        if not contextual_assignments:
+            break
+        for block, candidate in contextual_assignments:
+            matches[block["element_id"]] = {
+                "block": block,
+                "ranges": [candidate],
+                "confidence": 0.93,
+            }
+
     token_owners: dict[int, set[str]] = {}
     for element_id, match in matches.items():
         for start, end in match["ranges"]:
             for token_index in range(start, end):
                 token_owners.setdefault(token_index, set()).add(element_id)
+    preferred_owner: dict[int, str] = {}
+    for token_index, owners in token_owners.items():
+        preferred_owner[token_index] = max(
+            owners,
+            key=lambda element_id: (
+                matches[element_id]["block"]["element_type"]
+                not in {"header_paragraph", "footer_paragraph"},
+                float(matches[element_id]["confidence"]),
+                len(_normalise_tokens(matches[element_id]["block"]["text"])),
+                bool(matches[element_id]["block"]["supported"]),
+                -int(matches[element_id]["block"]["ordinal"]),
+            ),
+        )
+    overlap_removed: set[str] = set()
     for element_id, match in list(matches.items()):
         safe_ranges = [
             (start, end)
             for start, end in match["ranges"]
-            if all(len(token_owners[index]) == 1 for index in range(start, end))
+            if all(
+                preferred_owner[index] == element_id
+                for index in range(start, end)
+            )
         ]
         if safe_ranges:
             match["ranges"] = safe_ranges
             continue
         del matches[element_id]
+        overlap_removed.add(element_id)
+
+    unmapped: list[dict] = []
+    for block in blocks:
+        element_id = block["element_id"]
+        if element_id in matches:
+            continue
+        candidates = candidates_by_element_id[element_id]
         unmapped.append(
             {
                 "element_id": element_id,
-                "element_type": match["block"]["element_type"],
-                "reason": "The PDF range overlaps another block and is not safe to select.",
+                "element_type": block["element_type"],
+                "reason": (
+                    "The PDF range overlaps another block and is not safe to select."
+                    if element_id in overlap_removed
+                    else "No reliable PDF text region was found."
+                    if not candidates
+                    else "Repeated PDF text could not be resolved safely from context and order."
+                ),
             }
         )
     return matches, unmapped
+
+
+def _match_tokens(match: dict, tokens: list[dict]) -> list[dict]:
+    return [
+        tokens[token_index]
+        for start, end in match["ranges"]
+        for token_index in range(start, end)
+    ]
+
+
+def _point_inside_box(x: float, y: float, box: tuple[float, ...]) -> bool:
+    x0, y0, x1, y1 = box
+    return x0 <= x <= x1 and y0 <= y <= y1
+
+
+def _match_empty_table_blocks(
+    blocks: tuple[dict, ...],
+    matches: dict[str, dict],
+    tokens: list[dict],
+    geometry: dict,
+) -> None:
+    empty_blocks = sorted(
+        (
+            block
+            for block in blocks
+            if block["element_type"] == "table_paragraph"
+            and not _normalise_tokens(block["text"])
+            and block["element_id"] not in matches
+        ),
+        key=lambda block: (
+            int(block["location"].get("table_index", -1)),
+            int(block["location"].get("row_index", -1)),
+            -int(block["location"].get("column_index", -1)),
+            int(block["location"].get("paragraph_index", -1)),
+        ),
+    )
+    if not empty_blocks:
+        return
+
+    anchors_by_table: dict[int, list[dict]] = {}
+    for match in matches.values():
+        block = match["block"]
+        location = block["location"]
+        if block["element_type"] != "table_paragraph":
+            continue
+        if "table_index" not in location:
+            continue
+        anchors_by_table.setdefault(int(location["table_index"]), []).append(
+            match
+        )
+
+    pdf_tables = list(geometry.get("tables") or [])
+    table_scores: dict[tuple[int, int], int] = {}
+    for table_index, anchors in anchors_by_table.items():
+        for pdf_index, pdf_table in enumerate(pdf_tables):
+            score = 0
+            cells = pdf_table["cells"]
+            for anchor in anchors:
+                location = anchor["block"]["location"]
+                cell_key = (
+                    int(location.get("row_index", -1)),
+                    int(location.get("column_index", -1)),
+                )
+                cell_box = cells.get(cell_key)
+                if cell_box is None:
+                    continue
+                if any(
+                    token["page_number"] == pdf_table["page_number"]
+                    and _point_inside_box(
+                        (float(token["x0"]) + float(token["x1"])) / 2,
+                        (float(token["y0"]) + float(token["y1"])) / 2,
+                        cell_box,
+                    )
+                    for token in _match_tokens(anchor, tokens)
+                ):
+                    score += 1
+            if score:
+                table_scores[(table_index, pdf_index)] = score
+
+    horizontal_lines = list(geometry.get("horizontal_lines") or [])
+    claimed_geometry: set[tuple[float, ...]] = set()
+    for block in empty_blocks:
+        location = block["location"]
+        table_index = int(location.get("table_index", -1))
+        row_index = int(location.get("row_index", -1))
+        column_index = int(location.get("column_index", -1))
+        cell_candidates: list[tuple[int, int, dict, tuple[float, ...]]] = []
+        for pdf_index, pdf_table in enumerate(pdf_tables):
+            score = table_scores.get((table_index, pdf_index), 0)
+            cell_box = pdf_table["cells"].get((row_index, column_index))
+            if score and cell_box is not None:
+                cell_candidates.append((score, -pdf_index, pdf_table, cell_box))
+        if cell_candidates:
+            _score, _order, pdf_table, cell_box = max(
+                cell_candidates,
+                key=lambda item: (item[0], item[1]),
+            )
+            x0, y0, x1, y1 = cell_box
+            geometry_key = (
+                float(pdf_table["page_number"]),
+                float(x0),
+                float(y0),
+                float(x1),
+                float(y1),
+            )
+            if geometry_key in claimed_geometry:
+                continue
+            claimed_geometry.add(geometry_key)
+            inset = min(2.0, max(0.0, (x1 - x0) / 10), max(0.0, (y1 - y0) / 10))
+            matches[block["element_id"]] = {
+                "block": block,
+                "ranges": [],
+                "confidence": 0.98,
+                "geometric_boxes": [
+                    {
+                        "page_number": pdf_table["page_number"],
+                        "page_width": pdf_table["page_width"],
+                        "page_height": pdf_table["page_height"],
+                        "x0": x0 + inset,
+                        "y0": y0 + inset,
+                        "x1": x1 - inset,
+                        "y1": y1 - inset,
+                        "mapping_method": "word_pdf_empty_table_cell",
+                    }
+                ],
+            }
+            continue
+
+        same_row_anchors = [
+            anchor
+            for anchor in anchors_by_table.get(table_index, [])
+            if int(anchor["block"]["location"].get("row_index", -1))
+            == row_index
+            and int(anchor["block"]["location"].get("column_index", -1))
+            < column_index
+        ]
+        line_candidates: list[tuple[float, float, dict, dict]] = []
+        for anchor in same_row_anchors:
+            anchor_tokens = _match_tokens(anchor, tokens)
+            for page_number in {
+                int(token["page_number"]) for token in anchor_tokens
+            }:
+                page_tokens = [
+                    token
+                    for token in anchor_tokens
+                    if int(token["page_number"]) == page_number
+                ]
+                anchor_x1 = max(float(token["x1"]) for token in page_tokens)
+                anchor_y1 = max(float(token["y1"]) for token in page_tokens)
+                for line in horizontal_lines:
+                    if int(line["page_number"]) != page_number:
+                        continue
+                    vertical_gap = float(line["y0"]) - anchor_y1
+                    if not 0 <= vertical_gap <= 24:
+                        continue
+                    if float(line["x0"]) < anchor_x1 + 8:
+                        continue
+                    geometry_key = (
+                        float(line["page_number"]),
+                        float(line["x0"]),
+                        float(line["y0"]),
+                        float(line["x1"]),
+                        float(line["y1"]),
+                    )
+                    if geometry_key in claimed_geometry:
+                        continue
+                    line_candidates.append(
+                        (
+                            vertical_gap,
+                            -(float(line["x1"]) - float(line["x0"])),
+                            line,
+                            page_tokens[0],
+                        )
+                    )
+        if not line_candidates:
+            continue
+        _gap, _width, line, page_token = min(
+            line_candidates,
+            key=lambda item: (item[0], item[1]),
+        )
+        claimed_geometry.add(
+            (
+                float(line["page_number"]),
+                float(line["x0"]),
+                float(line["y0"]),
+                float(line["x1"]),
+                float(line["y1"]),
+            )
+        )
+        matches[block["element_id"]] = {
+            "block": block,
+            "ranges": [],
+            "confidence": 0.96,
+            "geometric_boxes": [
+                {
+                    "page_number": line["page_number"],
+                    "page_width": page_token["page_width"],
+                    "page_height": page_token["page_height"],
+                    "x0": line["x0"],
+                    "y0": max(0.0, float(line["y0"]) - 16.0),
+                    "x1": line["x1"],
+                    "y1": float(line["y1"]) + 4.0,
+                    "mapping_method": "word_pdf_empty_signature_line",
+                }
+            ],
+        }
 
 
 def _regions_for_match(
@@ -464,6 +811,72 @@ def _regions_for_match(
         block["supported"]
         and confidence >= settings.render_map_confidence_threshold
     )
+    geometric_boxes = list(match.get("geometric_boxes") or [])
+    if geometric_boxes:
+        regions: list[dict] = []
+        for region_index, box in enumerate(geometric_boxes, start=1):
+            page_number = int(box["page_number"])
+            page_width = float(box["page_width"])
+            page_height = float(box["page_height"])
+            x0 = max(0.0, min(float(box["x0"]), page_width))
+            y0 = max(0.0, min(float(box["y0"]), page_height))
+            x1 = max(x0, min(float(box["x1"]), page_width))
+            y1 = max(y0, min(float(box["y1"]), page_height))
+            coordinates = (
+                x0 / page_width,
+                y0 / page_height,
+                (x1 - x0) / page_width,
+                (y1 - y0) / page_height,
+            )
+            if (
+                x1 <= x0
+                or y1 <= y0
+                or not all(
+                    math.isfinite(value) and 0 <= value <= 1
+                    for value in coordinates
+                )
+            ):
+                continue
+            reason = None
+            if not block["supported"]:
+                reason = (
+                    block["unsupported_reason"]
+                    or "This Word structure is read-only."
+                )
+            elif not interactive:
+                reason = (
+                    "The coordinate match is below the interactive confidence threshold."
+                )
+            regions.append(
+                {
+                    "region_id": (
+                        f"{block['element_id']}:{page_number}:{region_index}"
+                    ),
+                    "region_index": region_index,
+                    "render_id": None,
+                    "element_id": block["element_id"],
+                    "document_id": context.document_id,
+                    "version_id": context.version_id,
+                    "element_type": block["element_type"],
+                    "text_preview": block["text"][:160],
+                    "location": block["location"],
+                    "page_number": page_number,
+                    "x": round(coordinates[0], 7),
+                    "y": round(coordinates[1], 7),
+                    "width": round(coordinates[2], 7),
+                    "height": round(coordinates[3], 7),
+                    "confidence": confidence,
+                    "mapping_method": str(box["mapping_method"]),
+                    "interactive": interactive,
+                    "editable": interactive,
+                    "supported": bool(block["supported"]),
+                    "read_only": not interactive,
+                    "reason": reason,
+                    "read_only_reason": reason,
+                }
+            )
+        return regions
+
     lines: dict[tuple[int, int, int], list[dict]] = {}
     for start, end in match["ranges"]:
         seen: set[tuple[int, int, int, int]] = set()
@@ -533,9 +946,18 @@ def _regions_for_match(
 def _extract_pdf_structure(
     context: _RenderContext,
     render_id: str,
-) -> tuple[list[dict], list[dict]]:
+) -> tuple[list[dict], list[dict], dict]:
     pages: list[dict] = []
     tokens: list[dict] = []
+    geometry: dict[str, list[dict]] = {
+        "tables": [],
+        "horizontal_lines": [],
+    }
+    needs_empty_table_geometry = any(
+        block["element_type"] == "table_paragraph"
+        and not _normalise_tokens(block["text"])
+        for block in context.blocks
+    )
     with context.pdf_path.open("rb") as source:
         header = source.read(8)
         source.seek(max(0, context.pdf_size - 2048))
@@ -575,13 +997,36 @@ def _extract_pdf_structure(
                     ),
                 }
             )
-            for word in page.get_text("words", sort=True):
+            words = page.get_text("words", sort=True)
+            line_token_counts: dict[tuple[int, int], int] = {}
+            for word in words:
+                if len(word) < 8:
+                    continue
+                line_key = (int(word[5]), int(word[6]))
+                line_token_counts[line_key] = line_token_counts.get(
+                    line_key, 0
+                ) + len(_normalise_tokens(str(word[4])))
+            for word in words:
                 if len(word) < 8:
                     continue
                 x0, y0, x1, y1, raw_text, block_number, line_number, word_number = word[:8]
                 if not all(math.isfinite(float(value)) for value in (x0, y0, x1, y1)):
                     continue
-                for value in _normalise_tokens(str(raw_text)):
+                values = _normalise_tokens(str(raw_text))
+                is_automatic_page_number = bool(
+                    values == (str(page_number),)
+                    and line_token_counts.get(
+                        (int(block_number), int(line_number))
+                    )
+                    == 1
+                    and (
+                        (float(y0) + float(y1)) / 2 / height < 0.055
+                        or (float(y0) + float(y1)) / 2 / height > 0.945
+                    )
+                )
+                if is_automatic_page_number:
+                    continue
+                for value in values:
                     tokens.append(
                         {
                             "value": value,
@@ -597,7 +1042,64 @@ def _extract_pdf_structure(
                             "word_number": int(word_number),
                         }
                     )
-    return pages, tokens
+            if needs_empty_table_geometry:
+                try:
+                    found_tables = page.find_tables().tables
+                except Exception:
+                    logger.warning(
+                        "docsync.render_map.table_geometry_failed "
+                        "version_id=%s page=%s",
+                        context.version_id,
+                        page_number,
+                        exc_info=True,
+                    )
+                    found_tables = []
+                for found_table in found_tables:
+                    cells: dict[tuple[int, int], tuple[float, ...]] = {}
+                    for row_index, row in enumerate(found_table.rows):
+                        for column_index, cell_box in enumerate(row.cells):
+                            if cell_box is None:
+                                continue
+                            cells[(row_index, column_index)] = tuple(
+                                float(value) for value in cell_box
+                            )
+                    if not cells:
+                        continue
+                    geometry["tables"].append(
+                        {
+                            "page_number": page_number,
+                            "page_width": width,
+                            "page_height": height,
+                            "row_count": int(found_table.row_count),
+                            "column_count": int(found_table.col_count),
+                            "cells": cells,
+                        }
+                    )
+                try:
+                    drawings = page.get_drawings()
+                except Exception:
+                    logger.warning(
+                        "docsync.render_map.line_geometry_failed "
+                        "version_id=%s page=%s",
+                        context.version_id,
+                        page_number,
+                        exc_info=True,
+                    )
+                    drawings = []
+                for drawing in drawings:
+                    rect = drawing.get("rect")
+                    if rect is None or rect.width < 60 or rect.height > 3:
+                        continue
+                    geometry["horizontal_lines"].append(
+                        {
+                            "page_number": page_number,
+                            "x0": float(rect.x0),
+                            "y0": float(rect.y0),
+                            "x1": float(rect.x1),
+                            "y1": float(rect.y1),
+                        }
+                    )
+    return pages, tokens, geometry
 
 
 def _render_pdf_page(
@@ -696,7 +1198,7 @@ def _generate_render_map(context: _RenderContext, key: str) -> None:
         )
         render_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
         stage_started = perf_counter()
-        pages, tokens = _extract_pdf_structure(context, render_id)
+        pages, tokens, geometry = _extract_pdf_structure(context, render_id)
         text_extraction_ms = (perf_counter() - stage_started) * 1000
         logger.info(
             "docsync.render_map_text_extraction_timing version_id=%s pages=%s "
@@ -720,6 +1222,18 @@ def _generate_render_map(context: _RenderContext, key: str) -> None:
 
         stage_started = perf_counter()
         matches, unmapped = _match_blocks(context.blocks, tokens)
+        _match_empty_table_blocks(
+            context.blocks,
+            matches,
+            tokens,
+            geometry,
+        )
+        mapped_match_ids = set(matches)
+        unmapped = [
+            item
+            for item in unmapped
+            if item["element_id"] not in mapped_match_ids
+        ]
         block_matching_ms = (perf_counter() - stage_started) * 1000
         regions = [
             region
@@ -737,13 +1251,13 @@ def _generate_render_map(context: _RenderContext, key: str) -> None:
             status = "failed"
             detail = (
                 "The PDF remains available, but no blocks could be mapped reliably. "
-                "Use Select from structure."
+                "Retry the Word preview after closing any open Word dialogue."
             )
         elif len(mapped_ids) < total:
             status = "partial"
             detail = (
-                "Reliable areas are editable. Unresolved content remains available "
-                "through Select from structure."
+                "Reliable Word areas are editable. A small number of unsupported "
+                "or non-rendered structures remain read-only."
             )
         else:
             status = "completed"
@@ -784,7 +1298,7 @@ def _generate_render_map(context: _RenderContext, key: str) -> None:
             "status": "failed",
             "status_detail": (
                 "The PDF remains available, but selectable text could not be prepared. "
-                "Use Select from structure."
+                "Retry after closing any Microsoft Word dialog."
             ),
             "error": str(exc),
             "generated_at": _utc_now(),

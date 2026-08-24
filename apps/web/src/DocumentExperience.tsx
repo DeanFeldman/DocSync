@@ -1,8 +1,5 @@
 import {
-  Fragment,
-  ReactNode,
   UIEvent as ReactUIEvent,
-  useCallback,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -77,7 +74,6 @@ import type {
   MatchDiscovery,
   PreviewResponse,
   PreviewRenderJobResponse,
-  QuillDelta,
   QuillDraft,
 } from "./types";
 
@@ -187,63 +183,6 @@ function locationLabel(item: {
   }`;
 }
 
-function linkedContentExplanation(block: EditorBlock): string | null {
-  if (
-    !["header_paragraph", "footer_paragraph"].includes(block.element_type) ||
-    !block.section_indexes ||
-    block.section_indexes.length < 2
-  ) {
-    return null;
-  }
-  const region = block.element_type === "header_paragraph" ? "header" : "footer";
-  const sectionList = block.section_indexes.map((index) => index + 1).join(" and ");
-  return `This ${region} is shared with sections ${sectionList} because they use the same linked Word part. Editing it will update every listed section.`;
-}
-
-interface StructuredBlockGroup {
-  key: string;
-  label: string;
-  blocks: EditorBlock[];
-  region: "header" | "body" | "footer";
-}
-
-function groupStructuredBlocks(blocks: EditorBlock[]): StructuredBlockGroup[] {
-  const groups = new Map<string, StructuredBlockGroup>();
-  for (const block of blocks) {
-    const region =
-      block.element_type === "header_paragraph"
-        ? "header"
-        : block.element_type === "footer_paragraph"
-          ? "footer"
-          : "body";
-    const key =
-      region === "body"
-        ? "body"
-        : `${region}:${block.section_index ?? 0}:${block.header_footer_type ?? "default"}`;
-    const label =
-      region === "body"
-        ? "Document body"
-        : `${region === "header" ? "Header" : "Footer"} · Section ${
-            (block.section_index ?? 0) + 1
-          } · ${
-            block.header_footer_type?.startsWith("first_page")
-              ? "First page"
-              : block.header_footer_type?.startsWith("even_page")
-                ? "Even pages"
-                : "Default"
-          }`;
-    const group = groups.get(key) ?? { key, label, blocks: [], region };
-    group.blocks.push(block);
-    groups.set(key, group);
-  }
-  const regionOrder = { header: 0, body: 1, footer: 2 };
-  return Array.from(groups.values()).sort(
-    (left, right) =>
-      regionOrder[left.region] - regionOrder[right.region] ||
-      (left.blocks[0]?.order ?? 0) - (right.blocks[0]?.order ?? 0),
-  );
-}
-
 function formatDate(value: string | undefined): string {
   if (!value) return "Saved locally";
   const date = new Date(value);
@@ -254,76 +193,6 @@ function formatDate(value: string | undefined): string {
   });
 }
 
-function applyInlineFormatting(
-  text: string,
-  attributes: Record<string, unknown>,
-): ReactNode {
-  let content: ReactNode = text;
-  if (attributes.bold) content = <strong>{content}</strong>;
-  if (attributes.italic) content = <em>{content}</em>;
-  if (attributes.underline) content = <u>{content}</u>;
-  return content;
-}
-
-function inlineDelta(
-  delta: QuillDelta,
-  highlight?: { start: number; end: number },
-): ReactNode[] {
-  let textOffset = 0;
-  return delta.ops.flatMap((operation, index) => {
-    if (typeof operation.insert !== "string") {
-      return [
-        <span className="unsupported-inline" key={`embed-${index}`}>
-          [Unsupported embedded content]
-        </span>,
-      ];
-    }
-    const text = operation.insert.replace(/\n$/, "");
-    if (!text) return [];
-    const attributes = operation.attributes ?? {};
-    const operationStart = textOffset;
-    const operationEnd = operationStart + text.length;
-    textOffset = operationEnd;
-
-    if (
-      !highlight ||
-      highlight.end <= operationStart ||
-      highlight.start >= operationEnd
-    ) {
-      return [
-        <Fragment key={`text-${index}`}>
-          {applyInlineFormatting(text, attributes)}
-        </Fragment>,
-      ];
-    }
-
-    const localStart = Math.max(0, highlight.start - operationStart);
-    const localEnd = Math.min(text.length, highlight.end - operationStart);
-    const pieces = [
-      { kind: "before", text: text.slice(0, localStart) },
-      { kind: "match", text: text.slice(localStart, localEnd) },
-      { kind: "after", text: text.slice(localEnd) },
-    ];
-    return pieces
-      .filter((piece) => piece.text)
-      .map((piece) => {
-        const content = applyInlineFormatting(piece.text, attributes);
-        return piece.kind === "match" ? (
-          <mark
-            className="editor-block-search-hit"
-            key={`text-${index}-${piece.kind}`}
-          >
-            {content}
-          </mark>
-        ) : (
-          <Fragment key={`text-${index}-${piece.kind}`}>
-            {content}
-          </Fragment>
-        );
-      });
-  });
-}
-
 function findLayoutElement(elementId: string): HTMLElement | null {
   return (
     Array.from(
@@ -331,89 +200,6 @@ function findLayoutElement(elementId: string): HTMLElement | null {
         "[data-element-id]",
       ),
     ).find((element) => element.dataset.elementId === elementId) ?? null
-  );
-}
-
-function LayoutFallbackBlock({
-  block,
-  selected,
-  onSelect,
-}: {
-  block: EditorBlock;
-  selected: boolean;
-  onSelect: (block: EditorBlock) => void;
-}) {
-  const editable = block.supported && !block.read_only;
-  const alignment = block.alignment ?? "left";
-  const className = `layout-fallback-block ${block.element_type} ${
-    selected ? "selected" : ""
-  } ${editable ? "editable" : "read-only"}`;
-  const content = (
-    <>
-      <span className="layout-fallback-meta">
-        <span>{locationLabel(block)}</span>
-        <span>
-          {editable
-            ? selected
-              ? "Selected"
-              : "Open in editor"
-            : "Read-only"}
-        </span>
-      </span>
-      <span
-        className={`layout-fallback-content align-${alignment} indent-${Math.min(
-          8,
-          Math.max(0, block.indent ?? 0),
-        )}`}
-      >
-        {block.element_type === "list_item" && (
-          <span className="editor-list-marker" aria-hidden="true">
-            {block.list_type === "ordered" ? "1." : "•"}
-          </span>
-        )}
-        <span>{inlineDelta(block.delta)}</span>
-      </span>
-      {!editable && block.unsupported_reason && (
-        <span className="layout-fallback-reason">
-          {block.unsupported_reason}
-        </span>
-      )}
-      {linkedContentExplanation(block) && (
-        <span className="layout-fallback-link-note">
-          {linkedContentExplanation(block)}
-        </span>
-      )}
-    </>
-  );
-
-  if (!editable) {
-    return (
-      <div
-        className={className}
-        aria-label={`Read-only ${block.element_type}: ${block.text}${
-          block.unsupported_reason ? `. ${block.unsupported_reason}` : ""
-        }`}
-        data-element-id={block.element_id}
-      >
-        {content}
-      </div>
-    );
-  }
-
-  return (
-    <button
-      type="button"
-      className={className}
-      aria-pressed={selected}
-      aria-label={`Open ${block.element_type.replaceAll("_", " ")} in editor: ${
-        block.text
-      }`}
-      title="Open in editor"
-      data-element-id={block.element_id}
-      onClick={() => onSelect(block)}
-    >
-      {content}
-    </button>
   );
 }
 
@@ -828,7 +614,6 @@ export default function DocumentExperience({
     useState<LoadingStatus>("idle");
   const [previewJob, setPreviewJob] =
     useState<PreviewRenderJobResponse | null>(null);
-  const [showLayoutStructure, setShowLayoutStructure] = useState(true);
   const [inlineSelection, setInlineSelection] =
     useState<LayoutSelectionIntent | null>(null);
   const [inlineCommand, setInlineCommand] =
@@ -899,15 +684,6 @@ export default function DocumentExperience({
     documentId: string;
     content: EditorContentResponse | null;
   } | null>(null);
-  const selectBlockRef = useRef<
-    (
-      block: EditorBlock,
-      skipDiscardConfirmation?: boolean,
-      remainInLayout?: boolean,
-      selection?: LayoutSelectionIntent | null,
-    ) => void
-  >(() => undefined);
-
   activeDocumentIdRef.current = document?.id ?? "";
   if (documentContextRef.current.documentId !== activeDocumentIdRef.current) {
     documentContextRef.current = {
@@ -1043,12 +819,10 @@ export default function DocumentExperience({
       layoutViewRef.current = cachedPreview ?? null;
       setLayoutView(cachedPreview ?? null);
       setLayoutStatus(cachedPreview ? "ready" : "idle");
-      setShowLayoutStructure(!cachedPreview);
     } else {
       layoutViewRef.current = null;
       setLayoutView(null);
       setLayoutStatus("idle");
-      setShowLayoutStructure(true);
     }
   }, [activeViewStateKey, activeVersionId, document?.id, documentSet.id]);
 
@@ -1647,7 +1421,6 @@ export default function DocumentExperience({
       layoutViewRef.current = response;
       setWorkspaceResource(resourceKey, response);
       setLayoutView(response);
-      setShowLayoutStructure(false);
       const renderStarted = performance.now();
       window.requestAnimationFrame(() => {
         console.info("docsync.preview_render_timing", {
@@ -1744,13 +1517,12 @@ export default function DocumentExperience({
       }
       const retainedPreview = layoutViewRef.current;
       setLayoutStatus(retainedPreview ? "ready" : "error");
-      setShowLayoutStructure(!retainedPreview);
       setLocalError(
         `${document.name}: ${errorMessage(
           error,
           retainedPreview
             ? "The preview refresh failed. The last working cached preview remains available."
-            : "Microsoft Word could not prepare the preview. The selectable Layout structure remains available.",
+            : "Microsoft Word could not prepare the preview. Close any open Word dialogue and retry.",
         )}`,
       );
     } finally {
@@ -1859,7 +1631,6 @@ export default function DocumentExperience({
       );
       setLayoutView(null);
       setLayoutStatus("idle");
-      setShowLayoutStructure(true);
       return;
     }
 
@@ -1928,7 +1699,6 @@ export default function DocumentExperience({
     setInlineSelection(remainInLayout ? selection : null);
 
     if (block.supported && !block.read_only) {
-      setShowLayoutStructure(selection ? false : true);
       setWorkspaceMode("layout");
     }
   }
@@ -1945,7 +1715,6 @@ export default function DocumentExperience({
       if (block.supported && !block.read_only) {
         setEditorResetToken((current) => current + 1);
         setInlineSelection(remainInLayout ? selection : null);
-        setShowLayoutStructure(selection ? false : true);
         setWorkspaceMode("layout");
       }
       return;
@@ -1965,12 +1734,6 @@ export default function DocumentExperience({
 
     activateSelectedBlock(block, remainInLayout, selection);
   }
-
-  selectBlockRef.current = selectBlock;
-  const handleBlockSelect = useCallback(
-    (block: EditorBlock) => selectBlockRef.current(block),
-    [],
-  );
 
   function confirmPendingBlockSelection() {
     const pending = pendingBlockSelection;
@@ -2679,7 +2442,6 @@ export default function DocumentExperience({
       setEditorResetToken((current) => current + 1);
       setLayoutView(null);
       setLayoutStatus("idle");
-      setShowLayoutStructure(true);
       setWorkspaceMode("layout");
       setRestoreNotice(
         `Version ${result.version.version_number} was created from Version ${result.restored_from_version_number}.`,
@@ -2862,17 +2624,15 @@ export default function DocumentExperience({
                 </span>
               </div>
             )}
-            {layoutStatus === "error" && !editorContent && (
+            {layoutStatus === "error" && !layoutView?.pdf_url && (
               <div className="editor-empty-state">
                 <strong>Layout preview unavailable</strong>
                 <p>
-                  Retry the Word preview after closing any Word dialogue. The
-                  selectable structure remains available in Layout.
+                  Retry the Word preview after closing any open Word dialogue.
                 </p>
               </div>
             )}
-            {layoutView?.pdf_url &&
-              !showLayoutStructure && (
+            {layoutView?.pdf_url && (
               <div className="layout-iframe-shell">
                 <WordPreviewOverlay
                   documentSetId={documentSet.id}
@@ -2896,60 +2656,10 @@ export default function DocumentExperience({
                   }
                   onDraftChange={handleDraftChange}
                   onExitInline={exitInlineEditing}
-                  onShowStructure={() => {
-                    setInlineSelection(null);
-                    setShowLayoutStructure(true);
-                  }}
                   onRetryPreview={() => void loadWordPreview(true)}
                 />
               </div>
             )}
-            {editorContent &&
-              mode === "layout" &&
-              (showLayoutStructure ||
-                !layoutView ||
-                (layoutStatus === "ready" &&
-                  layoutView &&
-                  !layoutView.pdf_url) ||
-                layoutStatus === "error") && (
-                <div className="layout-structured-fallback">
-                  <div className="render-notice">
-                    <strong>Selectable structure</strong>
-                    <span>
-                      {layoutStatus === "error"
-                        ? "The rendered layout could not be loaded. Supported elements below remain selectable in Layout."
-                        : "Supported elements remain mapped to stable Word blocks. Read-only Word structures remain protected."}
-                    </span>
-                  </div>
-                  {groupStructuredBlocks(editorContent.blocks).map((group) => (
-                    <section
-                      className={`structured-block-group ${group.region}`}
-                      aria-labelledby={`layout-group-${group.key.replaceAll(":", "-")}`}
-                      key={group.key}
-                    >
-                      <h3 id={`layout-group-${group.key.replaceAll(":", "-")}`}>
-                        {group.label}
-                      </h3>
-                      {group.blocks.map((block) => (
-                        <LayoutFallbackBlock
-                          block={block}
-                          selected={block.element_id === selectedElementId}
-                          onSelect={(selectedBlock) =>
-                            selectElementById(selectedBlock.element_id, {
-                              sourceVersionId:
-                                layoutView?.version_id ??
-                                editorContent.version_id,
-                              sourceLabel: "Layout element",
-                              remainInLayout: true,
-                            })
-                          }
-                          key={block.element_id}
-                        />
-                      ))}
-                    </section>
-                  ))}
-                </div>
-              )}
           </section>
 
         </div>
@@ -3018,8 +2728,8 @@ export default function DocumentExperience({
                   )}
                   {!inlineSelection && (
                     <p className="inline-editor-paused">
-                      Inline typing is paused. Activate the selected outline to
-                      place the cursor back in the paragraph.
+                      Inline typing is paused. Select a highlighted area in the
+                      Word preview to place the cursor in that block.
                     </p>
                   )}
                   <div

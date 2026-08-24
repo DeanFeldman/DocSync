@@ -24,35 +24,32 @@ test("v1.7 exposes section-aware header and footer Layout contracts", () => {
   assert.match(utils, /location\.linked_section_indexes/);
   assert.match(experience, /"Header" : "Footer"/);
   assert.match(experience, /`\$\{region\}.*Section \$\{item\.section_index \+ 1\}.*\$\{variant\}.*Paragraph/);
-  assert.match(
-    experience,
-    /This \$\{region\} is shared with sections \$\{sectionList\}/,
-  );
+  assert.doesNotMatch(experience, /linkedContentExplanation/);
 });
 
-test("header and footer blocks are grouped, button-selectable, and explain links", () => {
+test("header and footer blocks are button-selectable in the Word preview", () => {
   const experience = read("apps/web/src/DocumentExperience.tsx");
+  const overlay = read("apps/web/src/WordPreviewOverlay.tsx");
   const styles = read("apps/web/src/styles.css");
 
-  assert.match(experience, /function groupStructuredBlocks/);
-  assert.match(experience, /Document body/);
-  assert.match(experience, /function linkedContentExplanation/);
-  assert.match(experience, /<button[\s\S]*type="button"/);
-  assert.match(experience, /onClick=\{\(\) => onSelect\(block\)\}/);
+  assert.match(overlay, /element_type === "header_paragraph"/);
+  assert.match(overlay, /element_type === "footer_paragraph"/);
+  assert.match(overlay, /data-element-id=\{region\.element_id\}/);
+  assert.match(overlay, /onClick=\{\(event\) => pointerIntent\(region, event\)\}/);
   assert.match(experience, /setWorkspaceMode\("layout"\)/);
   assert.doesNotMatch(experience, /setWorkspaceMode\("edit"\)/);
-  assert.match(styles, /\.structured-block-group\.header/);
-  assert.match(styles, /\.structured-block-group\.footer/);
-  assert.match(styles, /:root\[data-theme="dark"\] \.structured-block-group/);
+  assert.doesNotMatch(experience, /groupStructuredBlocks|LayoutFallbackBlock/);
+  assert.doesNotMatch(styles, /structured-block-group|layout-fallback/);
 });
 
-test("header and footer editing keeps the existing one-paragraph Quill boundary", () => {
+test("header and footer editing supports soft line breaks within one Word block", () => {
   const editor = read("apps/web/src/InlineLayoutEditor.tsx");
   const experience = read("apps/web/src/DocumentExperience.tsx");
 
-  assert.match(editor, /docsyncInlineEnter:[\s\S]*handler: \(\) => false/);
-  assert.match(editor, /aria-multiline", "false"/);
-  assert.match(editor, /replace\(\/\\s\*\[\\r\\n\]\+\\s\*\/g, " "\)/);
+  assert.match(editor, /docsyncSoftLineBreak/);
+  assert.match(editor, /insertText\(range\.index, "\\n", "user"\)/);
+  assert.match(editor, /aria-multiline", "true"/);
+  assert.match(editor, /replace\(\/\\r\\n\?\/g, "\\n"\)/);
   assert.match(experience, /"header_paragraph"/);
   assert.match(experience, /"footer_paragraph"/);
   assert.match(experience, /disabled=\{\["table_paragraph", "header_paragraph", "footer_paragraph"\]/);

@@ -4,7 +4,7 @@
 [![Release](https://github.com/DeanFeldman/DocSync/actions/workflows/release.yml/badge.svg)](https://github.com/DeanFeldman/DocSync/actions/workflows/release.yml)
 [![Latest Release](https://img.shields.io/github/v/release/DeanFeldman/DocSync)](https://github.com/DeanFeldman/DocSync/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-Windows-0078D4)](#requirements)
-[![Version](https://img.shields.io/badge/version-1.11.0-blue)](#latest-release)
+[![Version](https://img.shields.io/badge/version-1.12.0-blue)](#latest-release)
 
 DocSync is a local-first Windows desktop application for safely coordinating edits across related Microsoft Word documents.
 
@@ -36,30 +36,30 @@ SHA256SUMS.txt
 
 ## Latest Release
 
-### Version 1.11.0
+### Version 1.12.0
 
-DocSync `v1.11.0` adds review-first workspace Find & Replace and durable batch
-editing on top of a direct OOXML text inventory.
+DocSync `v1.12.0` makes the rendered Word layout substantially more complete
+and adds safe editing for previously invisible blank form fields.
 
 The application now:
 
-- Finds every occurrence separately across logical Word text, including phrases
-  split across runs, hyperlinks, nested tables, headers/footers, notes, comments,
-  content controls, text boxes, tracked revisions, and DrawingML text.
-- Reports discovered protected text as read-only with a specific reason.
-- Maps logical search offsets back to exact OOXML nodes for fidelity-preserving
-  cross-run replacement.
-- Combines Find & Replace and reviewed rich-editor changes in one durable batch.
-- Detects overlaps, duplicate targets, protected ranges, and stale base versions
-  before generation.
-- Generates at most one new immutable version per affected document and commits
-  the complete batch transactionally.
-- Adds auditable batch history, progress, restart recovery, and combined review.
+- Maps numbered clauses, generated list markers, table-of-contents entries,
+  repeated legal wording, and paragraphs split across PDF pages more reliably.
+- Detects empty bordered table cells and blank signature/form underlines as real
+  selectable Word targets.
+- Allows text and soft line breaks inside supported empty, ordinary, and merged
+  top-level table cells while preserving the surrounding table structure.
+- Preserves multiline plain-text paste instead of flattening it into one line.
+- Removes the unhelpful `Select from structure` button and its synthetic layout
+  fallback; Layout now exposes only regions tied to the rendered Word document.
+- Adds an incremental, restart-safe schema migration for existing workspaces.
+  The migration preserves historical revision identities and avoids rebuilding
+  the complete version history during desktop startup.
 
 See:
 
-- [v1.11.0 release notes](docs/v1.11.0-release-notes.md)
-- [v1.11.0 manual test plan](docs/v1.11.0-manual-testing.md)
+- [v1.12.0 release notes](docs/v1.12.0-release-notes.md)
+- [v1.12.0 manual test plan](docs/v1.12.0-manual-testing.md)
 - [Batch editing and complete Word text inventory](docs/batch-find-replace-text-inventory.md)
 - [Measured batch performance](docs/evidence/v1.11.0-batch-find-replace-performance.md)
 
@@ -97,13 +97,15 @@ See [Batch editing and complete Word text inventory](docs/batch-find-replace-tex
 
 ### Word Layout Preview
 
-- Display structured content while the full Word preview loads.
 - Render high-fidelity Word layouts in the background.
 - Cache previews using immutable document versions.
 - Reuse previously generated previews.
 - Display document pages inside a scrollable workspace.
+- Resolve generated numbering, TOC decorations, repeated text, and cross-page
+  paragraphs with contextual PDF mapping.
+- Map blank bordered table cells and long signature/form underlines geometrically.
 - Continue using the application while rendering completes.
-- Fall back to structured content when Microsoft Word is unavailable.
+- Retry a failed Word preview without substituting a synthetic document layout.
 
 ### Controlled Editing
 
@@ -116,6 +118,8 @@ Supported content includes:
 - Ordered lists
 - Unordered lists
 - Top-level table paragraphs
+- Empty bordered table cells and mapped signature/form lines
+- Supported merged top-level table paragraphs
 - Header paragraphs
 - Footer paragraphs
 
@@ -128,6 +132,7 @@ Supported formatting includes:
 - Ordered and unordered lists
 - Indentation
 - Alignment
+- Soft line breaks within one Word paragraph or table cell
 
 Editing is intentionally restricted to operations that can be mapped safely back to the original Word document.
 
@@ -138,13 +143,16 @@ Reliable text regions can be selected directly from the Word layout.
 When a supported paragraph is selected:
 
 1. A controlled Quill editor opens over the selected content.
-2. The user edits the paragraph.
+2. The user edits the block, including multiline typing or plain-text paste.
 3. Matching wording is identified across the document set.
 4. The user chooses which documents should be updated.
 5. DocSync previews the complete result.
 6. New immutable document versions are generated.
 
 Low-confidence or ambiguous layout regions remain read-only.
+
+Pressing Enter creates a Word line break inside the selected block. It does not
+insert a new structural Word paragraph, table row, or table column.
 
 ### Compare Related Documents
 
@@ -305,7 +313,9 @@ schema migration 5 adds durable preview-render jobs. Schema migration 6 adds the
 durable structured/Word preview cache and stale-preview recovery metadata.
 Schema migration 7 adds a trigger-maintained SQLite FTS5 trigram index for
 current-version document search, with a safe substring fallback when FTS5 is
-not available in the embedded SQLite build.
+not available in the embedded SQLite build. Schema migration 8 adds durable
+reviewed edit batches. Schema migration 9 additively backfills empty table-field
+targets in current versions without deleting or recreating historical revisions.
 
 If migration fails, the active database is restored automatically and the
 startup dialog shows the workspace and recovery-backup paths. Do not move or
@@ -476,7 +486,7 @@ The release workflow runs when a tag beginning with `v` is pushed.
 Example:
 
 ```powershell
-$version = "1.11.0"
+$version = "1.12.0"
 
 git switch main
 git pull origin main
@@ -572,10 +582,13 @@ http://localhost:8001/docs
 - The PDF preview is a fixed visual snapshot and is not modified directly.
 - Final Word wrapping and pagination appear after generation and rerendering.
 - Low-confidence or ambiguous text mappings cannot be edited inline.
-- Direct editing is limited to reliably mapped paragraphs.
-- Adding, deleting, splitting, merging, or moving paragraphs is not supported.
-- Complex fields, drawings, text boxes, shapes, watermarks, and content controls remain read-only.
-- Nested tables and unsupported table structures remain read-only.
+- Layout editing is limited to reliably mapped Word blocks and blank fields.
+- Soft line breaks within one block are supported. Adding, deleting, splitting,
+  merging, or moving structural Word paragraphs, rows, or columns is not.
+- Complex fields, drawings, text boxes, shapes, watermarks, and content controls
+  remain read-only in Layout editing even when Find can discover their text.
+- Nested tables and table cells containing protected objects remain read-only in
+  Layout editing.
 - Authentication and multi-user collaboration are not included.
 - PostgreSQL, cloud storage, and document synchronisation are not included in the local desktop release.
 - The Windows installer is not commercially code-signed.
@@ -586,9 +599,8 @@ http://localhost:8001/docs
 
 Planned improvements include:
 
-- Batch multiple reviewed edits before generation
 - Support for additional complex Word structures
-- Find and replace
+- Structural paragraph and table row/column operations
 - Linux and macOS feasibility
 - Commercial code signing
 - Automatic update channels

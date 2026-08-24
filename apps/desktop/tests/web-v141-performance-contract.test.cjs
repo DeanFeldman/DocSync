@@ -71,7 +71,7 @@ test("Word preview auto-loads while near matching and version history remain laz
   );
   assert.match(experience, /"Updating preview/);
   assert.match(experience, /"Opening document/);
-  assert.match(experience, /showLayoutStructure \|\|[\s\S]*!layoutView/);
+  assert.match(experience, /\{layoutView\?\.pdf_url && \(/);
   assert.match(experience, /onToggle=\{\(event\) =>/);
   assert.match(experience, /setHistoryRequested\(true\)/);
   assert.match(
@@ -90,16 +90,16 @@ test("Word preview auto-loads while near matching and version history remain laz
   );
 });
 
-test("Layout fallback renders stable grouped blocks without the removed card list", () => {
+test("Layout uses controlled Word regions without a structure fallback", () => {
   const experience = read("apps/web/src/DocumentExperience.tsx");
+  const overlay = read("apps/web/src/WordPreviewOverlay.tsx");
 
-  assert.match(experience, /function LayoutFallbackBlock/);
-  assert.match(
+  assert.match(overlay, /data-element-id=\{region\.element_id\}/);
+  assert.match(experience, /selectElementById\(intent\.elementId/);
+  assert.doesNotMatch(
     experience,
-    /groupStructuredBlocks\(editorContent\.blocks\)\.map/,
+    /LayoutFallbackBlock|groupStructuredBlocks|showLayoutStructure/,
   );
-  assert.match(experience, /group\.blocks\.map\(\(block\) =>/);
-  assert.match(experience, /key=\{block\.element_id\}/);
   assert.doesNotMatch(experience, /const BlockCard = memo/);
   assert.doesNotMatch(experience, /INITIAL_VISIBLE_BLOCKS/);
 });

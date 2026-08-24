@@ -430,9 +430,13 @@ def _extract_paragraphs(
                     continue
                 seen_cells.add(cell_key)
 
-                for paragraph_index, paragraph in enumerate(cell.paragraphs):
+                cell_paragraphs = list(cell.paragraphs)
+                cell_has_text = any(
+                    paragraph.text.strip() for paragraph in cell_paragraphs
+                )
+                for paragraph_index, paragraph in enumerate(cell_paragraphs):
                     text = paragraph.text.strip()
-                    if not text:
+                    if not text and (cell_has_text or paragraph_index > 0):
                         continue
                     body_elements.append(
                         (
