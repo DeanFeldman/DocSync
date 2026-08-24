@@ -49,7 +49,9 @@ test("controlled preview publishes pages, overlays, zoom, and structure fallback
   assert.match(overlay, /IntersectionObserver/);
   assert.match(overlay, /ResizeObserver/);
   assert.match(overlay, /region\.x \* 100/);
-  assert.match(backend, /Publish controlled page images before contextual coordinate matching/);
+  assert.match(backend, /def _extract_pdf_structure/);
+  assert.match(backend, /def _render_pdf_page/);
+  assert.match(backend, /wait_for_render_map/);
   assert.match(backend, /Repeated PDF text could not be resolved safely/);
   assert.match(styles, /\.render-map-region\.interactive:hover/);
   assert.match(styles, /\.render-map-region\.read-only:hover/);

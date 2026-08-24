@@ -10,6 +10,7 @@ import json
 import logging
 import math
 from pathlib import Path
+from types import SimpleNamespace
 import re
 import shutil
 import threading
@@ -1118,6 +1119,57 @@ def initialise_original_version(
         )
         session.flush()
     return version
+
+
+def prepare_original_version_rows(
+    document_row: dict,
+    parsed_document: DocxDocument,
+    element_rows: list[dict],
+) -> tuple[dict, dict, list[dict]]:
+    """Prepare immutable initial-version mappings without ORM identity tracking."""
+
+    paragraphs = list(parsed_document.paragraphs)
+    tables = list(parsed_document.tables)
+    style_name_cache: dict[str | None, str | None] = {}
+    header_footer_parts = _header_footer_part_map(parsed_document)
+    created_at = document_row["created_at"]
+    version_row = {
+        "id": document_row["id"],
+        "document_id": document_row["id"],
+        "parent_version_id": None,
+        "generation_id": None,
+        "editor_operation_id": None,
+        "version_number": 1,
+        "storage_area": "originals",
+        "storage_name": document_row["stored_name"],
+        "download_name": document_row["original_name"],
+        "checksum_sha256": document_row["checksum_sha256"],
+        "created_at": created_at,
+    }
+    head_row = {
+        "document_id": document_row["id"],
+        "current_version_id": document_row["id"],
+        "revision": 1,
+        "updated_at": created_at,
+    }
+    revision_rows = []
+    for element_row in element_rows:
+        element = SimpleNamespace(**element_row)
+        revision_rows.append(
+            {
+                "version_id": document_row["id"],
+                "created_at": created_at,
+                **_revision_values(
+                    parsed_document,
+                    element,
+                    paragraphs=paragraphs,
+                    tables=tables,
+                    style_name_cache=style_name_cache,
+                    header_footer_parts=header_footer_parts,
+                ),
+            }
+        )
+    return version_row, head_row, revision_rows
 
 
 def _serialize_revision(

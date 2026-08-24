@@ -99,6 +99,7 @@ def main() -> None:
         f"sqlite:///{(args.data_dir / 'benchmark.db').as_posix()}"
     )
     os.environ["DOCUMENTSYNC_SESSION_TOKEN"] = ""
+    os.environ["DOCUMENTSYNC_WORD_WORKER_AUTOSTART"] = "0"
     api_directory = Path(__file__).resolve().parents[1]
     if str(api_directory) not in sys.path:
         sys.path.insert(0, str(api_directory))

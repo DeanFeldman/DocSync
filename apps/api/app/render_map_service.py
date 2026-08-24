@@ -24,8 +24,8 @@ from .models import DocumentBlockRevision, DocumentVersion
 
 logger = logging.getLogger(__name__)
 
-RENDER_MAP_SCHEMA_VERSION = 1
-RENDER_MAP_ENGINE = "docsync-contextual-pdf-map-v1"
+RENDER_MAP_SCHEMA_VERSION = 2
+RENDER_MAP_ENGINE = "docsync-contextual-pdf-map-v2-lazy-pages"
 WORD_RENDER_ENGINE = "Microsoft Word ExportAsFixedFormat PDF"
 TOKEN_PATTERN = re.compile(r"\w+", re.UNICODE)
 RENDER_ID_PATTERN = re.compile(r"^[a-f0-9]{24}$")
@@ -35,6 +35,8 @@ RENDER_MAP_EXECUTOR = ThreadPoolExecutor(
 )
 RENDER_MAP_LOCK = threading.RLock()
 ACTIVE_RENDER_MAPS: set[str] = set()
+RENDER_MAP_EVENTS: dict[str, threading.Event] = {}
+PAGE_RENDER_LOCKS = tuple(threading.Lock() for _ in range(32))
 
 
 @dataclass(frozen=True)
@@ -161,6 +163,7 @@ def _cache_matches(payload: dict | None, context: _RenderContext) -> bool:
         and payload.get("pdf_mtime_ns") == context.pdf_mtime_ns
         and payload.get("map_engine") == RENDER_MAP_ENGINE
         and payload.get("mapper_version") == pymupdf.__version__
+        and payload.get("render_dpi") == settings.render_map_dpi
     )
 
 
@@ -175,6 +178,7 @@ def _status_payload(context: _RenderContext, status: str, detail: str) -> dict:
         "map_engine": RENDER_MAP_ENGINE,
         "mapper": "PyMuPDF",
         "mapper_version": pymupdf.__version__,
+        "render_dpi": settings.render_map_dpi,
         "pdf_engine": WORD_RENDER_ENGINE,
         "coordinate_unit": "normalised",
         "source_sha256": context.source_sha256,
@@ -219,6 +223,7 @@ def request_render_map(session: Session, version_id: str) -> dict:
             "map_engine": RENDER_MAP_ENGINE,
             "mapper": "PyMuPDF",
             "mapper_version": pymupdf.__version__,
+            "render_dpi": settings.render_map_dpi,
             "pdf_engine": WORD_RENDER_ENGINE,
             "coordinate_unit": "normalised",
             "source_sha256": version.checksum_sha256,
@@ -242,6 +247,11 @@ def request_render_map(session: Session, version_id: str) -> dict:
         "partial",
         "failed",
     }:
+        with RENDER_MAP_LOCK:
+            RENDER_MAP_EVENTS.setdefault(
+                f"{context.document_set_id}:{context.version_id}",
+                threading.Event(),
+            ).set()
         return _public_payload(cached)
 
     key = f"{context.document_set_id}:{context.version_id}"
@@ -250,6 +260,7 @@ def request_render_map(session: Session, version_id: str) -> dict:
         if key in ACTIVE_RENDER_MAPS and _cache_matches(cached, context):
             return _public_payload(cached)
         ACTIVE_RENDER_MAPS.add(key)
+        RENDER_MAP_EVENTS.setdefault(key, threading.Event()).clear()
         queued = _status_payload(
             context,
             "queued",
@@ -258,6 +269,25 @@ def request_render_map(session: Session, version_id: str) -> dict:
         _write_cache(context.cache_path, queued)
         RENDER_MAP_EXECUTOR.submit(_generate_render_map, context, key)
     return _public_payload(queued)
+
+
+def wait_for_render_map(
+    session: Session,
+    version_id: str,
+    *,
+    timeout: float = 180,
+) -> dict:
+    """Wait without repeatedly querying or writing SQLite render-job state."""
+
+    payload = request_render_map(session, version_id)
+    if payload.get("status") in {"completed", "partial", "failed"}:
+        return payload
+    key = f"{payload.get('document_set_id')}:{version_id}"
+    with RENDER_MAP_LOCK:
+        completion = RENDER_MAP_EVENTS.setdefault(key, threading.Event())
+    completion.wait(timeout=max(0, timeout))
+    session.expire_all()
+    return request_render_map(session, version_id)
 
 
 def _candidate_context(block: dict, tokens: list[dict], start: int, end: int) -> bool:
@@ -500,14 +530,12 @@ def _regions_for_match(
     return regions
 
 
-def _extract_pdf(
+def _extract_pdf_structure(
     context: _RenderContext,
     render_id: str,
 ) -> tuple[list[dict], list[dict]]:
     pages: list[dict] = []
     tokens: list[dict] = []
-    page_directory = context.cache_path.parent / f"{context.version_id}.pages" / render_id
-    page_directory.mkdir(parents=True, exist_ok=True)
     with context.pdf_path.open("rb") as source:
         header = source.read(8)
         source.seek(max(0, context.pdf_size - 2048))
@@ -522,21 +550,12 @@ def _extract_pdf(
             raise ValueError(
                 f"The PDF has {pdf.page_count} pages; the safe limit is {settings.render_map_max_pages}."
             )
-        matrix = pymupdf.Matrix(settings.render_map_dpi / 72, settings.render_map_dpi / 72)
         for page_index, page in enumerate(pdf):
             page_number = page_index + 1
             width = float(page.rect.width)
             height = float(page.rect.height)
             if width <= 0 or height <= 0:
                 raise ValueError(f"PDF page {page_number} has invalid dimensions.")
-            pixmap = page.get_pixmap(matrix=matrix, alpha=False)
-            image_path = page_directory / f"page-{page_number}.png"
-            temporary_image = image_path.with_name(f"{image_path.name}.{uuid4().hex}.tmp")
-            try:
-                temporary_image.write_bytes(pixmap.tobytes("png"))
-                temporary_image.replace(image_path)
-            finally:
-                temporary_image.unlink(missing_ok=True)
             pages.append(
                 {
                     "page_id": f"{render_id}:{page_number}",
@@ -548,8 +567,8 @@ def _extract_pdf(
                     "coordinate_unit": "normalised",
                     "render_version": render_id,
                     "aspect_ratio": width / height,
-                    "image_width": pixmap.width,
-                    "image_height": pixmap.height,
+                    "image_width": round(width * settings.render_map_dpi / 72),
+                    "image_height": round(height * settings.render_map_dpi / 72),
                     "image_url": (
                         f"/api/document-versions/{context.version_id}/render-pages/"
                         f"{render_id}/{page_number}.png"
@@ -581,6 +600,76 @@ def _extract_pdf(
     return pages, tokens
 
 
+def _render_pdf_page(
+    context: _RenderContext,
+    render_id: str,
+    page_number: int,
+) -> Path:
+    page_directory = (
+        context.cache_path.parent / f"{context.version_id}.pages" / render_id
+    ).resolve()
+    image_path = (page_directory / f"page-{page_number}.png").resolve()
+    try:
+        image_path.relative_to(page_directory)
+    except ValueError as exc:
+        raise ValueError("The preview page path is invalid.") from exc
+    lock = PAGE_RENDER_LOCKS[hash(str(image_path)) % len(PAGE_RENDER_LOCKS)]
+    with lock:
+        if image_path.is_file() and image_path.stat().st_size > 0:
+            return image_path
+        pdf_stat = context.pdf_path.stat()
+        if (
+            pdf_stat.st_size != context.pdf_size
+            or pdf_stat.st_mtime_ns != context.pdf_mtime_ns
+        ):
+            raise ValueError("The immutable PDF identity changed during page rendering.")
+        started_at = perf_counter()
+        with pymupdf.open(context.pdf_path) as pdf:
+            if page_number < 1 or page_number > pdf.page_count:
+                raise ValueError("The preview page number is invalid.")
+            page = pdf.load_page(page_number - 1)
+            matrix = pymupdf.Matrix(
+                settings.render_map_dpi / 72,
+                settings.render_map_dpi / 72,
+            )
+            pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+            image_bytes = pixmap.tobytes("png")
+        page_directory.mkdir(parents=True, exist_ok=True)
+        temporary_image = image_path.with_name(
+            f"{image_path.name}.{uuid4().hex}.tmp"
+        )
+        try:
+            temporary_image.write_bytes(image_bytes)
+            temporary_image.replace(image_path)
+        finally:
+            temporary_image.unlink(missing_ok=True)
+        logger.info(
+            "docsync.render_page_timing version_id=%s render_id=%s page=%s "
+            "cache_hit=false duration_ms=%.2f",
+            context.version_id,
+            render_id,
+            page_number,
+            (perf_counter() - started_at) * 1000,
+        )
+        return image_path
+
+
+def _prefetch_initial_pages(
+    context: _RenderContext,
+    render_id: str,
+    page_count: int,
+) -> None:
+    for page_number in range(1, min(page_count, 2) + 1):
+        try:
+            _render_pdf_page(context, render_id, page_number)
+        except Exception:
+            logger.exception(
+                "docsync.render_page.prefetch_failed version_id=%s page=%s",
+                context.version_id,
+                page_number,
+            )
+
+
 def _generate_render_map(context: _RenderContext, key: str) -> None:
     total_started = perf_counter()
     processing = _status_payload(
@@ -607,8 +696,15 @@ def _generate_render_map(context: _RenderContext, key: str) -> None:
         )
         render_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
         stage_started = perf_counter()
-        pages, tokens = _extract_pdf(context, render_id)
-        image_and_text_extraction_ms = (perf_counter() - stage_started) * 1000
+        pages, tokens = _extract_pdf_structure(context, render_id)
+        text_extraction_ms = (perf_counter() - stage_started) * 1000
+        logger.info(
+            "docsync.render_map_text_extraction_timing version_id=%s pages=%s "
+            "duration_ms=%.2f",
+            context.version_id,
+            len(pages),
+            text_extraction_ms,
+        )
 
         # Publish controlled page images before contextual coordinate matching.
         progressive = {
@@ -663,15 +759,21 @@ def _generate_render_map(context: _RenderContext, key: str) -> None:
             "generated_at": _utc_now(),
         }
         _write_cache(context.cache_path, payload)
+        RENDER_MAP_EXECUTOR.submit(
+            _prefetch_initial_pages,
+            context,
+            render_id,
+            len(pages),
+        )
         logger.info(
             "docsync.render_map_timing version_id=%s pages=%s blocks=%s "
-            "pdf_read_ms=%.2f image_and_text_extraction_ms=%.2f "
+            "pdf_read_ms=%.2f text_extraction_ms=%.2f "
             "block_matching_ms=%.2f total_ms=%.2f",
             context.version_id,
             len(pages),
             len(context.blocks),
             pdf_read_ms,
-            image_and_text_extraction_ms,
+            text_extraction_ms,
             block_matching_ms,
             (perf_counter() - total_started) * 1000,
         )
@@ -691,6 +793,7 @@ def _generate_render_map(context: _RenderContext, key: str) -> None:
     finally:
         with RENDER_MAP_LOCK:
             ACTIVE_RENDER_MAPS.discard(key)
+            RENDER_MAP_EVENTS.setdefault(key, threading.Event()).set()
 
 
 def render_page_path(
@@ -717,18 +820,14 @@ def render_page_path(
     version = session.get(DocumentVersion, version_id)
     if version is None:
         raise HTTPException(status_code=404, detail="Document version not found.")
-    page_directory = (
-        settings.data_dir
-        / "renders"
-        / version.document.document_set_id
-        / f"{version.id}.pages"
-        / render_id
-    ).resolve()
-    path = (page_directory / f"page-{page_number}.png").resolve()
-    try:
-        path.relative_to(page_directory)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail="The preview page is unavailable.") from exc
-    if not path.is_file():
+    context = _context_for_version(version)
+    if context is None or not _cache_matches(_read_cache(context.cache_path), context):
         raise HTTPException(status_code=404, detail="The preview page is unavailable.")
+    try:
+        path = _render_pdf_page(context, render_id, page_number)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(
+            status_code=404,
+            detail="The preview page is unavailable.",
+        ) from exc
     return path

@@ -96,6 +96,7 @@ def main() -> int:
         os.environ["DOCUMENTSYNC_DATABASE_URL"] = (
             f"sqlite:///{benchmark_root / 'benchmark.db'}"
         )
+        os.environ["DOCUMENTSYNC_WORD_WORKER_AUTOSTART"] = "0"
 
         selected_api_dir = args.api_dir.resolve()
         if str(selected_api_dir) not in sys.path:

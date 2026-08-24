@@ -4,7 +4,7 @@
 [![Release](https://github.com/DeanFeldman/DocSync/actions/workflows/release.yml/badge.svg)](https://github.com/DeanFeldman/DocSync/actions/workflows/release.yml)
 [![Latest Release](https://img.shields.io/github/v/release/DeanFeldman/DocSync)](https://github.com/DeanFeldman/DocSync/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-Windows-0078D4)](#requirements)
-[![Version](https://img.shields.io/badge/version-1.9.0-blue)](#latest-release)
+[![Version](https://img.shields.io/badge/version-1.10.0-blue)](#latest-release)
 
 DocSync is a local-first Windows desktop application for safely coordinating edits across related Microsoft Word documents.
 
@@ -36,28 +36,28 @@ SHA256SUMS.txt
 
 ## Latest Release
 
-### Version 1.9.0
+### Version 1.10.0
 
-DocSync `v1.9.0` improves the speed of opening large Word documents and generating new versions.
+DocSync `v1.10.0` substantially reduces workspace-ingestion, exact-match,
+search, preview, and desktop-startup overhead while preserving immutable document
+history and Word fidelity.
 
 The application now:
 
-- Checks memory and SQLite preview caches before rebuilding previews.
-- Displays structured content while the high-fidelity Word preview refreshes.
-- Keeps stale cached previews usable during a refresh.
-- Avoids repeated DOCX parsing and indexing during generation.
-- Retains stable block identities.
-- Rebuilds only changed exact-match groups.
-- Batches database writes.
-- Avoids recompressing files that are already compressed.
-- Loads Quill only when an editable region is selected.
-- Keeps document and sidebar scrolling inside the workspace.
-- Shows processing progress and actionable errors inline.
+- Reuses one serial Microsoft Word process for high-fidelity PDF exports.
+- Extracts PDF structure without rasterizing every page up front.
+- Renders immutable page images lazily and safely reuses the cache.
+- Coordinates preview jobs through events instead of database polling.
+- Persists workspace rows in batches and groups exact matches in SQL.
+- Uses a trigger-maintained FTS5 index for current-version search, with fallback.
+- Starts development services directly without rebuilding production assets.
+- Ships a 98.98% smaller lossless logo asset.
+- Reduces the measured workspace-ingestion median from 5.78 seconds to 1.36 seconds.
 
 See:
 
-- [v1.9.0 release notes](docs/v1.9.0-release-notes.md)
-- [v1.9.0 manual test plan](docs/v1.9.0-manual-testing.md)
+- [v1.10.0 release notes](docs/v1.10.0-release-notes.md)
+- [v1.10.0 manual test plan](docs/v1.10.0-manual-testing.md)
 - [Performance optimisation report](docs/performance-optimisation-2026-08.md)
 
 ---
@@ -270,6 +270,31 @@ Important environment variables include:
 
 DocSync uses SQLite by default. No external database server or API key is required for the local desktop version.
 
+See [`.env.example`](.env.example) for a local development template.
+
+Existing workspaces are upgraded by ordered, one-time schema migrations when the
+backend starts. Before an older database is modified, DocSync stores and verifies
+a timestamped backup under `workspace/migration-backups`; the five newest
+backups are retained. A current workspace skips completed migrations and does
+not rerun the version/block-revision backfill. No manual migration command is
+normally required.
+
+Schema migration 2 introduced paragraph-level table mappings, schema migration
+3 added durable background-job progress fields, schema migration 4 reparses all
+immutable versions to add deduplicated, section-aware header/footer blocks, and
+schema migration 5 adds durable preview-render jobs. Schema migration 6 adds the
+durable structured/Word preview cache and stale-preview recovery metadata.
+Schema migration 7 adds a trigger-maintained SQLite FTS5 trigram index for
+current-version document search, with a safe substring fallback when FTS5 is
+not available in the embedded SQLite build.
+
+If migration fails, the active database is restored automatically and the
+startup dialog shows the workspace and recovery-backup paths. Do not move or
+delete the workspace. Close DocSync before any manual restore, preserve the
+active `documentsync.db`, then copy the support-selected backup into place as
+`documentsync.db`. See the
+[v1.4.2 recovery notes](docs/v1.4.2-release-notes.md#manual-recovery).
+
 ---
 
 ## Run Locally
@@ -284,10 +309,23 @@ npm.cmd install
 python -m pip install -r apps/api/requirements.txt
 
 npm.cmd test
+npm.cmd run build:web
 npm.cmd start
 ```
 
-`npm.cmd start` builds the React frontend and opens DocSync in an Electron window.
+`npm.cmd start` launches the already-built React frontend, starts the local
+FastAPI service, and opens DocSync in an Electron window. It intentionally does
+not rebuild production assets on every launch.
+
+For the live development stack (Vite hot reload, FastAPI, and Electron), run:
+
+```powershell
+npm.cmd run dev
+```
+
+The development command uses the ignored `.artifacts/dev-workspace` directory
+unless `DOCUMENTSYNC_DATA_DIR` is explicitly set. Production builds remain
+available through `npm.cmd run build:web` or `npm.cmd run build:desktop`.
 
 ### PowerShell Execution-Policy Error
 
@@ -419,7 +457,7 @@ The release workflow runs when a tag beginning with `v` is pushed.
 Example:
 
 ```powershell
-$version = "1.9.0"
+$version = "1.10.0"
 
 git switch main
 git pull origin main
