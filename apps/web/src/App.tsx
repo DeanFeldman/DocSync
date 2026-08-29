@@ -41,9 +41,11 @@ import {
 } from "./workspaceResources";
 import {
   applyTheme,
-  initialTheme,
-  persistTheme,
+  initialThemePreference,
+  persistThemePreference,
+  resolveTheme,
   type AppTheme,
+  type ThemePreference,
 } from "./theme";
 
 type BusyAction =
@@ -60,6 +62,7 @@ type CreationStage =
   | "editor-preparation"
   | "workspace"
   | null;
+type WorkspacePanel = "find" | "pending" | null;
 
 type NewerVersionNotice = {
   document: DocumentSummary;
@@ -132,7 +135,8 @@ function readableDate(value: string): string {
 }
 
 function App() {
-  const [theme, setTheme] = useState<AppTheme>(() => initialTheme());
+  const [themePreference, setThemePreference] = useState<ThemePreference>(() => initialThemePreference());
+  const [theme, setTheme] = useState<AppTheme>(() => resolveTheme(initialThemePreference()));
 const [setName, setSetName] = useState("");
 const [setNameTouched, setSetNameTouched] = useState(false);
   const [files, setFiles] = useState<File[]>([]);
@@ -161,6 +165,8 @@ const [setNameTouched, setSetNameTouched] = useState(false);
   const [creationStage, setCreationStage] = useState<CreationStage>(null);
   const [error, setError] = useState("");
   const [editorDirty, setEditorDirty] = useState(false);
+  const [workspacePanel, setWorkspacePanel] = useState<WorkspacePanel>(null);
+  const [pendingChangeCount, setPendingChangeCount] = useState(0);
   const [generationJobs, setGenerationJobs] = useState<
     EditorGenerationResponse[]
   >([]);
@@ -183,15 +189,22 @@ const [setNameTouched, setSetNameTouched] = useState(false);
   }, [theme]);
 
   useEffect(() => {
+    const updateTheme = () => setTheme(resolveTheme(themePreference));
+    updateTheme();
+    if (themePreference !== "system") return;
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    media.addEventListener("change", updateTheme);
+    return () => media.removeEventListener("change", updateTheme);
+  }, [themePreference]);
+
+  useEffect(() => {
     document.body.classList.toggle("workspace-open", Boolean(documentSet));
     return () => document.body.classList.remove("workspace-open");
   }, [documentSet?.id]);
 
-  function toggleTheme() {
-    const nextTheme: AppTheme = theme === "dark" ? "light" : "dark";
-    applyTheme(nextTheme);
-    persistTheme(nextTheme);
-    setTheme(nextTheme);
+  function selectThemePreference(preference: ThemePreference) {
+    persistThemePreference(preference);
+    setThemePreference(preference);
   }
 
   const filteredSavedSets = useMemo(() => {
@@ -507,14 +520,6 @@ const [setNameTouched, setSetNameTouched] = useState(false);
   }
 
   function openNewerVersion(notice: NewerVersionNotice) {
-    if (
-      editorDirty &&
-      !window.confirm(
-        "Open the new version and discard the current uncommitted draft?",
-      )
-    ) {
-      return;
-    }
     setDocumentSet((current) =>
       current
         ? {
@@ -535,13 +540,6 @@ const [setNameTouched, setSetNameTouched] = useState(false);
   }
 
   function resetWorkspace(updateHistory = true) {
-    if (
-      updateHistory &&
-      editorDirty &&
-      !window.confirm("Leave this workspace and discard the current editor draft?")
-    ) {
-      return;
-    }
     if (editorDirty && documentSet && activeDocumentId) {
       clearWorkspaceViewStateForDocument(
         documentSet.id,
@@ -808,14 +806,7 @@ async function handleUpload(event: FormEvent) {
     document: DocumentSummary,
     searchResult: GlobalSearchResult | null = null,
   ) {
-    const hasDraft = editorDirty;
-    if (
-      hasDraft &&
-      !window.confirm("Switch documents and discard the uncommitted editor draft?")
-    ) {
-      return;
-    }
-    if (hasDraft && documentSet && activeDocumentId) {
+    if (editorDirty && documentSet && activeDocumentId) {
       clearWorkspaceViewStateForDocument(
         documentSet.id,
         activeDocumentId,
@@ -912,19 +903,17 @@ const canUpload = files.length >= 2 && !busyAction;
           >
             v{__DOCSYNC_VERSION__}
           </span>
-          <button
-            type="button"
-            className="theme-toggle"
-            onClick={toggleTheme}
-            aria-pressed={theme === "dark"}
-            aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
-            title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
-          >
-            <span className="theme-toggle-icon" aria-hidden="true">
-              {theme === "dark" ? "☀" : "☾"}
-            </span>
-            <span>{theme === "dark" ? "Light" : "Dark"}</span>
-          </button>
+          <details className="theme-selector">
+            <summary aria-label="Choose appearance"><span className="theme-toggle-icon" aria-hidden="true">{themePreference === "dark" ? "☾" : themePreference === "light" ? "☀" : "▣"}</span> Appearance</summary>
+            <div className="theme-selector-menu" role="menu" aria-label="Appearance">
+              <strong>Appearance</strong>
+              {(["system", "light", "dark"] as ThemePreference[]).map((preference) => (
+                <button key={preference} type="button" className={themePreference === preference ? "selected" : ""} onClick={() => selectThemePreference(preference)} role="menuitemradio" aria-checked={themePreference === preference}>
+                  {themePreference === preference ? "✓ " : ""}{preference === "system" ? "System" : preference[0].toUpperCase() + preference.slice(1)}
+                </button>
+              ))}
+            </div>
+          </details>
           {documentSet && (
             <button type="button" className="quiet-button" onClick={() => resetWorkspace()}>
               Home
@@ -1262,9 +1251,12 @@ const canUpload = files.length >= 2 && !busyAction;
                 )}
               </div>
 
+              <button type="button" className="toolbar-button" onClick={() => setWorkspacePanel("find")}>Find &amp; Replace</button>
+              <button type="button" className="toolbar-button pending-batch-button" onClick={() => setWorkspacePanel("pending")}>Pending changes <strong>{pendingChangeCount}</strong></button>
+
               <div className="set-summary">
-                <strong>{documentSet.documents.length}</strong><span>documents</span>
-                <strong>{documentSet.link_group_count ?? documentSet.link_groups.length}</strong><span>exact groups</span>
+                <strong>{documentSet.documents.length}</strong><span>docs ·</span>
+                <strong>{documentSet.link_group_count ?? documentSet.link_groups.length}</strong><span>groups</span>
               </div>
 
               <button
@@ -1294,6 +1286,9 @@ const canUpload = files.length >= 2 && !busyAction;
           <FindReplacePanel
             documentSet={documentSet}
             activeDocumentId={activeDocumentId}
+            panel={workspacePanel}
+            onPanelChange={setWorkspacePanel}
+            onPendingCountChange={setPendingChangeCount}
             onGenerationQueued={handleGenerationQueued}
             onOpenOccurrence={(occurrence: FindReplaceOccurrence) => {
               const target = documentSet.documents.find(

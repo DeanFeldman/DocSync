@@ -37,6 +37,13 @@ export interface LayoutSelectionIntent {
   requestId: number;
 }
 
+export interface PendingLayoutOverride {
+  replacementText: string;
+  operationId: string;
+  locationCount: number;
+  documentCount: number;
+}
+
 interface WordPreviewOverlayProps {
   documentSetId: string;
   documentName: string;
@@ -45,6 +52,7 @@ interface WordPreviewOverlayProps {
   selectedElementId: string;
   selectedBlock: EditorBlock | null;
   draft: QuillDraft | null;
+  pendingOverridesByElementId: Record<string, PendingLayoutOverride>;
   editorResetToken: number;
   inlineSelection: LayoutSelectionIntent | null;
   inlineCommand: InlineEditorCommand | null;
@@ -89,6 +97,7 @@ interface MapPageProps {
   selectedElementId: string;
   selectedBlock: EditorBlock | null;
   draft: QuillDraft | null;
+  pendingOverridesByElementId: Record<string, PendingLayoutOverride>;
   editorResetToken: number;
   inlineSelection: LayoutSelectionIntent | null;
   inlineCommand: InlineEditorCommand | null;
@@ -133,6 +142,7 @@ function MapPage({
   selectedElementId,
   selectedBlock,
   draft,
+  pendingOverridesByElementId,
   editorResetToken,
   inlineSelection,
   inlineCommand,
@@ -178,6 +188,31 @@ function MapPage({
     );
     return { left, top, width: right - left, height: bottom - top };
   }, [selectedRegions]);
+  const pendingOverlays = useMemo(() => {
+    const grouped = new Map<string, RenderMapRegion[]>();
+    for (const region of regions) {
+      if (!pendingOverridesByElementId[region.element_id]) continue;
+      const entries = grouped.get(region.element_id) ?? [];
+      entries.push(region);
+      grouped.set(region.element_id, entries);
+    }
+    return Array.from(grouped, ([elementId, entries]) => {
+      const ordered = entries.sort((left, right) => left.y - right.y || left.x - right.x);
+      const left = Math.min(...ordered.map((region) => region.x));
+      const top = Math.min(...ordered.map((region) => region.y));
+      const right = Math.max(...ordered.map((region) => region.x + region.width));
+      const bottom = Math.max(...ordered.map((region) => region.y + region.height));
+      return {
+        elementId,
+        region: ordered[0],
+        override: pendingOverridesByElementId[elementId],
+        left,
+        top,
+        width: right - left,
+        height: bottom - top,
+      };
+    });
+  }, [pendingOverridesByElementId, regions]);
 
   function pointerIntent(region: RenderMapRegion, event: MouseEvent<HTMLButtonElement>) {
     if (!region.interactive) return;
@@ -277,6 +312,29 @@ function MapPage({
                 onKeyDown={(event) => keyboardIntent(region, event)}
               />
             ))}
+            {pendingOverlays.map(
+              (overlay) =>
+                !(showInlineEditor && overlay.elementId === selectedElementId) && (
+                  <button
+                    type="button"
+                    key={`pending:${overlay.override.operationId}:${overlay.elementId}`}
+                    className="render-map-pending-overlay"
+                    data-element-id={overlay.elementId}
+                    style={{
+                      left: `${overlay.left * 100}%`,
+                      top: `${overlay.top * 100}%`,
+                      width: `${overlay.width * 100}%`,
+                      minHeight: `${overlay.height * 100}%`,
+                    }}
+                    aria-label={`Pending change: ${overlay.override.replacementText}. Click to edit.`}
+                    onClick={(event) => pointerIntent(overlay.region, event)}
+                    onKeyDown={(event) => keyboardIntent(overlay.region, event)}
+                  >
+                    <span>{overlay.override.replacementText}</span>
+                    <small>Pending</small>
+                  </button>
+                ),
+            )}
             {showInlineEditor && inlineBounds && selectedBlock && draft && (
               <div
                 className="render-map-inline-layer"
@@ -318,6 +376,7 @@ export default function WordPreviewOverlay({
   selectedElementId,
   selectedBlock,
   draft,
+  pendingOverridesByElementId,
   editorResetToken,
   inlineSelection,
   inlineCommand,
@@ -514,6 +573,7 @@ export default function WordPreviewOverlay({
               selectedElementId={selectedElementId}
               selectedBlock={selectedBlock}
               draft={draft}
+              pendingOverridesByElementId={pendingOverridesByElementId}
               editorResetToken={editorResetToken}
               inlineSelection={inlineSelection}
               inlineCommand={inlineCommand}

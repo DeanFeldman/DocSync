@@ -8,6 +8,8 @@ import sys
 import time
 
 from docx import Document
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 import pymupdf
@@ -126,6 +128,30 @@ def write_signature_line_pdf(path: Path) -> None:
     page.draw_line((160, 126), (460, 126), width=0.8)
     pdf.save(path)
     pdf.close()
+
+
+def write_stacked_body_form_lines_pdf(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pdf = pymupdf.open()
+    page = pdf.new_page(width=612, height=792)
+    page.insert_text((72, 120), "and", fontsize=11)
+    page.draw_line((72, 145), (420, 145), width=0.8)
+    page.draw_line((72, 170), (190, 170), width=0.8)
+    page.insert_text((72, 205), "on 2026", fontsize=11)
+    pdf.save(path)
+    pdf.close()
+
+
+def add_bottom_border(paragraph) -> None:
+    properties = paragraph._p.get_or_add_pPr()
+    borders = OxmlElement("w:pBdr")
+    bottom = OxmlElement("w:bottom")
+    bottom.set(qn("w:val"), "single")
+    bottom.set(qn("w:sz"), "4")
+    bottom.set(qn("w:space"), "1")
+    bottom.set(qn("w:color"), "000000")
+    borders.append(bottom)
+    properties.append(borders)
 
 
 def poll_job(client: TestClient, job_id: str, timeout: float = 8) -> dict:
@@ -617,6 +643,69 @@ def test_signature_line_maps_once_to_the_rightmost_empty_word_cell(
         assert mapped["mapped_element_count"] == 2
         assert len(empty_regions) == 1
         assert empty_regions[0]["location"]["column_index"] == 2
+
+
+def test_render_map_maps_distinct_bordered_body_form_lines_below_a_label(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    document = Document()
+    document.add_paragraph("and")
+    first = document.add_paragraph("")
+    second = document.add_paragraph("")
+    add_bottom_border(first)
+    add_bottom_border(second)
+    document.add_paragraph("on 2026")
+    stream = io.BytesIO()
+    document.save(stream)
+
+    app = load_test_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        workspace, primary = upload(client, stream.getvalue())
+        version_id = primary["version_id"]
+        pdf_path = tmp_path / "data" / "renders" / workspace["id"] / f"{version_id}.pdf"
+        write_stacked_body_form_lines_pdf(pdf_path)
+
+        mapped = poll_map(client, version_id)
+        empty_regions = [
+            region
+            for region in mapped["regions"]
+            if region["text_preview"] == ""
+        ]
+        assert len(empty_regions) == 2
+        assert {region["mapping_method"] for region in empty_regions} == {
+            "word_pdf_empty_body_form_line"
+        }
+        assert len({region["element_id"] for region in empty_regions}) == 2
+        assert len({(region["x"], region["y"], region["width"]) for region in empty_regions}) == 2
+        assert all(region["interactive"] for region in empty_regions)
+        assert mapped["mapping_diagnostics"] == {
+            "detected_horizontal_line_count": 2,
+            "blank_form_candidate_count": 2,
+            "matched_form_line_count": 2,
+        }
+
+
+def test_render_map_does_not_create_a_target_for_an_unformatted_blank_body_paragraph(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    document = Document()
+    document.add_paragraph("and")
+    document.add_paragraph("")
+    document.add_paragraph("on 2026")
+    stream = io.BytesIO()
+    document.save(stream)
+
+    app = load_test_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        workspace, primary = upload(client, stream.getvalue())
+        version_id = primary["version_id"]
+        pdf_path = tmp_path / "data" / "renders" / workspace["id"] / f"{version_id}.pdf"
+        write_stacked_body_form_lines_pdf(pdf_path)
+
+        mapped = poll_map(client, version_id)
+        assert all(region["text_preview"] for region in mapped["regions"])
 
 
 def test_later_pdf_pages_render_only_on_demand_and_reuse_cache(

@@ -1,4 +1,5 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
+import { wordDifferenceSpans } from "./editorUtils";
 
 import {
   addEditBatchOperation,
@@ -30,6 +31,9 @@ export const BATCH_UPDATED_EVENT = "docsync:batch-updated";
 interface FindReplacePanelProps {
   documentSet: DocumentSetResponse;
   activeDocumentId: string;
+  panel: "find" | "pending" | null;
+  onPanelChange: (panel: "find" | "pending" | null) => void;
+  onPendingCountChange: (count: number) => void;
   onGenerationQueued: (job: EditorGenerationResponse) => void;
   onOpenOccurrence: (occurrence: FindReplaceOccurrence) => void;
 }
@@ -89,16 +93,20 @@ function operationInput(
 export default function FindReplacePanel({
   documentSet,
   activeDocumentId,
+  panel,
+  onPanelChange,
+  onPendingCountChange,
   onGenerationQueued,
   onOpenOccurrence,
 }: FindReplacePanelProps) {
-  const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [replacement, setReplacement] = useState("");
   const [matchCase, setMatchCase] = useState(false);
   const [wholeWord, setWholeWord] = useState(false);
   const [includeComments, setIncludeComments] = useState(false);
   const [includeTracked, setIncludeTracked] = useState(false);
+  const [scope, setScope] = useState<"all" | "current" | "selected">("all");
+  const [moreOptionsOpen, setMoreOptionsOpen] = useState(false);
   const [selectedDocuments, setSelectedDocuments] = useState<Set<string>>(
     () => new Set(documentSet.documents.map((item) => item.id)),
   );
@@ -106,6 +114,7 @@ export default function FindReplacePanel({
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [batch, setBatch] = useState<EditBatch | null>(null);
   const [preview, setPreview] = useState<EditBatchPreview | null>(null);
+  const [previewOpen, setPreviewOpen] = useState(false);
   const [replacementDrafts, setReplacementDrafts] = useState<Record<string, string>>({});
   const [action, setAction] = useState("");
   const [error, setError] = useState("");
@@ -125,6 +134,8 @@ export default function FindReplacePanel({
     setPreview(null);
     void refreshBatch();
   }, [documentSet.id]);
+
+  useEffect(() => onPendingCountChange(batch?.operation_count ?? 0), [batch?.operation_count, onPendingCountChange]);
 
   useEffect(() => {
     const refresh = () => void refreshBatch();
@@ -147,10 +158,9 @@ export default function FindReplacePanel({
   ).length;
 
   function searchOptions(): FindReplaceSearchOptions {
-    const allSelected = selectedDocuments.size === documentSet.documents.length;
     return {
       query,
-      document_ids: allSelected ? undefined : Array.from(selectedDocuments),
+      document_ids: scope === "all" ? undefined : Array.from(selectedDocuments),
       match_case: matchCase,
       whole_word: wholeWord,
       include_comments: includeComments,
@@ -305,7 +315,9 @@ export default function FindReplacePanel({
     setAction("preview");
     setError("");
     try {
-      setPreview(await previewEditBatch(batch.id));
+      const response = await previewEditBatch(batch.id);
+      setPreview(response);
+      setPreviewOpen(true);
     } catch (caught) {
       setError(message(caught));
     } finally {
@@ -322,7 +334,8 @@ export default function FindReplacePanel({
       onGenerationQueued(queued);
       setBatch(null);
       setPreview(null);
-      setOpen(false);
+      setPreviewOpen(false);
+      onPanelChange(null);
       window.dispatchEvent(new Event(BATCH_UPDATED_EVENT));
     } catch (caught) {
       setError(message(caught));
@@ -332,24 +345,16 @@ export default function FindReplacePanel({
   }
 
   return (
-    <section className={`find-replace-panel ${open ? "open" : ""}`}>
-      <div className="find-replace-launcher">
-        <button type="button" onClick={() => setOpen((value) => !value)}>
-          Find &amp; Replace
-        </button>
-        <button type="button" className="pending-batch-button" onClick={() => setOpen(true)}>
-          Pending changes <strong>{batch?.operation_count ?? 0}</strong>
-        </button>
-      </div>
+    <section className={`find-replace-panel ${panel ? "open" : ""} ${panel ?? ""}`}>
 
-      {open && (
+      {panel && (
         <div className="find-replace-workspace" aria-label="Find and replace across document set">
           <header>
             <div>
-              <p className="eyebrow">Complete text inventory</p>
-              <h2>Find &amp; Replace</h2>
+              {panel === "find" && <p className="eyebrow">Complete text inventory</p>}
+              <h2>{panel === "find" ? "Find & Replace" : "Pending changes"}</h2>
             </div>
-            <button type="button" className="quiet-button" onClick={() => setOpen(false)}>
+            <button type="button" className="quiet-button" onClick={() => onPanelChange(null)}>
               Close
             </button>
           </header>
@@ -369,27 +374,28 @@ export default function FindReplacePanel({
               <legend>Match options</legend>
               <label><input type="checkbox" checked={matchCase} onChange={(event) => setMatchCase(event.target.checked)} /> Match case</label>
               <label><input type="checkbox" checked={wholeWord} onChange={(event) => setWholeWord(event.target.checked)} /> Whole word</label>
-              <label><input type="checkbox" checked={includeComments} onChange={(event) => setIncludeComments(event.target.checked)} /> Include comments</label>
-              <label><input type="checkbox" checked={includeTracked} onChange={(event) => setIncludeTracked(event.target.checked)} /> Include tracked deletions</label>
             </fieldset>
+            <button type="button" className="more-options-button" onClick={() => setMoreOptionsOpen((open) => !open)}>More options {moreOptionsOpen ? "▴" : "▾"}</button>
+            {moreOptionsOpen && <div className="find-replace-more-options"><label><input type="checkbox" checked={includeComments} onChange={(event) => setIncludeComments(event.target.checked)} /> Include comments</label><label><input type="checkbox" checked={includeTracked} onChange={(event) => setIncludeTracked(event.target.checked)} /> Include tracked deletions</label></div>}
             <fieldset className="find-replace-scope">
               <legend>Document scope</legend>
               <div className="find-replace-scope-shortcuts">
-                <button
+                <button className={scope === "all" ? "active" : ""}
                   type="button"
-                  onClick={() => setSelectedDocuments(new Set(documentSet.documents.map((item) => item.id)))}
+                  onClick={() => { setScope("all"); setSelectedDocuments(new Set(documentSet.documents.map((item) => item.id))); }}
                 >
                   All documents
                 </button>
-                <button
+                <button className={scope === "current" ? "active" : ""}
                   type="button"
-                  onClick={() => setSelectedDocuments(new Set(activeDocumentId ? [activeDocumentId] : []))}
+                  onClick={() => { setScope("current"); setSelectedDocuments(new Set(activeDocumentId ? [activeDocumentId] : [])); }}
                   disabled={!activeDocumentId}
                 >
                   Current document
                 </button>
+                <button className={scope === "selected" ? "active" : ""} type="button" onClick={() => setScope("selected")}>Selected documents</button>
               </div>
-              {documentSet.documents.map((document) => (
+              {scope === "selected" && documentSet.documents.map((document) => (
                 <label key={document.id}>
                   <input
                     type="checkbox"
@@ -469,7 +475,7 @@ export default function FindReplacePanel({
 
           <section className="pending-batch" aria-label="Pending changes batch">
             <header>
-              <div><p className="eyebrow">Durable batch</p><h2>Pending changes</h2></div>
+              <div><p>{batch?.operation_count ?? 0} operations · {batch?.operations.reduce((total, operation) => total + (operation.occurrence_count || operation.editor_request?.targets.length || 0), 0) ?? 0} locations · {batch?.affected_document_count ?? 0} documents</p></div>
               {batch && <button type="button" className="quiet-button" onClick={() => void handleClear()} disabled={Boolean(action)}>Clear batch</button>}
             </header>
             {!batch || batch.operations.length === 0 ? (
@@ -517,20 +523,23 @@ export default function FindReplacePanel({
                   ))}
                 </div>
                 <div className="pending-batch-actions">
-                  <button type="button" onClick={() => void handlePreviewBatch()} disabled={Boolean(action)}>Preview all</button>
-                  <button type="button" className="generate-version-button" onClick={() => void handleApplyBatch()} disabled={preview?.status !== "ready" || Boolean(action)}>
-                    {action === "apply" ? "Submitting batch…" : "Apply batch"}
-                  </button>
+                  <button type="button" className="primary-button" onClick={() => void handlePreviewBatch()} disabled={Boolean(action)}>Preview all changes</button>
                 </div>
-                {preview && (
-                  <div className={`batch-preview-summary ${preview.status}`} role="status">
-                    <strong>{preview.status === "ready" ? "Batch ready" : `${preview.conflict_count} conflicts need attention`}</strong>
-                    <span>{preview.affected_location_count} locations across {preview.affected_document_count} documents; one new version per document.</span>
-                    {preview.conflicts.map((item, index) => <em key={`${item.code}-${index}`}>{item.message}</em>)}
-                  </div>
-                )}
               </>
             )}
+          </section>
+        </div>
+      )}
+      {preview && previewOpen && (
+        <div className="modal-backdrop batch-diff-backdrop" role="presentation">
+          <section className="preview-dialog batch-diff-preview" role="dialog" aria-modal="true" aria-labelledby="batch-diff-title">
+            <header className="preview-dialog-header"><div><p className="eyebrow">Pending changes</p><h2 id="batch-diff-title">Review every proposed change</h2><p>{preview.affected_location_count} locations across {preview.affected_document_count} documents</p></div><button type="button" className="dialog-close" onClick={() => setPreviewOpen(false)} aria-label="Back to changes">×</button></header>
+            <div className="batch-diff-scroll">
+              {preview.status !== "ready" ? <div className="batch-preview-summary conflicted"><strong>{preview.conflict_count} conflicts need attention</strong>{preview.conflicts.map((item, index) => <em key={`${item.code}-${index}`}>{item.message}</em>)}</div> : preview.documents.map((document) => (
+                <section className="preview-document" key={document.document_id}><header><strong>{document.document_name}</strong><span>{document.change_count} changes</span></header>{document.changes.map((change, index) => <article className="comparison-card" key={`${change.operation_id}-${change.occurrence_id ?? change.element_id}-${index}`}><header><strong>{change.operation_type === "find_replace" ? "Find & replace" : "Editor edit"}</strong><small>{change.element_type.replaceAll("_", " ")} · Block {change.paragraph_index + 1}</small></header><div className="batch-diff-values"><div className="before"><small>Before</small><p>{change.before}</p></div><div className="after"><small>After</small><p>{wordDifferenceSpans(change.before, change.after).map((span, spanIndex) => <mark className={`difference-span ${span.kind}`} key={spanIndex}>{span.text}</mark>)}</p></div></div></article>)}</section>
+              ))}
+            </div>
+            <footer className="preview-dialog-footer"><button type="button" className="quiet-button" onClick={() => { setPreviewOpen(false); onPanelChange("pending"); }}>Back to changes</button><button type="button" className="generate-version-button" onClick={() => void handleApplyBatch()} disabled={preview.status !== "ready" || Boolean(action)}>{action === "apply" ? "Submitting batch…" : "Apply all"}</button></footer>
           </section>
         </div>
       )}

@@ -103,10 +103,10 @@ test("version badge is injected from the root package and precedes the theme con
   const app = read("apps/web/src/App.tsx");
   const styles = read("apps/web/src/styles.css");
 
-  assert.equal(rootPackage.version, "1.12.0");
+  assert.equal(rootPackage.version, "1.13.0");
   assert.equal(webPackage.version, rootPackage.version);
-  assert.match(apiMain, /version="1\.12\.0"/);
-  assert.match(auditLogger, /APP_VERSION = "1\.12\.0"/);
+  assert.match(apiMain, /version="1\.13\.0"/);
+  assert.match(auditLogger, /APP_VERSION = "1\.13\.0"/);
   assert.match(vite, /new URL\("\.\.\/\.\.\/package\.json", import\.meta\.url\)/);
   assert.match(vite, /__DOCSYNC_VERSION__/);
   assert.match(vite, /valid semantic version/);
@@ -114,7 +114,7 @@ test("version badge is injected from the root package and precedes the theme con
   assert.match(app, />\s*v\{__DOCSYNC_VERSION__\}\s*<\/span>/);
   assert.ok(
     app.indexOf('className="version-badge"') <
-      app.indexOf('className="theme-toggle"'),
+      app.indexOf('className="theme-selector"'),
   );
   assert.match(styles, /:root\[data-theme="dark"\] \.version-badge/);
 });

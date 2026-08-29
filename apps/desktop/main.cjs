@@ -2,6 +2,7 @@
 
 const { spawn } = require("node:child_process");
 const crypto = require("node:crypto");
+const fs = require("node:fs");
 const http = require("node:http");
 const net = require("node:net");
 const path = require("node:path");
@@ -15,6 +16,7 @@ const {
   app,
   BrowserWindow,
   dialog,
+  ipcMain,
   session,
 } = require("electron");
 
@@ -34,6 +36,28 @@ let backendWorkspacePath = "";
 let mainWindow = null;
 const developmentWebUrl = process.env.DOCUMENTSYNC_WEB_DEV_URL || "";
 const externalBackendOrigin = process.env.DOCUMENTSYNC_BACKEND_ORIGIN || "";
+const THEME_PREFERENCE_KEY = "docsync-theme";
+
+function themePreferencePath() {
+  return path.join(app.getPath("userData"), "preferences.json");
+}
+
+function readThemePreference() {
+  try {
+    const value = JSON.parse(fs.readFileSync(themePreferencePath(), "utf8"))[THEME_PREFERENCE_KEY];
+    return value === "system" || value === "light" || value === "dark" ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function persistThemePreference(value) {
+  if (!["system", "light", "dark"].includes(value)) return;
+  let preferences = {};
+  try { preferences = JSON.parse(fs.readFileSync(themePreferencePath(), "utf8")); } catch { /* First run. */ }
+  fs.mkdirSync(app.getPath("userData"), { recursive: true });
+  fs.writeFileSync(themePreferencePath(), JSON.stringify({ ...preferences, [THEME_PREFERENCE_KEY]: value }), "utf8");
+}
 
 function applicationPaths() {
   if (app.isPackaged) {
@@ -234,6 +258,7 @@ function createWindow() {
     backgroundColor: "#edf2f7",
     autoHideMenuBar: true,
     webPreferences: {
+      preload: path.join(__dirname, "preload.cjs"),
       nodeIntegration: false,
       contextIsolation: true,
       sandbox: true,
@@ -279,6 +304,8 @@ if (hasSingleInstanceLock) {
   });
 
   app.whenReady().then(async () => {
+    ipcMain.on("theme:get-preference", (event) => { event.returnValue = readThemePreference(); });
+    ipcMain.on("theme:set-preference", (_event, preference) => persistThemePreference(preference));
     configureSession();
     try {
       await startBackend();

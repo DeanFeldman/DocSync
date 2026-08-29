@@ -17,14 +17,21 @@ test("theme is applied before React and persists the explicit preference", () =>
   const app = read("apps/web/src/App.tsx");
   const theme = read("apps/web/src/theme.ts");
   const styles = read("apps/web/src/styles.css");
+  const desktop = read("apps/desktop/main.cjs");
+  const preload = read("apps/desktop/preload.cjs");
 
   assert.match(index, /<script src="\/theme-bootstrap\.js"><\/script>/);
   assert.match(bootstrap, /docsync-theme/);
   assert.match(bootstrap, /prefers-color-scheme:\s*dark/);
   assert.match(bootstrap, /documentElement\.dataset\.theme/);
-  assert.match(theme, /localStorage\.setItem\(THEME_STORAGE_KEY, theme\)/);
-  assert.match(app, /className="theme-toggle"/);
-  assert.match(app, /aria-pressed=\{theme === "dark"\}/);
+  assert.match(theme, /ThemePreference = "system" \| AppTheme/);
+  assert.match(theme, /localStorage\.setItem\(THEME_STORAGE_KEY, preference\)/);
+  assert.match(theme, /setThemePreference/);
+  assert.match(app, /className="theme-selector"/);
+  assert.match(app, /prefers-color-scheme: dark/);
+  assert.match(desktop, /theme:get-preference/);
+  assert.match(desktop, /preload: path\.join\(__dirname, "preload\.cjs"\)/);
+  assert.match(preload, /getThemePreference/);
   assert.match(styles, /:root\[data-theme="dark"\]/);
   assert.match(styles, /:root\[data-theme="dark"\]/);
 });
