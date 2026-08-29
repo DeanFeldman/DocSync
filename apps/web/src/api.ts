@@ -432,16 +432,41 @@ export async function addEditorEditToPendingBatch(
   const draft =
     (await fetchDraftEditBatch(documentSetId, signal)) ??
     (await createEditBatch(documentSetId, "Pending changes", signal));
+  const existing = draft.operations.find(
+    (operation) =>
+      operation.operation_type === "editor_replace" &&
+      operation.editor_request?.source_element_id === request.source_element_id,
+  );
+  const input: EditBatchOperationInput = {
+    operation_type: "editor_replace",
+    label: label ?? "Reviewed editor replacement",
+    editor_request: request,
+    enabled: true,
+  };
+  if (existing) {
+    return updateEditBatchOperation(draft.id, existing.id, input, signal);
+  }
   return addEditBatchOperation(
     draft.id,
-    {
-      operation_type: "editor_replace",
-      label: label ?? "Reviewed editor replacement",
-      editor_request: request,
-      enabled: true,
-    },
+    input,
     signal,
   );
+}
+
+export async function removeEditorEditFromPendingBatch(
+  documentSetId: string,
+  sourceElementId: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const draft = await fetchDraftEditBatch(documentSetId, signal);
+  const existing = draft?.operations.find(
+    (operation) =>
+      operation.operation_type === "editor_replace" &&
+      operation.editor_request?.source_element_id === sourceElementId,
+  );
+  if (draft && existing) {
+    await removeEditBatchOperation(draft.id, existing.id, signal);
+  }
 }
 
 export async function updateEditBatchOperation(

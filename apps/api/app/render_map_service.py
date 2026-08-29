@@ -24,8 +24,8 @@ from .models import DocumentBlockRevision, DocumentVersion
 
 logger = logging.getLogger(__name__)
 
-RENDER_MAP_SCHEMA_VERSION = 4
-RENDER_MAP_ENGINE = "docsync-contextual-pdf-map-v4-empty-table-fields"
+RENDER_MAP_SCHEMA_VERSION = 5
+RENDER_MAP_ENGINE = "docsync-contextual-pdf-map-v5-form-line-fields"
 WORD_RENDER_ENGINE = "Microsoft Word ExportAsFixedFormat PDF"
 TOKEN_PATTERN = re.compile(r"\w+", re.UNICODE)
 RENDER_ID_PATTERN = re.compile(r"^[a-f0-9]{24}$")
@@ -800,6 +800,96 @@ def _match_empty_table_blocks(
         }
 
 
+def _match_empty_body_form_blocks(
+    blocks: tuple[dict, ...],
+    matches: dict[str, dict],
+    tokens: list[dict],
+    geometry: dict,
+) -> None:
+    """Associate qualified blank body paragraphs with nearby rendered form lines.
+
+    These blocks exist only when DOCX extraction found explicit form formatting,
+    so a PDF line never creates a synthetic editor target.  Assignment is
+    order-preserving and each drawing can be claimed once.
+    """
+
+    candidates = sorted(
+        (
+            block
+            for block in blocks
+            if block["element_type"] == "paragraph"
+            and not _normalise_tokens(block["text"])
+            and block["element_id"] not in matches
+        ),
+        key=lambda block: int(block["ordinal"]),
+    )
+    lines = sorted(
+        geometry.get("horizontal_lines") or [],
+        key=lambda line: (int(line["page_number"]), float(line["y0"]), float(line["x0"])),
+    )
+    if not candidates or not lines:
+        return
+
+    claimed: set[tuple[float, ...]] = set()
+    text_matches = sorted(
+        (
+            match
+            for match in matches.values()
+            if match["ranges"] and match["block"]["element_type"] not in {"header_paragraph", "footer_paragraph"}
+        ),
+        key=lambda match: int(match["block"]["ordinal"]),
+    )
+    for block in candidates:
+        previous = next(
+            (match for match in reversed(text_matches) if int(match["block"]["ordinal"]) < int(block["ordinal"])),
+            None,
+        )
+        following = next(
+            (match for match in text_matches if int(match["block"]["ordinal"]) > int(block["ordinal"])),
+            None,
+        )
+        scored: list[tuple[float, dict, dict]] = []
+        for line in lines:
+            key = (float(line["page_number"]), float(line["x0"]), float(line["y0"]), float(line["x1"]), float(line["y1"]))
+            if key in claimed or float(line["x1"]) - float(line["x0"]) < 32:
+                continue
+            previous_tokens = _match_tokens(previous, tokens) if previous else []
+            following_tokens = _match_tokens(following, tokens) if following else []
+            previous_on_page = [token for token in previous_tokens if int(token["page_number"]) == int(line["page_number"])]
+            following_on_page = [token for token in following_tokens if int(token["page_number"]) == int(line["page_number"])]
+            if not previous_on_page and not following_on_page:
+                continue
+            if previous_on_page and float(line["y0"]) < max(float(token["y1"]) for token in previous_on_page) - 4:
+                continue
+            if following_on_page and float(line["y1"]) > min(float(token["y0"]) for token in following_on_page) + 8:
+                continue
+            distance = min(
+                [abs(float(line["y0"]) - max(float(token["y1"]) for token in previous_on_page))] if previous_on_page else []
+                + [abs(min(float(token["y0"]) for token in following_on_page) - float(line["y1"]))] if following_on_page else []
+            )
+            if distance <= 96:
+                scored.append((distance, line, {"key": key}))
+        if not scored:
+            continue
+        _distance, line, metadata = min(scored, key=lambda item: (item[0], -float(item[1]["x1"]) + float(item[1]["x0"])))
+        claimed.add(metadata["key"])
+        matches[block["element_id"]] = {
+            "block": block,
+            "ranges": [],
+            "confidence": 0.95,
+            "geometric_boxes": [{
+                "page_number": line["page_number"],
+                "page_width": line["page_width"],
+                "page_height": line["page_height"],
+                "x0": line["x0"],
+                "y0": max(0.0, float(line["y0"]) - 16.0),
+                "x1": line["x1"],
+                "y1": float(line["y1"]) + 4.0,
+                "mapping_method": "word_pdf_empty_body_form_line",
+            }],
+        }
+
+
 def _regions_for_match(
     match: dict,
     tokens: list[dict],
@@ -953,8 +1043,8 @@ def _extract_pdf_structure(
         "tables": [],
         "horizontal_lines": [],
     }
-    needs_empty_table_geometry = any(
-        block["element_type"] == "table_paragraph"
+    needs_empty_form_geometry = any(
+        block["element_type"] in {"table_paragraph", "paragraph"}
         and not _normalise_tokens(block["text"])
         for block in context.blocks
     )
@@ -1042,7 +1132,7 @@ def _extract_pdf_structure(
                             "word_number": int(word_number),
                         }
                     )
-            if needs_empty_table_geometry:
+            if needs_empty_form_geometry:
                 try:
                     found_tables = page.find_tables().tables
                 except Exception:
@@ -1093,6 +1183,8 @@ def _extract_pdf_structure(
                     geometry["horizontal_lines"].append(
                         {
                             "page_number": page_number,
+                            "page_width": width,
+                            "page_height": height,
                             "x0": float(rect.x0),
                             "y0": float(rect.y0),
                             "x1": float(rect.x1),
@@ -1228,6 +1320,12 @@ def _generate_render_map(context: _RenderContext, key: str) -> None:
             tokens,
             geometry,
         )
+        _match_empty_body_form_blocks(
+            context.blocks,
+            matches,
+            tokens,
+            geometry,
+        )
         mapped_match_ids = set(matches)
         unmapped = [
             item
@@ -1245,6 +1343,21 @@ def _generate_render_map(context: _RenderContext, key: str) -> None:
         mapped_ids = {region["element_id"] for region in regions}
         interactive_ids = {
             region["element_id"] for region in regions if region["interactive"]
+        }
+        mapping_diagnostics = {
+            "detected_horizontal_line_count": len(geometry.get("horizontal_lines") or []),
+            "blank_form_candidate_count": sum(
+                1
+                for block in context.blocks
+                if block["element_type"] in {"table_paragraph", "paragraph"}
+                and not _normalise_tokens(block["text"])
+            ),
+            "matched_form_line_count": sum(
+                1
+                for region in regions
+                if region["mapping_method"]
+                in {"word_pdf_empty_signature_line", "word_pdf_empty_body_form_line"}
+            ),
         }
         total = len(context.blocks)
         if total and not mapped_ids:
@@ -1269,6 +1382,7 @@ def _generate_render_map(context: _RenderContext, key: str) -> None:
             "regions": regions,
             "mapped_element_count": len(mapped_ids),
             "interactive_element_count": len(interactive_ids),
+            "mapping_diagnostics": mapping_diagnostics,
             "unmapped": unmapped,
             "generated_at": _utc_now(),
         }
@@ -1282,13 +1396,15 @@ def _generate_render_map(context: _RenderContext, key: str) -> None:
         logger.info(
             "docsync.render_map_timing version_id=%s pages=%s blocks=%s "
             "pdf_read_ms=%.2f text_extraction_ms=%.2f "
-            "block_matching_ms=%.2f total_ms=%.2f",
+            "block_matching_ms=%.2f form_lines=%s/%s total_ms=%.2f",
             context.version_id,
             len(pages),
             len(context.blocks),
             pdf_read_ms,
             text_extraction_ms,
             block_matching_ms,
+            mapping_diagnostics["matched_form_line_count"],
+            mapping_diagnostics["detected_horizontal_line_count"],
             (perf_counter() - total_started) * 1000,
         )
     except Exception as exc:

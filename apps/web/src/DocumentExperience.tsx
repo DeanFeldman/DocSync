@@ -9,9 +9,11 @@ import {
 import {
   absoluteApiUrl,
   addEditorEditToPendingBatch,
+  removeEditorEditFromPendingBatch,
   ApiError,
   currentDocumentDownloadUrl,
   createPreviewJob,
+  fetchDraftEditBatch,
   fetchDocumentVersions,
   fetchDocumentView,
   fetchEditorContent,
@@ -52,6 +54,7 @@ import {
 } from "./editorUtils";
 import WordPreviewOverlay, {
   type LayoutSelectionIntent,
+  type PendingLayoutOverride,
 } from "./WordPreviewOverlay";
 import type { InlineEditorCommand } from "./InlineLayoutEditor";
 import { BATCH_UPDATED_EVENT } from "./FindReplacePanel";
@@ -66,6 +69,8 @@ import type {
   EditorBlock,
   EditorContentResponse,
   EditorEditMode,
+  EditBatch,
+  EditBatchOperation,
   EditorGenerationResponse,
   EditorMatch,
   EditorOperationRequest,
@@ -82,10 +87,31 @@ type EditorAction = "preview" | "generate" | "batch" | "restore" | null;
 type WithoutCommandId<T> = T extends { id: number } ? Omit<T, "id"> : never;
 type InlineEditorCommandInput = WithoutCommandId<InlineEditorCommand>;
 
-interface PendingBlockSelection {
-  block: EditorBlock;
-  remainInLayout: boolean;
-  inlineSelection: LayoutSelectionIntent | null;
+function pendingEditorOperationForBlock(
+  batch: EditBatch | null,
+  elementId: string,
+): EditBatchOperation | null {
+  return (
+    batch?.operations.find(
+      (operation) =>
+        operation.enabled &&
+        operation.operation_type === "editor_replace" &&
+        operation.editor_request?.source_element_id === elementId,
+    ) ?? null
+  );
+}
+
+function pendingDraftForBlock(
+  block: EditorBlock,
+  batch: EditBatch | null,
+): QuillDraft {
+  const operation = pendingEditorOperationForBlock(batch, block.element_id);
+  const target = operation?.editor_request?.targets.find(
+    (candidate) => candidate.element_id === block.element_id);
+  return {
+    text: target?.replacement_text ?? block.text,
+    delta: target?.delta ?? block.delta,
+  };
 }
 
 interface DocumentExperienceProps {
@@ -333,90 +359,6 @@ function normaliseVersions(
   };
 }
 
-function DiscardDraftDialog({
-  onConfirm,
-  onCancel,
-}: {
-  onConfirm: () => void;
-  onCancel: () => void;
-}) {
-  const cancelRef = useRef<HTMLButtonElement>(null);
-
-  useEffect(() => {
-    const focusFrame = window.requestAnimationFrame(() => {
-      cancelRef.current?.focus();
-    });
-
-    function handleKeyDown(event: KeyboardEvent) {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        onCancel();
-      }
-    }
-
-    window.addEventListener("keydown", handleKeyDown);
-    return () => {
-      window.cancelAnimationFrame(focusFrame);
-      window.removeEventListener("keydown", handleKeyDown);
-    };
-  }, [onCancel]);
-
-  return (
-    <div
-      className="modal-backdrop"
-      role="presentation"
-      onMouseDown={(event) => {
-        if (event.currentTarget === event.target) {
-          onCancel();
-        }
-      }}
-    >
-      <section
-        className="preview-dialog discard-draft-dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="discard-draft-title"
-        aria-describedby="discard-draft-description"
-      >
-        <header className="preview-dialog-header">
-          <div>
-            <p className="eyebrow">Unsaved editor draft</p>
-            <h2 id="discard-draft-title">Discard the current draft?</h2>
-            <p id="discard-draft-description">
-              Choose OK to open the selected block and discard the current
-              unpreviewed draft. Choose Cancel to keep editing the current
-              block.
-            </p>
-          </div>
-        </header>
-        <footer className="preview-dialog-footer">
-          <div>
-            <strong>No files have been changed</strong>
-            <span>This only affects the draft currently shown in the editor.</span>
-          </div>
-          <div>
-            <button
-              ref={cancelRef}
-              type="button"
-              className="quiet-button"
-              onClick={onCancel}
-            >
-              Cancel
-            </button>
-            <button
-              type="button"
-              className="primary-button"
-              onClick={onConfirm}
-            >
-              OK
-            </button>
-          </div>
-        </footer>
-      </section>
-    </div>
-  );
-}
-
 function PreviewDialog({
   preview,
   onClose,
@@ -621,8 +563,6 @@ export default function DocumentExperience({
   const [selectedElementId, setSelectedElementId] = useState("");
   const [draft, setDraft] = useState<QuillDraft | null>(null);
   const [editorResetToken, setEditorResetToken] = useState(0);
-  const [pendingBlockSelection, setPendingBlockSelection] =
-    useState<PendingBlockSelection | null>(null);
   const [matches, setMatches] = useState<EditorMatch[]>([]);
   const [matchStatus, setMatchStatus] =
     useState<LoadingStatus>("idle");
@@ -641,6 +581,8 @@ export default function DocumentExperience({
   const [previewOpen, setPreviewOpen] = useState(false);
   const [previewSignature, setPreviewSignature] = useState("");
   const [batchAddedSignature, setBatchAddedSignature] = useState("");
+  const [pendingBatch, setPendingBatch] = useState<EditBatch | null>(null);
+  const [stagingStatus, setStagingStatus] = useState<"idle" | "editing" | "saving" | "saved" | "error">("idle");
   const [action, setAction] = useState<EditorAction>(null);
   const [localError, setLocalError] = useState("");
   const [versions, setVersions] =
@@ -679,6 +621,7 @@ export default function DocumentExperience({
   const editorActionAbortRef = useRef<AbortController | null>(null);
   const generationSubmissionRef = useRef(false);
   const generationStartedAtRef = useRef(new Map<string, number>());
+  const draftTouchedRef = useRef(false);
   const queuedGenerationSnapshotRef = useRef<{
     jobId: string;
     documentId: string;
@@ -754,6 +697,35 @@ export default function DocumentExperience({
       ) ?? null,
     [editorContent, selectedElementId],
   );
+  const pendingEditorOperation = useMemo(
+    () =>
+      selectedBlock
+        ? pendingEditorOperationForBlock(pendingBatch, selectedBlock.element_id)
+        : null,
+    [pendingBatch, selectedBlock],
+  );
+  const pendingDraft = useMemo(
+    () =>
+      selectedBlock ? pendingDraftForBlock(selectedBlock, pendingBatch) : null,
+    [pendingBatch, selectedBlock],
+  );
+  const pendingLayoutOverridesByElementId = useMemo(() => {
+    const overrides: Record<string, PendingLayoutOverride> = {};
+    for (const operation of pendingBatch?.operations ?? []) {
+      if (!operation.enabled || operation.operation_type !== "editor_replace" || !operation.editor_request) continue;
+      const locationCount = operation.occurrence_count || operation.editor_request.targets.length;
+      const documentCount = operation.document_count || Object.keys(operation.editor_request.base_versions).length;
+      for (const target of operation.editor_request.targets) {
+        overrides[target.element_id] = {
+          replacementText: target.replacement_text,
+          operationId: operation.id,
+          locationCount,
+          documentCount,
+        };
+      }
+    }
+    return overrides;
+  }, [pendingBatch]);
   const sourceMatch = useMemo(
     () =>
       matches.find((match) => match.element_id === selectedElementId) ?? null,
@@ -761,10 +733,10 @@ export default function DocumentExperience({
   );
 
   const dirty = useMemo(() => {
-    if (!selectedBlock || !draft) return false;
-    if (draft.text !== selectedBlock.text) return true;
-    return JSON.stringify(draft.delta) !== JSON.stringify(selectedBlock.delta);
-  }, [draft, selectedBlock]);
+    if (!pendingDraft || !draft) return false;
+    if (draft.text !== pendingDraft.text) return true;
+    return JSON.stringify(draft.delta) !== JSON.stringify(pendingDraft.delta);
+  }, [draft, pendingDraft]);
 
   const perDocumentDirty = useMemo(
     () =>
@@ -775,9 +747,41 @@ export default function DocumentExperience({
       ),
     [includedElementIds, matches, targetReplacements],
   );
+  const sourceDiffersFromBase = useMemo(() => {
+    if (!selectedBlock || !draft) return false;
+    if (draft.text !== selectedBlock.text) return true;
+    return JSON.stringify(draft.delta) !== JSON.stringify(selectedBlock.delta);
+  }, [draft, selectedBlock]);
 
   useEffect(() => {
-    onDirtyChange(dirty || perDocumentDirty);
+    let active = true;
+    const refreshPendingBatch = () => {
+      void fetchDraftEditBatch(documentSet.id)
+        .then((batch) => {
+          if (active) setPendingBatch(batch);
+        })
+        .catch((error) => {
+          if (active && !isMissingFeature(error)) {
+            setLocalError(errorMessage(error, "Pending Changes could not be refreshed."));
+          }
+        });
+    };
+    refreshPendingBatch();
+    window.addEventListener(BATCH_UPDATED_EVENT, refreshPendingBatch);
+    return () => {
+      active = false;
+      window.removeEventListener(BATCH_UPDATED_EVENT, refreshPendingBatch);
+    };
+  }, [documentSet.id]);
+
+  useEffect(() => {
+    if (!selectedBlock || !pendingDraft || draftTouchedRef.current) return;
+    setDraft(pendingDraft);
+    setStagingStatus(pendingEditorOperation ? "saved" : "idle");
+  }, [pendingDraft, pendingEditorOperation, selectedBlock]);
+
+  useEffect(() => {
+    onDirtyChange(false);
     return () => onDirtyChange(false);
   }, [dirty, onDirtyChange, perDocumentDirty]);
 
@@ -786,7 +790,6 @@ export default function DocumentExperience({
     setRestoreError("");
     setRestoringVersionId("");
     setLocalError("");
-    setPendingBlockSelection(null);
     setHistoryRequested(false);
     setVersions(null);
     setVersionStatus("idle");
@@ -1302,22 +1305,33 @@ export default function DocumentExperience({
             : wordDifferenceSpans(selectedBlock!.text, match.text),
       }));
       setMatches(nextMatches);
+      const stagedRequest = pendingEditorOperationForBlock(
+        pendingBatch,
+        selectedBlock!.element_id,
+      )?.editor_request;
       setIncludedElementIds(
         new Set(
-          nextMatches
-            .filter(
-              (match) =>
-                match.match_type === "source" ||
-                match.match_type === "exact",
-            )
-            .map((match) => match.element_id),
+          stagedRequest?.targets.map((target) => target.element_id) ??
+            nextMatches
+              .filter(
+                (match) =>
+                  match.match_type === "source" ||
+                  match.match_type === "exact",
+              )
+              .map((match) => match.element_id),
         ),
       );
       setTargetReplacements(
         Object.fromEntries(
-          nextMatches.map((match) => [match.element_id, match.text]),
+          nextMatches.map((match) => {
+            const stagedTarget = stagedRequest?.targets.find(
+              (target) => target.element_id === match.element_id,
+            );
+            return [match.element_id, stagedTarget?.replacement_text ?? match.text];
+          }),
         ),
       );
+      if (stagedRequest) setEditMode(stagedRequest.edit_mode);
       } catch (error) {
         if (
           !controller.signal.aborted &&
@@ -1390,6 +1404,7 @@ export default function DocumentExperience({
     document?.name,
     documentSet.id,
     mode,
+    pendingBatch,
     selectedBlock?.element_id,
     versionScope,
   ]);
@@ -1676,25 +1691,37 @@ export default function DocumentExperience({
     remainInLayout = false,
     selection: LayoutSelectionIntent | null = null,
   ) {
+    draftTouchedRef.current = false;
+    const pendingOperation = pendingEditorOperationForBlock(
+      pendingBatch,
+      block.element_id,
+    );
+    const pendingRequest = pendingOperation?.editor_request;
     matchRequestRef.current += 1;
     editorActionRequestRef.current += 1;
     editorActionAbortRef.current?.abort();
     editorActionAbortRef.current = null;
 
-    setPendingBlockSelection(null);
     setSelectedElementId(block.element_id);
-    setDraft({ delta: block.delta, text: block.text });
+    setDraft(pendingDraftForBlock(block, pendingBatch));
     setMatches([]);
     setMatchStatus("idle");
     setNearMatchStatus("idle");
     setLegacyDiscovery(null);
-    setIncludedElementIds(new Set());
-    setTargetReplacements({});
-    setEditMode("shared");
+    setIncludedElementIds(
+      new Set(pendingRequest?.targets.map((target) => target.element_id) ?? []),
+    );
+    setTargetReplacements(
+      Object.fromEntries(
+        pendingRequest?.targets.map((target) => [target.element_id, target.replacement_text]) ?? [],
+      ),
+    );
+    setEditMode(pendingRequest?.edit_mode ?? "shared");
     setPreview(null);
     setPreviewOpen(false);
     setPreviewSignature("");
     setAction(null);
+    setStagingStatus(pendingOperation ? "saved" : "idle");
     setEditorResetToken((current) => current + 1);
     setInlineSelection(remainInLayout ? selection : null);
 
@@ -1720,56 +1747,10 @@ export default function DocumentExperience({
       return;
     }
 
-    if (
-      !skipDiscardConfirmation &&
-      (dirty || perDocumentDirty)
-    ) {
-      setPendingBlockSelection({
-        block,
-        remainInLayout,
-        inlineSelection: selection,
-      });
-      return;
+    if (!skipDiscardConfirmation && (dirty || perDocumentDirty)) {
+      void stageCurrentEdit();
     }
-
     activateSelectedBlock(block, remainInLayout, selection);
-  }
-
-  function confirmPendingBlockSelection() {
-    const pending = pendingBlockSelection;
-    if (!pending) {
-      return;
-    }
-
-    activateSelectedBlock(
-      pending.block,
-      pending.remainInLayout,
-      pending.inlineSelection,
-    );
-  }
-
-  function cancelPendingBlockSelection() {
-    const currentElementId = selectedElementId;
-
-    setPendingBlockSelection(null);
-    setAction(null);
-
-    if (!currentElementId) {
-      return;
-    }
-
-    setEditorResetToken((current) => current + 1);
-    window.requestAnimationFrame(() => {
-      if (inlineSelection?.regionId) {
-        window.document
-          .querySelector<HTMLElement>(
-            `[data-render-region-id="${CSS.escape(inlineSelection.regionId)}"]`,
-          )
-          ?.focus();
-        return;
-      }
-      findLayoutElement(currentElementId)?.focus();
-    });
   }
 
   function exitInlineEditing(regionId: string) {
@@ -1792,7 +1773,9 @@ export default function DocumentExperience({
   }
 
   function handleDraftChange(nextDraft: QuillDraft) {
+    draftTouchedRef.current = true;
     setDraft(nextDraft);
+    setStagingStatus("editing");
     setTargetReplacements((current) => ({
       ...current,
       ...(selectedElementId
@@ -1990,8 +1973,8 @@ export default function DocumentExperience({
   const operationSignature = operation ? JSON.stringify(operation) : "";
   const hasChangedOperation =
     editMode === "per_document"
-      ? dirty || perDocumentDirty
-      : dirty;
+      ? sourceDiffersFromBase || perDocumentDirty
+      : sourceDiffersFromBase;
   const validTargets = Boolean(
     operation?.targets.length &&
       operation.targets.every(
@@ -2020,6 +2003,43 @@ export default function DocumentExperience({
       !action &&
       batchAddedSignature !== operationSignature,
   );
+
+  async function stageCurrentEdit() {
+    if (!operation || !selectedBlock) return;
+    setStagingStatus("saving");
+    try {
+      if (!hasChangedOperation) {
+        await removeEditorEditFromPendingBatch(documentSet.id, selectedBlock.element_id);
+        draftTouchedRef.current = false;
+        setPendingBatch((current) =>
+          current
+            ? {
+                ...current,
+                operations: current.operations.filter(
+                  (candidate) =>
+                    candidate.editor_request?.source_element_id !== selectedBlock.element_id,
+                ),
+              }
+            : current,
+        );
+        setStagingStatus("idle");
+      } else {
+        await addEditorEditToPendingBatch(documentSet.id, operation, `${document?.name ?? "Document"} · ${locationLabel(selectedBlock)}`);
+        setBatchAddedSignature(operationSignature);
+        setStagingStatus("saved");
+      }
+      window.dispatchEvent(new Event(BATCH_UPDATED_EVENT));
+    } catch (caught) {
+      setStagingStatus("error");
+      setLocalError(errorMessage(caught, "The change could not be staged. Retry to keep it in Pending Changes."));
+    }
+  }
+
+  useEffect(() => {
+    if (!selectedBlock || !operation || (!hasChangedOperation && !draftTouchedRef.current)) return;
+    const timer = window.setTimeout(() => void stageCurrentEdit(), 650);
+    return () => window.clearTimeout(timer);
+  }, [operationSignature, selectedBlock?.element_id]);
 
   async function handlePreview() {
     if (!operation || !selectedBlock) return;
@@ -2642,6 +2662,7 @@ export default function DocumentExperience({
                   selectedElementId={selectedElementId}
                   selectedBlock={selectedBlock}
                   draft={draft}
+                  pendingOverridesByElementId={pendingLayoutOverridesByElementId}
                   editorResetToken={editorResetToken}
                   inlineSelection={inlineSelection}
                   inlineCommand={inlineCommand}
@@ -2713,8 +2734,16 @@ export default function DocumentExperience({
                 <span className="eyebrow">Controlled edit</span>
                 <h2 id="editor-operation-title">Layout editing</h2>
               </div>
-              <span className={`draft-status ${dirty ? "dirty" : ""}`}>
-                {dirty || perDocumentDirty ? "Unsaved draft" : "No changes"}
+              <span className={`draft-status ${stagingStatus === "error" ? "dirty" : ""}`} role="status">
+                {stagingStatus === "editing"
+                  ? "Editing"
+                  : stagingStatus === "saving"
+                    ? "Saving…"
+                    : stagingStatus === "saved"
+                      ? `✓ Pending${pendingEditorOperation ? ` · ${pendingEditorOperation.occurrence_count || pendingEditorOperation.editor_request?.targets.length || 1} locations · ${pendingEditorOperation.document_count || Object.keys(pendingEditorOperation.editor_request?.base_versions ?? {}).length || 1} documents` : ""}`
+                      : stagingStatus === "error"
+                        ? "Could not add to Pending Changes · Retry"
+                        : "No pending edit"}
               </span>
             </div>
             <div className="operation-sidebar-scroll">
@@ -2962,47 +2991,8 @@ export default function DocumentExperience({
               )}
 
               <div className="operation-actions">
-                <button
-                  type="button"
-                  className="quiet-button"
-                  onClick={discardDraft}
-                  disabled={!dirty && !perDocumentDirty}
-                >
-                  Discard draft
-                </button>
-                <button
-                  ref={previewButtonRef}
-                  type="button"
-                  className="primary-button"
-                  onClick={() => void handlePreview()}
-                  disabled={!canPreview}
-                >
-                  {action === "preview" ? "Building preview…" : "Preview changes"}
-                </button>
-                <button
-                  type="button"
-                  className="pending-change-button"
-                  onClick={() => void handleAddToBatch()}
-                  disabled={!canAddToBatch}
-                >
-                  {action === "batch"
-                    ? "Adding to pending…"
-                    : batchAddedSignature === operationSignature
-                      ? "Added to pending changes"
-                      : "Add to pending changes"}
-                </button>
-                <button
-                  type="button"
-                  className="generate-version-button"
-                  onClick={() => void handleGenerate()}
-                  disabled={!canGenerate}
-                >
-                  {action === "generate"
-                    ? "Submitting…"
-                    : pendingGenerationId
-                      ? "Processing in background"
-                      : "Generate new versions"}
-                </button>
+                {stagingStatus === "error" && <button type="button" className="quiet-button" onClick={() => void stageCurrentEdit()}>Retry staging</button>}
+                <span className="generate-safety-copy">Edits are staged here. Preview and apply all pending changes from the toolbar.</span>
               </div>
             
 
@@ -3057,13 +3047,6 @@ export default function DocumentExperience({
           </>
         )}
       </aside>
-
-      {pendingBlockSelection && (
-        <DiscardDraftDialog
-          onConfirm={confirmPendingBlockSelection}
-          onCancel={cancelPendingBlockSelection}
-        />
-      )}
 
       {preview && previewOpen && (
         <PreviewDialog

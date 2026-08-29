@@ -298,6 +298,8 @@ def test_mid_batch_failure_rolls_back_every_document_and_removes_staging(
         batch_service = importlib.import_module("app.batch_service")
         database = importlib.import_module("app.database")
         with database.SessionLocal() as session:
+            preview = batch_service.preview_edit_batch(session, batch["id"])
+            assert preview["status"] == "ready"
             batch_service.queue_edit_batch(session, batch["id"])
 
         real_apply = batch_service._apply_compiled_document
@@ -407,6 +409,14 @@ def test_editor_and_cross_structure_find_replace_share_one_document_version(
         preview = client.post(f"/api/edit-batches/{batch['id']}/preview")
         assert preview.status_code == 200, preview.text
         assert preview.json()["status"] == "ready", preview.json()
+        assert preview.json()["writes_performed"] is False
+        changes = preview.json()["documents"][0]["changes"]
+        assert {change["operation_type"] for change in changes} == {
+            "editor_replace",
+            "find_replace",
+        }
+        assert any(change["after"] == "EDITOR_BATCH_REPLACEMENT" for change in changes)
+        assert any(change["after"] == "HEADER_BATCH_REPLACEMENT" for change in changes)
         queued = client.post(f"/api/edit-batches/{batch['id']}/generate")
         assert queued.status_code == 202, queued.text
         completed = _wait_for_generation(client, batch["id"])

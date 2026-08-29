@@ -365,6 +365,26 @@ def _validate_docx_payload(filename: str, payload: bytes) -> None:
     DocumentValidationService.validate_file(payload, filename=filename)
 
 
+def _is_safe_empty_body_form_field(paragraph: Paragraph) -> bool:
+    """Keep only blank body paragraphs with explicit Word form-field evidence.
+
+    Plain spacer paragraphs remain absent from the editable inventory.  A bottom
+    border or underlined/tab-only run is a real, writable Word paragraph that
+    Word commonly renders as a signature or form line.
+    """
+
+    if paragraph.text.strip():
+        return False
+    properties = paragraph._p.pPr
+    if properties is not None and properties.find(qn("w:pBdr")) is not None:
+        return True
+    for run in paragraph.runs:
+        has_tab = run._r.find(qn("w:tab")) is not None
+        if run.underline and (has_tab or not run.text.strip()):
+            return True
+    return False
+
+
 def _extract_paragraphs(
     document: DocxDocument,
 ) -> list[tuple[int, str, str | None]]:
@@ -394,7 +414,7 @@ def _extract_paragraphs(
         paragraph = paragraph_lookup.get(child)
         if paragraph is not None:
             text = paragraph.text.strip()
-            if text:
+            if text or _is_safe_empty_body_form_field(paragraph):
                 paragraph_properties = paragraph._p.pPr
                 paragraph_style = (
                     paragraph_properties.pStyle

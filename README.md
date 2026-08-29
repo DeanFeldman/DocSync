@@ -4,7 +4,7 @@
 [![Release](https://github.com/DeanFeldman/DocSync/actions/workflows/release.yml/badge.svg)](https://github.com/DeanFeldman/DocSync/actions/workflows/release.yml)
 [![Latest Release](https://img.shields.io/github/v/release/DeanFeldman/DocSync)](https://github.com/DeanFeldman/DocSync/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-Windows-0078D4)](#requirements)
-[![Version](https://img.shields.io/badge/version-1.12.0-blue)](#latest-release)
+[![Version](https://img.shields.io/badge/version-1.13.0-blue)](#latest-release)
 
 DocSync is a local-first Windows desktop application for safely coordinating edits across related Microsoft Word documents.
 
@@ -36,30 +36,24 @@ SHA256SUMS.txt
 
 ## Latest Release
 
-### Version 1.12.0
+### Version 1.13.0
 
-DocSync `v1.12.0` makes the rendered Word layout substantially more complete
-and adds safe editing for previously invisible blank form fields.
+DocSync `v1.13.0` adds a review-first Pending Changes workflow to Layout,
+alongside safer form-line mapping and restart-stable appearance preferences.
 
 The application now:
 
-- Maps numbered clauses, generated list markers, table-of-contents entries,
-  repeated legal wording, and paragraphs split across PDF pages more reliably.
-- Detects empty bordered table cells and blank signature/form underlines as real
-  selectable Word targets.
-- Allows text and soft line breaks inside supported empty, ordinary, and merged
-  top-level table cells while preserving the surrounding table structure.
-- Preserves multiline plain-text paste instead of flattening it into one line.
-- Removes the unhelpful `Select from structure` button and its synthetic layout
-  fallback; Layout now exposes only regions tied to the rendered Word document.
-- Adds an incremental, restart-safe schema migration for existing workspaces.
-  The migration preserves historical revision identities and avoids rebuilding
-  the complete version history during desktop startup.
+- Stages direct Layout edits automatically into a durable Pending Changes batch.
+- Shows pending replacements over the immutable PDF layout without generating a
+  new Word version; Preview All remains the final layout authority.
+- Supports System, Light, and Dark appearance preferences across desktop restarts.
+- Maps qualified bordered or underlined blank body form lines, including stacked
+  signature fields, while leaving ambiguous drawings read-only.
 
 See:
 
-- [v1.12.0 release notes](docs/v1.12.0-release-notes.md)
-- [v1.12.0 manual test plan](docs/v1.12.0-manual-testing.md)
+- [v1.13.0 release notes](docs/v1.13.0-release-notes.md)
+- [v1.13.0 manual test plan](docs/v1.13.0-manual-testing.md)
 - [Batch editing and complete Word text inventory](docs/batch-find-replace-text-inventory.md)
 - [Measured batch performance](docs/evidence/v1.11.0-batch-find-replace-performance.md)
 
@@ -486,7 +480,7 @@ The release workflow runs when a tag beginning with `v` is pushed.
 Example:
 
 ```powershell
-$version = "1.12.0"
+$version = "1.13.0"
 
 git switch main
 git pull origin main

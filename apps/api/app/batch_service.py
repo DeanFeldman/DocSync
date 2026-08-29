@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from io import BytesIO
 import hashlib
+import json
 from pathlib import Path
 import shutil
 from time import perf_counter
@@ -95,6 +96,25 @@ def _base_versions(batch: EditorOperation) -> dict[str, str]:
 
 def _operation_request(operation: EditBatchOperation) -> EditBatchOperationRequest:
     return EditBatchOperationRequest.model_validate(operation.request_json)
+
+
+def _batch_state_signature(batch: EditorOperation) -> str:
+    """Fingerprint the durable draft state that a preview has checked."""
+    state = [
+        {
+            "id": operation.id,
+            "enabled": operation.enabled,
+            "request": operation.request_json,
+            "occurrences": [
+                {"id": item.id, "selected": item.selected}
+                for item in operation.occurrences
+            ],
+        }
+        for operation in sorted(batch.batch_operations, key=lambda item: item.operation_index)
+    ]
+    return hashlib.sha256(
+        json.dumps(state, sort_keys=True, separators=(",", ":"), default=str).encode()
+    ).hexdigest()
 
 
 def serialize_edit_batch(session: Session, batch: EditorOperation) -> dict:
@@ -849,11 +869,8 @@ def preview_edit_batch(session: Session, batch_id: str) -> dict:
     compiled = _compile_edit_batch(session, batch)
     conflicts = compiled["conflicts"]
     validation_ms = (perf_counter() - started) * 1000
-    generation_started = perf_counter()
-    if not conflicts:
-        for item in compiled["documents"].values():
-            _apply_compiled_document(item)
-    preview_ms = (perf_counter() - generation_started) * 1000
+    # Preview resolves and validates changes only; it must not generate a DOCX.
+    preview_ms = 0.0
     documents = [
         {
             "document_id": document_id,
@@ -862,6 +879,32 @@ def preview_edit_batch(session: Session, batch_id: str) -> dict:
             "find_replacement_count": len(item["find_patches"]),
             "editor_target_count": len(item["editor_targets"]),
             "change_count": len(item["find_patches"]) + len(item["editor_targets"]),
+            "changes": [
+                {
+                    "operation_id": operation.id,
+                    "operation_type": "editor_replace",
+                    "element_id": revision.element_id,
+                    "paragraph_index": int((revision.location_json or {}).get("paragraph_index", revision.ordinal)),
+                    "element_type": revision.element_type,
+                    "location": revision.location_json or {},
+                    "before": revision.text,
+                    "after": target.replacement_text,
+                }
+                for target, revision, _document, _delta, operation in item["editor_targets"]
+            ] + [
+                {
+                    "operation_id": operation.id,
+                    "operation_type": "find_replace",
+                    "occurrence_id": occurrence.occurrence_id,
+                    "element_id": occurrence.element_id,
+                    "paragraph_index": int((occurrence.location_json or {}).get("paragraph_index", 0)),
+                    "element_type": occurrence.structure_type,
+                    "location": occurrence.location_json or {},
+                    "before": occurrence.matched_text,
+                    "after": operation.replacement_text or "",
+                }
+                for occurrence, operation in item["find_occurrences"]
+            ],
         }
         for document_id, item in sorted(
             compiled["documents"].items(),
@@ -882,6 +925,7 @@ def preview_edit_batch(session: Session, batch_id: str) -> dict:
             "in_memory_generation_ms": round(preview_ms, 2),
             "total_ms": round((perf_counter() - started) * 1000, 2),
         },
+        "state_signature": _batch_state_signature(batch),
     }
     envelope = dict(batch.preview_json or {})
     batch.preview_json = {
@@ -898,7 +942,18 @@ def queue_edit_batch(session: Session, batch_id: str) -> dict:
     with EDITOR_QUEUE_LOCK:
         batch = get_edit_batch(session, batch_id)
         _require_draft(batch)
-        preview = preview_edit_batch(session, batch.id)
+        envelope = dict(batch.preview_json or {})
+        preview = envelope.get("preview") if isinstance(envelope, dict) else None
+        if not isinstance(preview, dict) or preview.get("status") != "ready":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Preview all changes before applying this batch.",
+            )
+        if preview.get("state_signature") != _batch_state_signature(batch):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Pending changes changed after preview. Preview all changes again.",
+            )
         if preview["conflicts"]:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,

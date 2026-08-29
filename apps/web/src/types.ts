@@ -717,6 +717,12 @@ export interface EditBatchPreview {
     find_replacement_count: number;
     editor_target_count: number;
     change_count: number;
+    changes: Array<PreviewChange & {
+      operation_id: string;
+      operation_type: "find_replace" | "editor_replace";
+      occurrence_id?: string;
+      location?: Record<string, unknown>;
+    }>;
   }>;
   affected_document_count: number;
   affected_location_count: number;

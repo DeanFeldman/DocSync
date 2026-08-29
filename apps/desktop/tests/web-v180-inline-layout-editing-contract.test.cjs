@@ -88,7 +88,8 @@ test("inline Quill supports soft lines and shares the central draft", () => {
   assert.match(experience, /setWorkspaceMode\("layout"\)/);
   assert.match(experience, /onDraftChange=\{handleDraftChange\}/);
   assert.match(experience, /setDraft\(nextDraft\)/);
-  assert.match(experience, /setPendingBlockSelection\(\{/);
+  assert.doesNotMatch(experience, /setPendingBlockSelection\(/);
+  assert.match(experience, /void stageCurrentEdit\(\)/);
   assert.match(experience, /This draft may wrap differently/);
 });
 
@@ -109,8 +110,8 @@ test("Layout exposes formatting, matching, preview, generation, and rerender", (
     "Paragraph alignment",
     "Undo",
     "Redo",
-    "Preview changes",
-    "Generate new versions",
+    "Edits are staged here",
+    "Preview ready",
   ]) {
     assert.match(experience, new RegExp(label));
   }

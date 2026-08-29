@@ -2,8 +2,9 @@
   const key = "docsync-theme";
   let theme;
   try {
-    const stored = localStorage.getItem(key);
+    const stored = window.docSync?.getThemePreference?.() || localStorage.getItem(key);
     if (stored === "light" || stored === "dark") theme = stored;
+    // "system" intentionally resolves below without rewriting the preference.
   } catch {
     // Local preference storage is optional.
   }
