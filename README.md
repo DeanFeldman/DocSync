@@ -602,6 +602,7 @@ Planned improvements include:
 - PostgreSQL support
 - Secure cloud storage
 - Multi-device document synchronisation
+- OneDrive Integration — Open documents from OneDrive, edit them safely in DocSync, and sync approved changes back.
 
 ---
 
