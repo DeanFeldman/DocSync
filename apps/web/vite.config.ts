@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
@@ -17,7 +18,7 @@ if (
 export default defineConfig({
   // Local development settings are intentionally shared from the repository
   // root; Vite exposes only variables prefixed with VITE_.
-  envDir: new URL("../../", import.meta.url).pathname,
+  envDir: fileURLToPath(new URL("../../", import.meta.url)),
   define: {
     __DOCSYNC_VERSION__: JSON.stringify(rootPackage.version),
   },
