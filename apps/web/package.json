@@ -1,7 +1,7 @@
 {
   "name": "documentsync-web",
   "private": true,
-  "version": "1.16.0",
+  "version": "1.17.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -9,6 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.57.4",
     "quill": "^2.0.3",
     "react": "19.2.7",
     "react-dom": "19.2.7"

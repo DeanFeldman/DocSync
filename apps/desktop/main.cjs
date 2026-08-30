@@ -18,6 +18,8 @@ const {
   dialog,
   ipcMain,
   session,
+  shell,
+  safeStorage,
 } = require("electron");
 
 app.enableSandbox();
@@ -37,6 +39,13 @@ let mainWindow = null;
 const developmentWebUrl = process.env.DOCUMENTSYNC_WEB_DEV_URL || "";
 const externalBackendOrigin = process.env.DOCUMENTSYNC_BACKEND_ORIGIN || "";
 const THEME_PREFERENCE_KEY = "docsync-theme";
+let pendingAuthCode = null;
+function authStoragePath() { return path.join(app.getPath("userData"), "auth-session.bin"); }
+function authCallback(url) {
+  try { const value = new URL(url); if (value.protocol !== "za.co.docsync:" || value.hostname !== "auth" || value.pathname !== "/callback") return null; const code = value.searchParams.get("code"); return code && /^[A-Za-z0-9._~-]+$/.test(code) ? code : null; } catch { return null; }
+}
+function deliverAuthCallback(url) { const code = authCallback(url); if (!code) return false; pendingAuthCode = code; if (mainWindow) { if (mainWindow.isMinimized()) mainWindow.restore(); mainWindow.focus(); mainWindow.webContents.send("auth:callback", code); } return true; }
+function trustedOAuthUrl(value) { try { const url = new URL(value); return url.protocol === "https:" && /(^|\.)supabase\.co$/i.test(url.hostname) && url.pathname === "/auth/v1/authorize"; } catch { return false; } }
 
 function themePreferencePath() {
   return path.join(app.getPath("userData"), "preferences.json");
@@ -296,8 +305,10 @@ function stopBackend() {
 
 if (hasSingleInstanceLock) {
   app.setAppUserModelId("za.co.docsync.desktop");
+  app.setAsDefaultProtocolClient("za.co.docsync");
 
-  app.on("second-instance", () => {
+  app.on("second-instance", (_event, argv) => {
+    argv.forEach(deliverAuthCallback);
     if (!mainWindow) return;
     if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.focus();
@@ -306,10 +317,19 @@ if (hasSingleInstanceLock) {
   app.whenReady().then(async () => {
     ipcMain.on("theme:get-preference", (event) => { event.returnValue = readThemePreference(); });
     ipcMain.on("theme:set-preference", (_event, preference) => persistThemePreference(preference));
+    ipcMain.handle("auth:open-oauth", (_event, url) => {
+      if (!trustedOAuthUrl(url)) return false;
+      return shell.openExternal(url).then(() => true);
+    });
+    ipcMain.handle("auth:callback", () => { const code = pendingAuthCode; pendingAuthCode = null; return code; });
+    ipcMain.handle("auth-storage:get", () => { if (!safeStorage.isEncryptionAvailable()) return null; try { return safeStorage.decryptString(fs.readFileSync(authStoragePath())); } catch { return null; } });
+    ipcMain.handle("auth-storage:set", (_event, value) => { if (!safeStorage.isEncryptionAvailable() || typeof value !== "string") return false; fs.mkdirSync(app.getPath("userData"), { recursive: true }); fs.writeFileSync(authStoragePath(), safeStorage.encryptString(value)); return true; });
+    ipcMain.handle("auth-storage:remove", () => { fs.rmSync(authStoragePath(), { force: true }); return true; });
     configureSession();
     try {
       await startBackend();
       createWindow();
+      process.argv.forEach(deliverAuthCallback);
     } catch (error) {
       dialog.showErrorBox(
         "DocSync could not start",

@@ -57,7 +57,15 @@ jobs:
         run: npm test
 
       - name: Build the web app and frozen Windows backend
-        run: npm run build:desktop
+        shell: pwsh
+        env:
+          VITE_SUPABASE_URL: ${{ vars.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_PUBLISHABLE_KEY: ${{ vars.VITE_SUPABASE_PUBLISHABLE_KEY }}
+        run: |
+          if (-not $env:VITE_SUPABASE_URL -or -not $env:VITE_SUPABASE_PUBLISHABLE_KEY) {
+            throw "VITE_SUPABASE_URL and VITE_SUPABASE_PUBLISHABLE_KEY repository variables are required for a release build."
+          }
+          npm run build:desktop
 
       - name: Smoke test the exact frozen backend
         run: npm run smoke:api:win

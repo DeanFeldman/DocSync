@@ -798,6 +798,9 @@ textarea:focus-visible {
 .quiet-button { min-height: 38px; padding: 9px 13px; color: var(--navy); background: #fff; border: 1px solid #cfd9e5; }
 .quiet-button:hover:not(:disabled) { background: #f5f8fb; border-color: #aebdce; }
 .quiet-button:disabled { opacity: 0.5; cursor: not-allowed; }
+.account-area { display: inline-flex; align-items: center; gap: 8px; font-size: 0.8rem; }
+.account-area img { width: 26px; height: 26px; border-radius: 50%; }
+.account-area small { color: #a22; max-width: 150px; }
 .text-button { border: 0; background: none; color: var(--navy); padding: 4px; }
 
 .alert { display: grid; gap: 4px; border-radius: 12px; padding: 13px 15px; margin: 16px max(22px, calc((100vw - 1500px) / 2)); }

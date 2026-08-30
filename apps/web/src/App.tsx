@@ -33,6 +33,7 @@ import type {
 import docSyncLogo from "./assets/Docsync LOGO.png";
 import DocumentExperience from "./DocumentExperience";
 import FindReplacePanel from "./FindReplacePanel";
+import AuthAccount from "./AuthAccount";
 import {
   clearWorkspaceResourcesForDocument,
   clearWorkspaceResourcesForSet,
@@ -1251,6 +1252,7 @@ const canUpload = files.length >= 2 && !busyAction;
                 )}
               </div>
 
+              <AuthAccount />
               <button type="button" className="toolbar-button" onClick={() => setWorkspacePanel("find")}>Find &amp; Replace</button>
               <button type="button" className="toolbar-button pending-batch-button" onClick={() => setWorkspacePanel("pending")}>Pending changes <strong>{pendingChangeCount}</strong></button>
 

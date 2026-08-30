@@ -15,6 +15,9 @@ if (
 }
 
 export default defineConfig({
+  // Local development settings are intentionally shared from the repository
+  // root; Vite exposes only variables prefixed with VITE_.
+  envDir: new URL("../../", import.meta.url).pathname,
   define: {
     __DOCSYNC_VERSION__: JSON.stringify(rootPackage.version),
   },
