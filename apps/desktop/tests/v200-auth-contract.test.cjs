@@ -10,7 +10,7 @@ const read = (file) => fs.readFileSync(path.join(root, file), "utf8");
 
 test("Google OAuth is limited to the Supabase authorization endpoint and exact callback", () => {
   const main = read("apps/desktop/main.cjs");
-  const packageJson = read("package.json");
+  const packageJson = JSON.parse(read("package.json"));
   assert.match(main, /url\.protocol === "https:"/);
   assert.match(main, /supabase\\\.co/);
   assert.ok(main.includes('url.pathname === "/auth/v1/authorize"'));
@@ -25,8 +25,7 @@ test("Google OAuth is limited to the Supabase authorization endpoint and exact c
   assert.match(main, /return app\.setAsDefaultProtocolClient\("za\.co\.docsync"\)/);
   assert.match(main, /registerProtocolClient\(\);/);
   assert.match(main, /DOCUMENTSYNC_SUPABASE_URL: publicSupabaseUrl/);
-  assert.match(packageJson, /"protocols"/);
-  assert.match(packageJson, /"schemes": \["za\.co\.docsync"\]/);
+  assert.ok(packageJson.build.protocols.some((protocol) => protocol.name === "DocSync" && protocol.schemes.includes("za.co.docsync")));
 });
 
 test("desktop CSP allows only the configured Supabase origin and serves the built theme bootstrap", () => {
