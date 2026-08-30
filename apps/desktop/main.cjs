@@ -46,6 +46,13 @@ function authCallback(url) {
 }
 function deliverAuthCallback(url) { const code = authCallback(url); if (!code) return false; pendingAuthCode = code; if (mainWindow) { if (mainWindow.isMinimized()) mainWindow.restore(); mainWindow.focus(); mainWindow.webContents.send("auth:callback", code); } return true; }
 function trustedOAuthUrl(value) { try { const url = new URL(value); return url.protocol === "https:" && /(^|\.)supabase\.co$/i.test(url.hostname) && url.pathname === "/auth/v1/authorize"; } catch { return false; } }
+function registerProtocolClient() {
+  if (process.defaultApp) {
+    if (process.argv.length < 2) return false;
+    return app.setAsDefaultProtocolClient("za.co.docsync", process.execPath, [path.resolve(process.argv[1])]);
+  }
+  return app.setAsDefaultProtocolClient("za.co.docsync");
+}
 
 function themePreferencePath() {
   return path.join(app.getPath("userData"), "preferences.json");
@@ -305,7 +312,7 @@ function stopBackend() {
 
 if (hasSingleInstanceLock) {
   app.setAppUserModelId("za.co.docsync.desktop");
-  app.setAsDefaultProtocolClient("za.co.docsync");
+  registerProtocolClient();
 
   app.on("second-instance", (_event, argv) => {
     argv.forEach(deliverAuthCallback);
@@ -350,4 +357,4 @@ if (hasSingleInstanceLock) {
   app.on("window-all-closed", () => app.quit());
 }
 
-module.exports = { applicationPaths, findAvailablePort, isTrustedUrl };
+module.exports = { applicationPaths, findAvailablePort, isTrustedUrl, registerProtocolClient };

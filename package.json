@@ -37,6 +37,12 @@
     "productName": "DocSync",
     "asar": true,
     "artifactName": "${productName}-Setup-${version}.${ext}",
+    "protocols": [
+      {
+        "name": "DocSync",
+        "schemes": ["za.co.docsync"]
+      }
+    ],
     "directories": {
       "output": "release/v1"
     },

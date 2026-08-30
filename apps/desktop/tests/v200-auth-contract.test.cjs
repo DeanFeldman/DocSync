@@ -10,6 +10,7 @@ const read = (file) => fs.readFileSync(path.join(root, file), "utf8");
 
 test("Google OAuth is limited to the Supabase authorization endpoint and exact callback", () => {
   const main = read("apps/desktop/main.cjs");
+  const packageJson = read("package.json");
   assert.match(main, /url\.protocol === "https:"/);
   assert.match(main, /supabase\\\.co/);
   assert.ok(main.includes('url.pathname === "/auth/v1/authorize"'));
@@ -18,6 +19,13 @@ test("Google OAuth is limited to the Supabase authorization endpoint and exact c
   assert.ok(main.includes('value.pathname !== "/callback"'));
   assert.match(main, /auth:open-oauth/);
   assert.match(main, /if \(!trustedOAuthUrl\(url\)\) return false/);
+  assert.match(main, /function registerProtocolClient\(\)/);
+  assert.match(main, /if \(process\.defaultApp\)/);
+  assert.match(main, /process\.execPath, \[path\.resolve\(process\.argv\[1\]\)\]/);
+  assert.match(main, /return app\.setAsDefaultProtocolClient\("za\.co\.docsync"\)/);
+  assert.match(main, /registerProtocolClient\(\);/);
+  assert.match(packageJson, /"protocols"/);
+  assert.match(packageJson, /"schemes": \["za\.co\.docsync"\]/);
 });
 
 test("auth persistence is encrypted, removable, and not exposed as plaintext", () => {
