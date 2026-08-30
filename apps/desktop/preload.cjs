@@ -10,5 +10,5 @@ contextBridge.exposeInMainWorld("docSync", Object.freeze({
   openOAuth: (url) => ipcRenderer.invoke("auth:open-oauth", url),
   getAuthCallback: () => ipcRenderer.invoke("auth:callback"),
   onAuthCallback: (listener) => { const handler = (_event, code) => listener(code); ipcRenderer.on("auth:callback", handler); return () => ipcRenderer.removeListener("auth:callback", handler); },
-  authStorage: Object.freeze({ get: () => ipcRenderer.invoke("auth-storage:get"), set: (value) => ipcRenderer.invoke("auth-storage:set", value), remove: () => ipcRenderer.invoke("auth-storage:remove") }),
+  authStorage: Object.freeze({ get: (key) => ipcRenderer.invoke("auth-storage:get", key), set: (key, value) => ipcRenderer.invoke("auth-storage:set", key, value), remove: (key) => ipcRenderer.invoke("auth-storage:remove", key), clear: () => ipcRenderer.invoke("auth-storage:clear") }),
 }));

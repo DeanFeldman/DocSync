@@ -28,14 +28,27 @@ test("Google OAuth is limited to the Supabase authorization endpoint and exact c
   assert.match(packageJson, /"schemes": \["za\.co\.docsync"\]/);
 });
 
-test("auth persistence is encrypted, removable, and not exposed as plaintext", () => {
+test("auth persistence is encrypted key/value storage and does not overwrite PKCE or session entries", () => {
   const main = read("apps/desktop/main.cjs");
   const preload = read("apps/desktop/preload.cjs");
+  const auth = read("apps/web/src/auth.ts");
   assert.match(main, /safeStorage\.encryptString/);
   assert.match(main, /safeStorage\.decryptString/);
+  assert.match(main, /JSON\.parse\(safeStorage\.decryptString/);
+  assert.match(main, /JSON\.stringify\(entries\)/);
+  assert.match(main, /function getAuthStorageEntry\(key\)/);
+  assert.match(main, /function setAuthStorageEntry\(key, value\)/);
+  assert.match(main, /function removeAuthStorageEntry\(key\)/);
+  assert.match(main, /function clearAuthStorage\(\)/);
   assert.match(main, /auth-storage:remove/);
   assert.match(main, /fs\.rmSync\(authStoragePath\(\), \{ force: true \}\)/);
   assert.match(preload, /authStorage: Object\.freeze/);
+  assert.match(preload, /get: \(key\)/);
+  assert.match(preload, /set: \(key, value\)/);
+  assert.match(preload, /clear: \(\)/);
+  assert.match(auth, /getItem: \(storageKey: string\).*bridge\.get\(storageKey\)/);
+  assert.match(auth, /setItem: \(storageKey: string, value: string\).*bridge\.set\(storageKey, value\)/);
+  assert.match(auth, /removeItem: \(storageKey: string\).*bridge\.remove\(storageKey\)/);
 });
 
 test("auth gate hides the workspace until session restoration succeeds and clears it on sign-out", () => {
@@ -50,7 +63,8 @@ test("auth gate hides the workspace until session restoration succeeds and clear
   assert.match(gate, /exchangeCodeForSession/);
   assert.match(gate, /Continue with Google/);
   assert.match(gate, /Your documents remain stored locally/);
-  assert.match(gate, /authStorage\?\.remove\(\)/);
+  assert.match(gate, /console\.error\("DocSync OAuth code exchange failed:", exchangeError\)/);
+  assert.match(gate, /authStorage\?\.clear\(\)/);
   assert.match(gate, /Could not connect to DocSync account services/);
   assert.match(account, /useAuthenticatedUser/);
   assert.match(account, /full_name \|\| user\.email \|\| "Signed in"/);
