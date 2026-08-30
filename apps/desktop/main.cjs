@@ -6,6 +6,8 @@ const fs = require("node:fs");
 const http = require("node:http");
 const net = require("node:net");
 const path = require("node:path");
+const { accountWorkspacePath, deviceId } = require("./account-workspace.cjs");
+const { copyToStaging, declineMigration, finalizeStaging, migrationStatus, validateStagingLayout } = require("./legacy-workspace-migration.cjs");
 const {
   appendBounded,
   formatStartupFailure,
@@ -36,6 +38,8 @@ let backendExitDetails = { exitCode: null, signal: null };
 let backendSessionToken = "";
 let backendWorkspacePath = "";
 let mainWindow = null;
+let activeAccountId = null;
+let activeAccountWorkspaceWasNew = false;
 const developmentWebUrl = process.env.DOCUMENTSYNC_WEB_DEV_URL || "";
 const externalBackendOrigin = process.env.DOCUMENTSYNC_BACKEND_ORIGIN || "";
 const publicSupabaseUrl = process.env.DOCUMENTSYNC_SUPABASE_URL || process.env.VITE_SUPABASE_URL || "https://lrgsqwkgokzpurdsvtag.supabase.co";
@@ -71,6 +75,7 @@ function removeAuthStorageEntry(key) {
   return writeAuthStorageEntries(entries);
 }
 function clearAuthStorage() { try { fs.rmSync(authStoragePath(), { force: true }); return true; } catch { return false; } }
+function authenticatedUserId() { try { for (const value of Object.values(readAuthStorageEntries())) { const token = JSON.parse(value).access_token; const payload = token && JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString("utf8")); if (payload && /^[0-9a-f-]{36}$/i.test(payload.sub || "")) return payload.sub.toLowerCase(); } } catch {} return null; }
 function authCallback(url) {
   try { const value = new URL(url); if (value.protocol !== "za.co.docsync:" || value.hostname !== "auth" || value.pathname !== "/callback") return null; const code = value.searchParams.get("code"); return code && /^[A-Za-z0-9._~-]+$/.test(code) ? code : null; } catch { return null; }
 }
@@ -188,7 +193,7 @@ function healthRequest() {
   });
 }
 
-async function startBackend() {
+async function startBackend(preferredPort = null) {
   if (externalBackendOrigin) {
     backendOrigin = new URL(externalBackendOrigin).origin;
     backendPort = Number(new URL(backendOrigin).port);
@@ -202,10 +207,10 @@ async function startBackend() {
     return;
   }
   const paths = applicationPaths();
-  backendPort = await findAvailablePort();
+  backendPort = preferredPort || await findAvailablePort();
   backendOrigin = `http://127.0.0.1:${backendPort}`;
   backendSessionToken = crypto.randomBytes(32).toString("base64url");
-  backendWorkspacePath = path.join(app.getPath("userData"), "workspace");
+  backendWorkspacePath = backendWorkspacePath || path.join(app.getPath("userData"), "bootstrap");
   backendErrorLog = "";
   backendOutputLog = "";
   backendExitDetails = { exitCode: null, signal: null };
@@ -222,6 +227,8 @@ async function startBackend() {
       DOCUMENTSYNC_CORS_ORIGINS: backendOrigin,
       DOCUMENTSYNC_PORT: String(backendPort),
       DOCUMENTSYNC_SUPABASE_URL: publicSupabaseUrl,
+      DOCUMENTSYNC_ACCOUNT_USER_ID: activeAccountId || "",
+      DOCUMENTSYNC_DEVICE_ID: activeAccountId ? deviceId(app.getPath("userData")) : "",
       PYTHONUNBUFFERED: "1",
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -333,12 +340,28 @@ function createWindow() {
   });
 }
 
-function stopBackend() {
+async function stopBackend() {
   if (!backendProcess) return;
   if (backendProcess.exitCode === null && !backendProcess.killed) {
     backendProcess.kill();
+    const exited = await Promise.race([
+      new Promise((resolve) => backendProcess.once("exit", () => resolve(true))),
+      new Promise((resolve) => setTimeout(() => resolve(false), 5_000)),
+    ]);
+    if (!exited) throw new Error("The previous account workspace did not stop in time.");
   }
   backendProcess = null;
+  backendSessionToken = "";
+}
+function cloudStatePath() { return activeAccountId ? path.join(app.getPath("userData"), "accounts", activeAccountId, "cloud-backup-state.json") : null; }
+function readCloudState() { try { const target = cloudStatePath(); return target ? JSON.parse(fs.readFileSync(target, "utf8")) : {}; } catch { return {}; } }
+function writeCloudState(value) { const target = cloudStatePath(); if (!target || !value || typeof value !== "object" || Array.isArray(value) || JSON.stringify(value).length > 4096) return false; fs.mkdirSync(path.dirname(target), { recursive: true }); fs.writeFileSync(target, JSON.stringify(value), "utf8"); return true; }
+
+async function restartBackendForWorkspace(workspace) {
+  const previousPort = backendPort;
+  await stopBackend();
+  backendWorkspacePath = workspace;
+  await startBackend(previousPort);
 }
 
 if (hasSingleInstanceLock) {
@@ -364,8 +387,66 @@ if (hasSingleInstanceLock) {
     ipcMain.handle("auth-storage:set", (_event, key, value) => setAuthStorageEntry(key, value));
     ipcMain.handle("auth-storage:remove", (_event, key) => removeAuthStorageEntry(key));
     ipcMain.handle("auth-storage:clear", () => clearAuthStorage());
+    ipcMain.handle("cloud-backup:get-state", () => readCloudState());
+    ipcMain.handle("cloud-backup:set-state", (_event, value) => writeCloudState(value));
+    ipcMain.handle("account:activate", async (_event, userId) => {
+      if (authenticatedUserId() !== String(userId).toLowerCase()) throw new Error("Account activation does not match the authenticated session.");
+      const workspace = accountWorkspacePath(app.getPath("userData"), userId);
+      // The renderer only receives this IPC after Supabase has established the user;
+      // Electron derives the path and never accepts a renderer filesystem path.
+      activeAccountWorkspaceWasNew = !fs.existsSync(workspace);
+      activeAccountId = userId.toLowerCase();
+      await restartBackendForWorkspace(workspace);
+      return { workspace_ready: true, ...migrationStatus({ userData: app.getPath("userData"), workspace, workspaceWasNew: activeAccountWorkspaceWasNew }), device_id: deviceId(app.getPath("userData")) };
+    });
+    ipcMain.handle("account:legacy-migration", () => {
+      if (!activeAccountId) throw new Error("No authenticated account is active.");
+      return migrationStatus({ userData: app.getPath("userData"), workspace: backendWorkspacePath, workspaceWasNew: activeAccountWorkspaceWasNew });
+    });
+    ipcMain.handle("account:decline-legacy-migration", () => {
+      if (!activeAccountId) throw new Error("No authenticated account is active.");
+      declineMigration(backendWorkspacePath);
+      return migrationStatus({ userData: app.getPath("userData"), workspace: backendWorkspacePath, workspaceWasNew: activeAccountWorkspaceWasNew });
+    });
+    ipcMain.handle("account:import-legacy-workspace", async () => {
+      if (!activeAccountId || authenticatedUserId() !== activeAccountId) throw new Error("Legacy import requires the active authenticated account.");
+      const workspace = backendWorkspacePath;
+      const status = migrationStatus({ userData: app.getPath("userData"), workspace, workspaceWasNew: activeAccountWorkspaceWasNew });
+      if (!status.migration_ready) throw new Error(status.message || "Legacy import is not available for this account.");
+      const { staging, sourceFingerprint } = copyToStaging({ userData: app.getPath("userData"), workspace });
+      try {
+        validateStagingLayout(staging);
+        await restartBackendForWorkspace(staging); // Existing backend init/migrations validate the copied SQLite workspace.
+        await stopBackend();
+        finalizeStaging({ workspace, staging, sourceFingerprint });
+        await startBackend(backendPort);
+        activeAccountWorkspaceWasNew = false;
+        return migrationStatus({ userData: app.getPath("userData"), workspace, workspaceWasNew: false });
+      } catch (error) {
+        await stopBackend();
+        backendWorkspacePath = workspace;
+        await startBackend(backendPort);
+        throw error;
+      }
+    });
+    ipcMain.handle("account:promote-cloud-restore", async (_event, snapshotId) => {
+      if (!activeAccountId || !/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(String(snapshotId))) throw new Error("Invalid staged restore.");
+      const workspace = accountWorkspacePath(app.getPath("userData"), activeAccountId);
+      const staged = path.join(path.dirname(workspace), "restore-temp", String(snapshotId).toLowerCase());
+      const backup = path.join(path.dirname(workspace), "pre-restore-backup");
+      if (!fs.existsSync(staged)) throw new Error("The staged restore is unavailable.");
+      await stopBackend(); fs.rmSync(backup, { recursive: true, force: true });
+      try {
+        fs.renameSync(workspace, backup); fs.renameSync(staged, workspace); await startBackend(backendPort); fs.rmSync(backup, { recursive: true, force: true });
+        return true;
+      } catch (error) {
+        await stopBackend(); if (fs.existsSync(workspace)) fs.rmSync(workspace, { recursive: true, force: true }); if (fs.existsSync(backup)) fs.renameSync(backup, workspace); await startBackend(backendPort); throw error;
+      }
+    });
+    ipcMain.handle("account:deactivate", async () => { await stopBackend(); activeAccountId = null; activeAccountWorkspaceWasNew = false; return true; });
     configureSession();
     try {
+      backendWorkspacePath = path.join(app.getPath("userData"), "bootstrap");
       await startBackend();
       createWindow();
       process.argv.forEach(deliverAuthCallback);

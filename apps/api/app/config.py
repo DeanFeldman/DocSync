@@ -66,6 +66,9 @@ class Settings:
     render_map_confidence_threshold: float
     render_map_dpi: int
     render_map_max_pages: int
+    account_user_id: str
+    device_id: str
+    max_snapshot_bytes: int
 
 
 def _build_settings() -> Settings:
@@ -171,6 +174,9 @@ def _build_settings() -> Settings:
             minimum=1,
             maximum=2000,
         ),
+        account_user_id=os.getenv("DOCUMENTSYNC_ACCOUNT_USER_ID", ""),
+        device_id=os.getenv("DOCUMENTSYNC_DEVICE_ID", ""),
+        max_snapshot_bytes=_bounded_int_env("DOCSYNC_MAX_SNAPSHOT_BYTES", 2 * 1024 * 1024 * 1024, minimum=1, maximum=50 * 1024 * 1024 * 1024),
     )
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 import logging
 import secrets
+from pathlib import Path
 from time import perf_counter
 
 from fastapi import (
@@ -107,6 +108,8 @@ from .audit_logger import AuditLogger
 from .backup_service import DocumentBackupService
 from .error_mapper import DocuSyncError, ErrorMapper
 from .storage_service import DocumentStorageService
+from .snapshot_service import SnapshotError, create_snapshot, restore_snapshot
+from uuid import UUID
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +140,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="DocumentSync API",
-    version="1.17.0",
+    version="1.18.0",
     description="DocSync structured DOCX viewing and controlled editing service.",
     lifespan=lifespan,
 )
@@ -165,6 +168,10 @@ async def secure_local_application(request: Request, call_next):
             )
 
     response = await call_next(request)
+    durable_prefixes = ("/api/document-sets", "/api/documents/", "/api/edit-batches/", "/api/generation-jobs/")
+    if response.status_code < 400 and request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.url.path.startswith(durable_prefixes):
+        if not any(token in request.url.path for token in ("/preview", "/render", "/search", "/pages")):
+            response.headers["X-DocSync-Workspace-Mutated"] = "1"
     response.headers["Cache-Control"] = "no-store"
     connect_src = "connect-src 'self'" + (f" {settings.supabase_origin}" if settings.supabase_origin else "")
     response.headers["Content-Security-Policy"] = (
@@ -204,6 +211,50 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+def _cloud_snapshot_path(snapshot_id: str) -> Path:
+    try:
+        value = str(UUID(snapshot_id))
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail="Snapshot not found.") from error
+    target = settings.data_dir.parent / "snapshots" / f"{value}.zip"
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="Snapshot not found.")
+    return target
+
+
+@app.post("/api/cloud-snapshots", status_code=201)
+def create_local_cloud_snapshot() -> dict:
+    if not settings.account_user_id or not settings.device_id:
+        raise HTTPException(status_code=409, detail="An account workspace is not active.")
+    try:
+        result = create_snapshot(workspace=settings.data_dir, account_dir=settings.data_dir.parent, user_id=settings.account_user_id, device_id=settings.device_id, docsync_version=app.version, max_bytes=settings.max_snapshot_bytes)
+    except SnapshotError as error:
+        raise HTTPException(status_code=422, detail=error.code) from error
+    return {"snapshot_id": result.snapshot_id, "sha256": result.sha256, "archive_size_bytes": result.archive_size_bytes, "workspace_revision": result.workspace_revision}
+
+
+@app.get("/api/cloud-snapshots/{snapshot_id}/archive")
+def download_local_cloud_snapshot(snapshot_id: str) -> FileResponse:
+    return FileResponse(_cloud_snapshot_path(snapshot_id), media_type="application/zip", filename=f"{snapshot_id}.zip", headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/cloud-restores")
+async def stage_cloud_restore(archive: UploadFile = File(...), sha256: str = Form(...)) -> dict:
+    if not settings.account_user_id:
+        raise HTTPException(status_code=409, detail="An account workspace is not active.")
+    download = settings.data_dir.parent / "cloud-download-temp" / "restore.zip"
+    download.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with download.open("wb") as target:
+            while chunk := await archive.read(1024 * 1024): target.write(chunk)
+        staged = restore_snapshot(archive_path=download, expected_sha256=sha256, account_dir=settings.data_dir.parent, user_id=settings.account_user_id, max_bytes=settings.max_snapshot_bytes)
+        return {"snapshot_id": staged.name, "staged": True}
+    except SnapshotError as error:
+        raise HTTPException(status_code=422, detail=error.code) from error
+    finally:
+        download.unlink(missing_ok=True)
 
 
 @app.get("/api/document-sets")

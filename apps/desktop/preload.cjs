@@ -11,4 +11,11 @@ contextBridge.exposeInMainWorld("docSync", Object.freeze({
   getAuthCallback: () => ipcRenderer.invoke("auth:callback"),
   onAuthCallback: (listener) => { const handler = (_event, code) => listener(code); ipcRenderer.on("auth:callback", handler); return () => ipcRenderer.removeListener("auth:callback", handler); },
   authStorage: Object.freeze({ get: (key) => ipcRenderer.invoke("auth-storage:get", key), set: (key, value) => ipcRenderer.invoke("auth-storage:set", key, value), remove: (key) => ipcRenderer.invoke("auth-storage:remove", key), clear: () => ipcRenderer.invoke("auth-storage:clear") }),
+  cloudBackup: Object.freeze({ getState: () => ipcRenderer.invoke("cloud-backup:get-state"), setState: (value) => ipcRenderer.invoke("cloud-backup:set-state", value) }),
+  activateAccount: (userId) => ipcRenderer.invoke("account:activate", userId),
+  getLegacyMigration: () => ipcRenderer.invoke("account:legacy-migration"),
+  importLegacyWorkspace: () => ipcRenderer.invoke("account:import-legacy-workspace"),
+  declineLegacyMigration: () => ipcRenderer.invoke("account:decline-legacy-migration"),
+  promoteCloudRestore: (snapshotId) => ipcRenderer.invoke("account:promote-cloud-restore", snapshotId),
+  deactivateAccount: () => ipcRenderer.invoke("account:deactivate"),
 }));

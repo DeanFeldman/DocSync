@@ -30,7 +30,6 @@ import type {
   GlobalSearchResult,
 } from "./types";
 
-import docSyncLogo from "./assets/Docsync LOGO.png";
 import DocumentExperience from "./DocumentExperience";
 import FindReplacePanel from "./FindReplacePanel";
 import AuthAccount from "./AuthAccount";
@@ -880,11 +879,8 @@ const canUpload = files.length >= 2 && !busyAction;
     <div className={`app-shell ${documentSet ? "workspace-mode" : ""}`}>
       <header className="topbar">
         <a className="brand" href="#top" aria-label="DocSync home">
-          <img
-            className="brand-logo"
-            src={docSyncLogo}
-            alt="DocSync"
-          />
+          <span className="brand-mark" aria-hidden="true">DS</span>
+          <span><strong>DocSync</strong><small>Local-first documents</small></span>
         </a>
 
         {/* <p className="hero-text">

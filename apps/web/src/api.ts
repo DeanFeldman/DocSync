@@ -42,6 +42,7 @@ export class ApiError extends Error {
 
 async function parseResponse<T>(response: Response): Promise<T> {
   if (response.ok) {
+    if (response.headers.get("X-DocSync-Workspace-Mutated") === "1") window.dispatchEvent(new Event("docsync:workspace-mutated"));
     return (await response.json()) as T;
   }
 

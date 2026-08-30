@@ -1,6 +1,6 @@
 [project]
 name = "documentsync-api"
-version = "1.7.0"
+version = "1.18.0"
 description = "DocumentSync desktop DOCX API"
 requires-python = ">=3.11"
 
