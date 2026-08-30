@@ -76,6 +76,7 @@ body {
 .migration-backdrop { position: fixed; z-index: 100; inset: 0; display: grid; place-items: center; padding: 24px; background: rgb(15 23 42 / 48%); }
 .migration-dialog { width: min(100%, 490px); display: grid; gap: 14px; padding: 30px; border: 1px solid var(--line); border-radius: 16px; color: var(--ink); background: var(--surface); box-shadow: var(--shadow); }
 .migration-dialog h2, .migration-dialog p { margin: 0; }.migration-dialog small { color: var(--muted); }.migration-dialog > div { display: flex; flex-wrap: wrap; gap: 9px; }.admin-badge { padding: 4px 7px; border-radius: 999px; color: var(--teal); background: var(--teal-soft); font-size: .68rem; font-weight: 850; }
+.account-area strong,.account-area small{display:block}.account-area small{color:var(--muted);font-size:.68rem}.admin-cards{display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.admin-cards article{display:grid;gap:4px;padding:12px;border:1px solid var(--line);border-radius:9px}.admin-cards span{color:var(--muted);font-size:.8rem}
 .auth-card small, .auth-loading { color: var(--muted); }
 .auth-loading { gap: 14px; align-content: center; }
 
