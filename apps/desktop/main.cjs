@@ -6,7 +6,8 @@ const fs = require("node:fs");
 const http = require("node:http");
 const net = require("node:net");
 const path = require("node:path");
-const { accountWorkspacePath, deviceId, legacyWorkspaceDetected } = require("./account-workspace.cjs");
+const { accountWorkspacePath, deviceId } = require("./account-workspace.cjs");
+const { copyToStaging, declineMigration, finalizeStaging, migrationStatus, validateStagingLayout } = require("./legacy-workspace-migration.cjs");
 const {
   appendBounded,
   formatStartupFailure,
@@ -38,6 +39,7 @@ let backendSessionToken = "";
 let backendWorkspacePath = "";
 let mainWindow = null;
 let activeAccountId = null;
+let activeAccountWorkspaceWasNew = false;
 const developmentWebUrl = process.env.DOCUMENTSYNC_WEB_DEV_URL || "";
 const externalBackendOrigin = process.env.DOCUMENTSYNC_BACKEND_ORIGIN || "";
 const publicSupabaseUrl = process.env.DOCUMENTSYNC_SUPABASE_URL || process.env.VITE_SUPABASE_URL || "https://lrgsqwkgokzpurdsvtag.supabase.co";
@@ -191,7 +193,7 @@ function healthRequest() {
   });
 }
 
-async function startBackend() {
+async function startBackend(preferredPort = null) {
   if (externalBackendOrigin) {
     backendOrigin = new URL(externalBackendOrigin).origin;
     backendPort = Number(new URL(backendOrigin).port);
@@ -205,7 +207,7 @@ async function startBackend() {
     return;
   }
   const paths = applicationPaths();
-  backendPort = await findAvailablePort();
+  backendPort = preferredPort || await findAvailablePort();
   backendOrigin = `http://127.0.0.1:${backendPort}`;
   backendSessionToken = crypto.randomBytes(32).toString("base64url");
   backendWorkspacePath = backendWorkspacePath || path.join(app.getPath("userData"), "bootstrap");
@@ -340,10 +342,21 @@ async function stopBackend() {
   if (!backendProcess) return;
   if (backendProcess.exitCode === null && !backendProcess.killed) {
     backendProcess.kill();
-    await new Promise((resolve) => backendProcess.once("exit", resolve));
+    const exited = await Promise.race([
+      new Promise((resolve) => backendProcess.once("exit", () => resolve(true))),
+      new Promise((resolve) => setTimeout(() => resolve(false), 5_000)),
+    ]);
+    if (!exited) throw new Error("The previous account workspace did not stop in time.");
   }
   backendProcess = null;
   backendSessionToken = "";
+}
+
+async function restartBackendForWorkspace(workspace) {
+  const previousPort = backendPort;
+  await stopBackend();
+  backendWorkspacePath = workspace;
+  await startBackend(previousPort);
 }
 
 if (hasSingleInstanceLock) {
@@ -374,11 +387,42 @@ if (hasSingleInstanceLock) {
       const workspace = accountWorkspacePath(app.getPath("userData"), userId);
       // The renderer only receives this IPC after Supabase has established the user;
       // Electron derives the path and never accepts a renderer filesystem path.
-      await stopBackend(); activeAccountId = userId.toLowerCase();
-      backendWorkspacePath = workspace; await startBackend();
-      return { workspace_ready: true, legacy_workspace_detected: legacyWorkspaceDetected(app.getPath("userData"), workspace), device_id: deviceId(app.getPath("userData")) };
+      activeAccountWorkspaceWasNew = !fs.existsSync(workspace);
+      activeAccountId = userId.toLowerCase();
+      await restartBackendForWorkspace(workspace);
+      return { workspace_ready: true, ...migrationStatus({ userData: app.getPath("userData"), workspace, workspaceWasNew: activeAccountWorkspaceWasNew }), device_id: deviceId(app.getPath("userData")) };
     });
-    ipcMain.handle("account:deactivate", async () => { await stopBackend(); activeAccountId = null; return true; });
+    ipcMain.handle("account:legacy-migration", () => {
+      if (!activeAccountId) throw new Error("No authenticated account is active.");
+      return migrationStatus({ userData: app.getPath("userData"), workspace: backendWorkspacePath, workspaceWasNew: activeAccountWorkspaceWasNew });
+    });
+    ipcMain.handle("account:decline-legacy-migration", () => {
+      if (!activeAccountId) throw new Error("No authenticated account is active.");
+      declineMigration(backendWorkspacePath);
+      return migrationStatus({ userData: app.getPath("userData"), workspace: backendWorkspacePath, workspaceWasNew: activeAccountWorkspaceWasNew });
+    });
+    ipcMain.handle("account:import-legacy-workspace", async () => {
+      if (!activeAccountId || authenticatedUserId() !== activeAccountId) throw new Error("Legacy import requires the active authenticated account.");
+      const workspace = backendWorkspacePath;
+      const status = migrationStatus({ userData: app.getPath("userData"), workspace, workspaceWasNew: activeAccountWorkspaceWasNew });
+      if (!status.migration_ready) throw new Error(status.message || "Legacy import is not available for this account.");
+      const { staging, sourceFingerprint } = copyToStaging({ userData: app.getPath("userData"), workspace });
+      try {
+        validateStagingLayout(staging);
+        await restartBackendForWorkspace(staging); // Existing backend init/migrations validate the copied SQLite workspace.
+        await stopBackend();
+        finalizeStaging({ workspace, staging, sourceFingerprint });
+        await startBackend(backendPort);
+        activeAccountWorkspaceWasNew = false;
+        return migrationStatus({ userData: app.getPath("userData"), workspace, workspaceWasNew: false });
+      } catch (error) {
+        await stopBackend();
+        backendWorkspacePath = workspace;
+        await startBackend(backendPort);
+        throw error;
+      }
+    });
+    ipcMain.handle("account:deactivate", async () => { await stopBackend(); activeAccountId = null; activeAccountWorkspaceWasNew = false; return true; });
     configureSession();
     try {
       backendWorkspacePath = path.join(app.getPath("userData"), "bootstrap");

@@ -49,6 +49,8 @@
     "files": [
       "apps/desktop/main.cjs",
       "apps/desktop/preload.cjs",
+      "apps/desktop/account-workspace.cjs",
+      "apps/desktop/legacy-workspace-migration.cjs",
       "apps/desktop/startup-supervision.cjs",
       "package.json"
     ],

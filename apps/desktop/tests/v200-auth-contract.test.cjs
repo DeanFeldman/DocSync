@@ -68,7 +68,7 @@ test("auth gate hides the workspace until session restoration succeeds and clear
   const gate = read("apps/web/src/AuthGate.tsx");
   const account = read("apps/web/src/AuthAccount.tsx");
   assert.match(main, /<AuthGate><App \/><\/AuthGate>/);
-  assert.match(gate, /"loading" \| "signed_out" \| "signing_in" \| "signed_in" \| "error"/);
+  assert.match(gate, /"loading_auth" \| "signed_out" \| "signing_in" \| "activating_account" \| "signed_in" \| "error"/);
   assert.match(gate, /client\.auth\.getSession/);
   assert.match(gate, /client\.auth\.getUser/);
   assert.match(gate, /getAuthCallback/);

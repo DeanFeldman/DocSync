@@ -73,6 +73,9 @@ body {
 .auth-card { width: min(100%, 440px); display: grid; gap: 18px; justify-items: center; padding: 46px; border: 1px solid var(--line); border-radius: 20px; background: var(--surface); box-shadow: var(--shadow); text-align: center; }
 .auth-card img, .auth-loading img { width: min(210px, 65vw); height: auto; }
 .auth-card h1, .auth-card p { margin: 0; }
+.migration-backdrop { position: fixed; z-index: 100; inset: 0; display: grid; place-items: center; padding: 24px; background: rgb(15 23 42 / 48%); }
+.migration-dialog { width: min(100%, 490px); display: grid; gap: 14px; padding: 30px; border: 1px solid var(--line); border-radius: 16px; color: var(--ink); background: var(--surface); box-shadow: var(--shadow); }
+.migration-dialog h2, .migration-dialog p { margin: 0; }.migration-dialog small { color: var(--muted); }.migration-dialog > div { display: flex; flex-wrap: wrap; gap: 9px; }.admin-badge { padding: 4px 7px; border-radius: 999px; color: var(--teal); background: var(--teal-soft); font-size: .68rem; font-weight: 850; }
 .auth-card small, .auth-loading { color: var(--muted); }
 .auth-loading { gap: 14px; align-content: center; }
 
