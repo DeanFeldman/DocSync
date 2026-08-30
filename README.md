@@ -4,7 +4,7 @@
 [![Release](https://github.com/DeanFeldman/DocSync/actions/workflows/release.yml/badge.svg)](https://github.com/DeanFeldman/DocSync/actions/workflows/release.yml)
 [![Latest Release](https://img.shields.io/github/v/release/DeanFeldman/DocSync)](https://github.com/DeanFeldman/DocSync/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-Windows-0078D4)](#requirements)
-[![Version](https://img.shields.io/badge/version-1.15.0-blue)](#latest-release)
+[![Version](https://img.shields.io/badge/version-1.16.0-blue)](#latest-release)
 
 DocSync is a local-first Windows desktop application for safely coordinating edits across related Microsoft Word documents.
 
@@ -36,22 +36,22 @@ SHA256SUMS.txt
 
 ## Latest Release
 
-### Version 1.15.0
+### Version 1.16.0
 
-DocSync `v1.15.0` starts preserving public GitHub Release download history with
-a daily, repository-managed snapshot collector.
+DocSync `v1.16.0` is a real-document compatibility and reliability release.
 
 The application now:
 
-- Collects installer asset download counts daily through GitHub Actions.
-- Preserves raw asset-level history and calculated daily deltas in
-  `analytics/download-history.csv`.
-- Generates per-release and 7-day/30-day summary metrics without collecting
-  any in-app user telemetry.
+- Adds a repeatable DOCX compatibility corpus and production inventory harness.
+- Covers formatted/split-run text, lists, tables, headers/footers, and safe
+  unsupported-structure boundaries.
+- Keeps ambiguous or unsupported Word structures read-only rather than guessing.
 
 See:
 
-- [v1.15.0 release notes](docs/v1.15.0-release-notes.md)
+- [v1.16.0 release notes](docs/v1.16.0-release-notes.md)
+- [v1.16.0 manual test plan](docs/v1.16.0-manual-testing.md)
+- [v1.16.0 compatibility evidence](docs/evidence/v1.16.0-compatibility.md)
 - [Download statistics](analytics/README.md)
 - [Supabase analytics setup](docs/analytics-supabase.md)
 - [Batch editing and complete Word text inventory](docs/batch-find-replace-text-inventory.md)
@@ -487,7 +487,7 @@ The release workflow runs when a tag beginning with `v` is pushed.
 Example:
 
 ```powershell
-$version = "1.15.0"
+$version = "1.16.0"
 
 git switch main
 git pull origin main
