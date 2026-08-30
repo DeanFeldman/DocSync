@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import sys
 
 
 SCRIPT = Path(__file__).parents[1] / "collect_download_stats.py"
+sys.path.insert(0, str(SCRIPT.parent))
 SPEC = importlib.util.spec_from_file_location("collect_download_stats", SCRIPT)
 collector = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
