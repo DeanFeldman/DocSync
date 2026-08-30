@@ -6,6 +6,7 @@ const fs = require("node:fs");
 const http = require("node:http");
 const net = require("node:net");
 const path = require("node:path");
+const { accountWorkspacePath, deviceId, legacyWorkspaceDetected } = require("./account-workspace.cjs");
 const {
   appendBounded,
   formatStartupFailure,
@@ -36,6 +37,7 @@ let backendExitDetails = { exitCode: null, signal: null };
 let backendSessionToken = "";
 let backendWorkspacePath = "";
 let mainWindow = null;
+let activeAccountId = null;
 const developmentWebUrl = process.env.DOCUMENTSYNC_WEB_DEV_URL || "";
 const externalBackendOrigin = process.env.DOCUMENTSYNC_BACKEND_ORIGIN || "";
 const publicSupabaseUrl = process.env.DOCUMENTSYNC_SUPABASE_URL || process.env.VITE_SUPABASE_URL || "https://lrgsqwkgokzpurdsvtag.supabase.co";
@@ -205,7 +207,7 @@ async function startBackend() {
   backendPort = await findAvailablePort();
   backendOrigin = `http://127.0.0.1:${backendPort}`;
   backendSessionToken = crypto.randomBytes(32).toString("base64url");
-  backendWorkspacePath = path.join(app.getPath("userData"), "workspace");
+  backendWorkspacePath = backendWorkspacePath || path.join(app.getPath("userData"), "bootstrap");
   backendErrorLog = "";
   backendOutputLog = "";
   backendExitDetails = { exitCode: null, signal: null };
@@ -333,12 +335,14 @@ function createWindow() {
   });
 }
 
-function stopBackend() {
+async function stopBackend() {
   if (!backendProcess) return;
   if (backendProcess.exitCode === null && !backendProcess.killed) {
     backendProcess.kill();
+    await new Promise((resolve) => backendProcess.once("exit", resolve));
   }
   backendProcess = null;
+  backendSessionToken = "";
 }
 
 if (hasSingleInstanceLock) {
@@ -364,8 +368,18 @@ if (hasSingleInstanceLock) {
     ipcMain.handle("auth-storage:set", (_event, key, value) => setAuthStorageEntry(key, value));
     ipcMain.handle("auth-storage:remove", (_event, key) => removeAuthStorageEntry(key));
     ipcMain.handle("auth-storage:clear", () => clearAuthStorage());
+    ipcMain.handle("account:activate", async (_event, userId) => {
+      const workspace = accountWorkspacePath(app.getPath("userData"), userId);
+      // The renderer only receives this IPC after Supabase has established the user;
+      // Electron derives the path and never accepts a renderer filesystem path.
+      await stopBackend(); activeAccountId = userId.toLowerCase();
+      backendWorkspacePath = workspace; await startBackend();
+      return { workspace_ready: true, legacy_workspace_detected: legacyWorkspaceDetected(app.getPath("userData"), workspace), device_id: deviceId(app.getPath("userData")) };
+    });
+    ipcMain.handle("account:deactivate", async () => { await stopBackend(); activeAccountId = null; return true; });
     configureSession();
     try {
+      backendWorkspacePath = path.join(app.getPath("userData"), "bootstrap");
       await startBackend();
       createWindow();
       process.argv.forEach(deliverAuthCallback);
