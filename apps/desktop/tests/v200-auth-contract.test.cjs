@@ -65,6 +65,7 @@ test("auth persistence is encrypted key/value storage and does not overwrite PKC
 
 test("auth gate hides the workspace until session restoration succeeds and clears it on sign-out", () => {
   const main = read("apps/web/src/main.tsx");
+  const app = read("apps/web/src/App.tsx");
   const gate = read("apps/web/src/AuthGate.tsx");
   const account = read("apps/web/src/AuthAccount.tsx");
   assert.match(main, /<AuthGate><App \/><\/AuthGate>/);
@@ -81,4 +82,6 @@ test("auth gate hides the workspace until session restoration succeeds and clear
   assert.match(account, /useAuthenticatedUser/);
   assert.match(account, /full_name \|\| user\.email \|\| "Signed in"/);
   assert.match(account, /Sign out/);
+  assert.ok(app.indexOf("<AuthAccount />") < app.indexOf("{!documentSet ? ("));
+  assert.equal((app.match(/<AuthAccount \/>/g) || []).length, 1);
 });

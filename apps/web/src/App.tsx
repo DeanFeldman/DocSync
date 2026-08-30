@@ -915,6 +915,7 @@ const canUpload = files.length >= 2 && !busyAction;
               ))}
             </div>
           </details>
+          <AuthAccount />
           {documentSet && (
             <button type="button" className="quiet-button" onClick={() => resetWorkspace()}>
               Home
@@ -1252,7 +1253,6 @@ const canUpload = files.length >= 2 && !busyAction;
                 )}
               </div>
 
-              <AuthAccount />
               <button type="button" className="toolbar-button" onClick={() => setWorkspacePanel("find")}>Find &amp; Replace</button>
               <button type="button" className="toolbar-button pending-batch-button" onClick={() => setWorkspacePanel("pending")}>Pending changes <strong>{pendingChangeCount}</strong></button>
 

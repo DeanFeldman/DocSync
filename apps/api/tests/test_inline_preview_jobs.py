@@ -5,6 +5,7 @@ import io
 import os
 from pathlib import Path
 import sys
+import threading
 import time
 
 from docx import Document
@@ -186,11 +187,17 @@ def test_preview_job_returns_before_word_finishes_and_reuses_cache(
     app = load_test_app(tmp_path, monkeypatch)
     document_service = importlib.import_module("app.document_service")
     render_calls = 0
+    render_started = threading.Event()
+    allow_render_to_finish = threading.Event()
+    render_finished = threading.Event()
+    request_finished = threading.Event()
 
     def fake_word_render(session, document, version):
         nonlocal render_calls
         render_calls += 1
-        time.sleep(0.25)
+        render_started.set()
+        if not allow_render_to_finish.wait(timeout=5):
+            raise RuntimeError("Test renderer was not released.")
         output_path = document_service.rendered_pdf_path(document, version.id)
         temporary_path = output_path.with_name(f"{version.id}-test-refresh.pdf")
         write_pdf(
@@ -198,11 +205,13 @@ def test_preview_job_returns_before_word_finishes_and_reuses_cache(
             [(72, 100, text, None)],
         )
         temporary_path.replace(output_path)
-        return document_service.serialize_cached_word_preview(
+        result = document_service.serialize_cached_word_preview(
             session,
             document,
             version,
         )
+        render_finished.set()
+        return result
 
     monkeypatch.setattr(
         document_service,
@@ -213,14 +222,26 @@ def test_preview_job_returns_before_word_finishes_and_reuses_cache(
     with TestClient(app) as client:
         _workspace, primary = upload(client, docx_bytes(text))
         version_id = primary["version_id"]
-        started = time.monotonic()
-        accepted = client.post(
-            f"/api/document-versions/{version_id}/preview-jobs"
-        )
-        elapsed = time.monotonic() - started
+        accepted_holder: dict[str, object] = {}
+
+        def submit_preview_job() -> None:
+            accepted_holder["response"] = client.post(
+                f"/api/document-versions/{version_id}/preview-jobs"
+            )
+            request_finished.set()
+
+        request_thread = threading.Thread(target=submit_preview_job)
+        request_thread.start()
+        assert render_started.wait(timeout=2), "Word rendering did not start."
+        assert request_finished.wait(timeout=2), "Preview request did not return."
+        assert not render_finished.is_set()
+        accepted = accepted_holder["response"]
+        assert isinstance(accepted, type(client.get("/api/health")))
+        allow_render_to_finish.set()
+        request_thread.join(timeout=2)
+        assert not request_thread.is_alive()
 
         assert accepted.status_code == 202, accepted.text
-        assert elapsed < 0.2
         initial = accepted.json()
         assert initial["status"] in {"queued", "processing"}
         assert initial["version_id"] == version_id
