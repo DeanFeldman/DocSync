@@ -21,7 +21,7 @@ import zipfile
 
 
 MANIFEST_SCHEMA_VERSION = 1
-DATABASE_NAME = "docsync.db"
+DATABASE_NAME = "documentsync.db"
 INCLUDED_DIRECTORIES = ("originals", "generated")
 EXCLUDED_NAMES = {"renders", "logs", "temp", "backups", "migration-backups", "snapshot-temp", "restore-temp", "snapshots", "pre-restore-backup"}
 MAX_FILES = 20_000
@@ -78,7 +78,7 @@ def _write_state(account_dir: Path, result: SnapshotResult) -> None:
 def _database_schema_version(database: Path) -> int:
     try:
         with sqlite3.connect(f"file:{database.as_posix()}?mode=ro", uri=True) as connection:
-            value = connection.execute("SELECT MAX(version) FROM workspace_schema_migrations").fetchone()[0]
+            value = connection.execute("SELECT MAX(version) FROM docsync_schema_migrations").fetchone()[0]
             return int(value or 0)
     except sqlite3.Error as error:
         raise SnapshotError("snapshot_database_backup_failed", "The workspace database could not be opened.") from error

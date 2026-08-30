@@ -23,10 +23,10 @@ DEVICE = "33333333-3333-4333-8333-333333333333"
 def workspace(root: Path, name: str = "workspace") -> Path:
     target = root / name
     target.mkdir(parents=True)
-    with sqlite3.connect(target / "docsync.db") as connection:
+    with sqlite3.connect(target / "documentsync.db") as connection:
         connection.execute("pragma journal_mode=wal")
-        connection.execute("create table workspace_schema_migrations(version integer)")
-        connection.execute("insert into workspace_schema_migrations values (9)")
+        connection.execute("create table docsync_schema_migrations(version integer)")
+        connection.execute("insert into docsync_schema_migrations values (9)")
         connection.execute("create table document_sets(id text primary key, name text)")
         connection.execute("insert into document_sets values ('one', 'Snapshot test')")
     connection.close()
@@ -45,12 +45,12 @@ def test_snapshot_uses_consistent_sqlite_backup_inventory_and_excludes_cache(tmp
     source = workspace(tmp_path); result = snapshot(source, tmp_path / "account")
     with zipfile.ZipFile(result.archive_path) as archive:
         names = set(archive.namelist()); manifest = json.loads(archive.read("manifest.json"))
-        assert "workspace/docsync.db" in names
+        assert "workspace/documentsync.db" in names
         assert "workspace/originals/source.docx" in names
         assert "workspace/generated/versions/immutable.docx" in names
         assert not any("renders" in name or "auth-session" in name or ".env" in name for name in names)
         assert manifest["user_id"] == USER_A and manifest["device_id"] == DEVICE and manifest["workspace_revision"] == 1
-        extracted = tmp_path / "snapshot.db"; extracted.write_bytes(archive.read("workspace/docsync.db"))
+        extracted = tmp_path / "snapshot.db"; extracted.write_bytes(archive.read("workspace/documentsync.db"))
     with sqlite3.connect(extracted) as connection:
         assert connection.execute("pragma integrity_check").fetchone()[0] == "ok"
         assert connection.execute("select name from document_sets").fetchone()[0] == "Snapshot test"
@@ -97,7 +97,7 @@ def test_restore_validates_owner_manifest_database_and_stages_without_touching_l
 def test_missing_manifest_unsupported_version_and_corrupt_database_are_rejected(tmp_path: Path):
     source = workspace(tmp_path); account = tmp_path / "account"; result = snapshot(source, account)
     bad = tmp_path / "bad.zip"
-    with zipfile.ZipFile(bad, "w") as output: output.writestr("workspace/docsync.db", b"not sqlite")
+    with zipfile.ZipFile(bad, "w") as output: output.writestr("workspace/documentsync.db", b"not sqlite")
     with pytest.raises(SnapshotError) as missing: restore_snapshot(archive_path=bad, expected_sha256=__import__("hashlib").sha256(bad.read_bytes()).hexdigest(), account_dir=account, user_id=USER_A, max_bytes=10_000_000)
     assert missing.value.code == "restore_manifest_invalid"
     future_archive = tmp_path / "future.zip"
