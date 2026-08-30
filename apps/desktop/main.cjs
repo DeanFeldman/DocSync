@@ -73,6 +73,7 @@ function removeAuthStorageEntry(key) {
   return writeAuthStorageEntries(entries);
 }
 function clearAuthStorage() { try { fs.rmSync(authStoragePath(), { force: true }); return true; } catch { return false; } }
+function authenticatedUserId() { try { for (const value of Object.values(readAuthStorageEntries())) { const token = JSON.parse(value).access_token; const payload = token && JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString("utf8")); if (payload && /^[0-9a-f-]{36}$/i.test(payload.sub || "")) return payload.sub.toLowerCase(); } } catch {} return null; }
 function authCallback(url) {
   try { const value = new URL(url); if (value.protocol !== "za.co.docsync:" || value.hostname !== "auth" || value.pathname !== "/callback") return null; const code = value.searchParams.get("code"); return code && /^[A-Za-z0-9._~-]+$/.test(code) ? code : null; } catch { return null; }
 }
@@ -369,6 +370,7 @@ if (hasSingleInstanceLock) {
     ipcMain.handle("auth-storage:remove", (_event, key) => removeAuthStorageEntry(key));
     ipcMain.handle("auth-storage:clear", () => clearAuthStorage());
     ipcMain.handle("account:activate", async (_event, userId) => {
+      if (authenticatedUserId() !== String(userId).toLowerCase()) throw new Error("Account activation does not match the authenticated session.");
       const workspace = accountWorkspacePath(app.getPath("userData"), userId);
       // The renderer only receives this IPC after Supabase has established the user;
       // Electron derives the path and never accepts a renderer filesystem path.
