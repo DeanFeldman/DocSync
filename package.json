@@ -1,6 +1,6 @@
 {
   "name": "docsync-desktop",
-  "version": "1.16.0",
+  "version": "1.17.0",
   "private": true,
   "description": "DocSync Windows desktop application for coordinated DOCX editing",
   "author": "Dean Feldman",
@@ -37,6 +37,12 @@
     "productName": "DocSync",
     "asar": true,
     "artifactName": "${productName}-Setup-${version}.${ext}",
+    "protocols": [
+      {
+        "name": "DocSync",
+        "schemes": ["za.co.docsync"]
+      }
+    ],
     "directories": {
       "output": "release/v1"
     },

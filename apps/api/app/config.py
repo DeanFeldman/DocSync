@@ -4,6 +4,7 @@ import os
 from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
+from urllib.parse import urlparse
 
 
 def _bounded_float_env(
@@ -59,6 +60,7 @@ class Settings:
     word_worker_timeout_seconds: int
     word_worker_autostart: bool
     session_token: str
+    supabase_origin: str
     near_match_threshold: float
     near_match_candidate_limit: int
     render_map_confidence_threshold: float
@@ -98,6 +100,13 @@ def _build_settings() -> Settings:
         ).split(",")
         if origin.strip()
     )
+    raw_supabase_url = os.getenv("DOCUMENTSYNC_SUPABASE_URL", "")
+    parsed_supabase_url = urlparse(raw_supabase_url)
+    supabase_origin = (
+        f"{parsed_supabase_url.scheme}://{parsed_supabase_url.netloc}"
+        if parsed_supabase_url.scheme == "https" and parsed_supabase_url.netloc
+        else ""
+    )
 
     data_dir.mkdir(parents=True, exist_ok=True)
     (data_dir / "originals").mkdir(parents=True, exist_ok=True)
@@ -131,6 +140,7 @@ def _build_settings() -> Settings:
             "1",
         ).strip().casefold() not in {"0", "false", "no", "off"},
         session_token=os.getenv("DOCUMENTSYNC_SESSION_TOKEN", ""),
+        supabase_origin=supabase_origin,
         near_match_threshold=_bounded_float_env(
             "DOCUMENTSYNC_NEAR_MATCH_THRESHOLD",
             0.82,

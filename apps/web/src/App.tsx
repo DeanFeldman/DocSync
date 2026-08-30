@@ -33,6 +33,7 @@ import type {
 import docSyncLogo from "./assets/Docsync LOGO.png";
 import DocumentExperience from "./DocumentExperience";
 import FindReplacePanel from "./FindReplacePanel";
+import AuthAccount from "./AuthAccount";
 import {
   clearWorkspaceResourcesForDocument,
   clearWorkspaceResourcesForSet,
@@ -914,6 +915,7 @@ const canUpload = files.length >= 2 && !busyAction;
               ))}
             </div>
           </details>
+          <AuthAccount />
           {documentSet && (
             <button type="button" className="quiet-button" onClick={() => resetWorkspace()}>
               Home

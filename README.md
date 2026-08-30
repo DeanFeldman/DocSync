@@ -4,7 +4,7 @@
 [![Release](https://github.com/DeanFeldman/DocSync/actions/workflows/release.yml/badge.svg)](https://github.com/DeanFeldman/DocSync/actions/workflows/release.yml)
 [![Latest Release](https://img.shields.io/github/v/release/DeanFeldman/DocSync)](https://github.com/DeanFeldman/DocSync/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-Windows-0078D4)](#requirements)
-[![Version](https://img.shields.io/badge/version-1.16.0-blue)](#latest-release)
+[![Version](https://img.shields.io/badge/version-1.17.0-blue)](#latest-release)
 
 DocSync is a local-first Windows desktop application for safely coordinating edits across related Microsoft Word documents.
 
@@ -36,22 +36,20 @@ SHA256SUMS.txt
 
 ## Latest Release
 
-### Version 1.16.0
+### Version 1.17.0
 
-DocSync `v1.16.0` is a real-document compatibility and reliability release.
+DocSync `v1.17.0` adds the local desktop foundation for optional Google sign-in.
 
 The application now:
 
-- Adds a repeatable DOCX compatibility corpus and production inventory harness.
-- Covers formatted/split-run text, lists, tables, headers/footers, and safe
-  unsupported-structure boundaries.
-- Keeps ambiguous or unsupported Word structures read-only rather than guessing.
+- Uses Supabase Auth PKCE with a system-browser Google sign-in flow.
+- Stores a restored session only through Electron safeStorage.
+- Keeps local documents on the device; document content is not uploaded.
 
 See:
 
-- [v1.16.0 release notes](docs/v1.16.0-release-notes.md)
-- [v1.16.0 manual test plan](docs/v1.16.0-manual-testing.md)
-- [v1.16.0 compatibility evidence](docs/evidence/v1.16.0-compatibility.md)
+- [v1.17.0 release notes](docs/v1.17.0-release-notes.md)
+- [v1.17.0 manual test plan](docs/v1.17.0-manual-testing.md)
 - [Download statistics](analytics/README.md)
 - [Supabase analytics setup](docs/analytics-supabase.md)
 - [Batch editing and complete Word text inventory](docs/batch-find-replace-text-inventory.md)
@@ -487,7 +485,7 @@ The release workflow runs when a tag beginning with `v` is pushed.
 Example:
 
 ```powershell
-$version = "1.16.0"
+$version = "1.17.0"
 
 git switch main
 git pull origin main

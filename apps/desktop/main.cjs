@@ -18,6 +18,8 @@ const {
   dialog,
   ipcMain,
   session,
+  shell,
+  safeStorage,
 } = require("electron");
 
 app.enableSandbox();
@@ -36,7 +38,51 @@ let backendWorkspacePath = "";
 let mainWindow = null;
 const developmentWebUrl = process.env.DOCUMENTSYNC_WEB_DEV_URL || "";
 const externalBackendOrigin = process.env.DOCUMENTSYNC_BACKEND_ORIGIN || "";
+const publicSupabaseUrl = process.env.DOCUMENTSYNC_SUPABASE_URL || process.env.VITE_SUPABASE_URL || "https://lrgsqwkgokzpurdsvtag.supabase.co";
 const THEME_PREFERENCE_KEY = "docsync-theme";
+let pendingAuthCode = null;
+function authStoragePath() { return path.join(app.getPath("userData"), "auth-session.bin"); }
+function validAuthStorageKey(key) { return typeof key === "string" && key.length > 0 && key.length <= 256 && /^[A-Za-z0-9._:-]+$/.test(key); }
+function validAuthStorageValue(value) { return typeof value === "string" && value.length <= 65_536; }
+function readAuthStorageEntries() {
+  if (!safeStorage.isEncryptionAvailable()) return {};
+  try {
+    const entries = JSON.parse(safeStorage.decryptString(fs.readFileSync(authStoragePath())));
+    if (!entries || Array.isArray(entries) || typeof entries !== "object") return {};
+    return Object.fromEntries(Object.entries(entries).filter(([key, value]) => validAuthStorageKey(key) && validAuthStorageValue(value)));
+  } catch { return {}; }
+}
+function writeAuthStorageEntries(entries) {
+  if (!safeStorage.isEncryptionAvailable()) return false;
+  try { fs.mkdirSync(app.getPath("userData"), { recursive: true }); fs.writeFileSync(authStoragePath(), safeStorage.encryptString(JSON.stringify(entries))); return true; } catch { return false; }
+}
+function getAuthStorageEntry(key) { return validAuthStorageKey(key) ? readAuthStorageEntries()[key] || null : null; }
+function setAuthStorageEntry(key, value) {
+  if (!validAuthStorageKey(key) || !validAuthStorageValue(value)) return false;
+  const entries = readAuthStorageEntries();
+  if (!(key in entries) && Object.keys(entries).length >= 50) return false;
+  entries[key] = value;
+  return writeAuthStorageEntries(entries);
+}
+function removeAuthStorageEntry(key) {
+  if (!validAuthStorageKey(key)) return false;
+  const entries = readAuthStorageEntries(); delete entries[key];
+  if (Object.keys(entries).length === 0) return clearAuthStorage();
+  return writeAuthStorageEntries(entries);
+}
+function clearAuthStorage() { try { fs.rmSync(authStoragePath(), { force: true }); return true; } catch { return false; } }
+function authCallback(url) {
+  try { const value = new URL(url); if (value.protocol !== "za.co.docsync:" || value.hostname !== "auth" || value.pathname !== "/callback") return null; const code = value.searchParams.get("code"); return code && /^[A-Za-z0-9._~-]+$/.test(code) ? code : null; } catch { return null; }
+}
+function deliverAuthCallback(url) { const code = authCallback(url); if (!code) return false; pendingAuthCode = code; if (mainWindow) { if (mainWindow.isMinimized()) mainWindow.restore(); mainWindow.focus(); mainWindow.webContents.send("auth:callback", code); } return true; }
+function trustedOAuthUrl(value) { try { const url = new URL(value); return url.protocol === "https:" && /(^|\.)supabase\.co$/i.test(url.hostname) && url.pathname === "/auth/v1/authorize"; } catch { return false; } }
+function registerProtocolClient() {
+  if (process.defaultApp) {
+    if (process.argv.length < 2) return false;
+    return app.setAsDefaultProtocolClient("za.co.docsync", process.execPath, [path.resolve(process.argv[1])]);
+  }
+  return app.setAsDefaultProtocolClient("za.co.docsync");
+}
 
 function themePreferencePath() {
   return path.join(app.getPath("userData"), "preferences.json");
@@ -175,6 +221,7 @@ async function startBackend() {
       DOCUMENTSYNC_SESSION_TOKEN: backendSessionToken,
       DOCUMENTSYNC_CORS_ORIGINS: backendOrigin,
       DOCUMENTSYNC_PORT: String(backendPort),
+      DOCUMENTSYNC_SUPABASE_URL: publicSupabaseUrl,
       PYTHONUNBUFFERED: "1",
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -296,8 +343,10 @@ function stopBackend() {
 
 if (hasSingleInstanceLock) {
   app.setAppUserModelId("za.co.docsync.desktop");
+  registerProtocolClient();
 
-  app.on("second-instance", () => {
+  app.on("second-instance", (_event, argv) => {
+    argv.forEach(deliverAuthCallback);
     if (!mainWindow) return;
     if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.focus();
@@ -306,10 +355,20 @@ if (hasSingleInstanceLock) {
   app.whenReady().then(async () => {
     ipcMain.on("theme:get-preference", (event) => { event.returnValue = readThemePreference(); });
     ipcMain.on("theme:set-preference", (_event, preference) => persistThemePreference(preference));
+    ipcMain.handle("auth:open-oauth", (_event, url) => {
+      if (!trustedOAuthUrl(url)) return false;
+      return shell.openExternal(url).then(() => true);
+    });
+    ipcMain.handle("auth:callback", () => { const code = pendingAuthCode; pendingAuthCode = null; return code; });
+    ipcMain.handle("auth-storage:get", (_event, key) => getAuthStorageEntry(key));
+    ipcMain.handle("auth-storage:set", (_event, key, value) => setAuthStorageEntry(key, value));
+    ipcMain.handle("auth-storage:remove", (_event, key) => removeAuthStorageEntry(key));
+    ipcMain.handle("auth-storage:clear", () => clearAuthStorage());
     configureSession();
     try {
       await startBackend();
       createWindow();
+      process.argv.forEach(deliverAuthCallback);
     } catch (error) {
       dialog.showErrorBox(
         "DocSync could not start",
@@ -330,4 +389,4 @@ if (hasSingleInstanceLock) {
   app.on("window-all-closed", () => app.quit());
 }
 
-module.exports = { applicationPaths, findAvailablePort, isTrustedUrl };
+module.exports = { applicationPaths, findAvailablePort, isTrustedUrl, registerProtocolClient, getAuthStorageEntry, setAuthStorageEntry, removeAuthStorageEntry, clearAuthStorage };

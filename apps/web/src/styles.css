@@ -69,6 +69,13 @@ body {
   background: var(--app-bg);
 }
 
+.auth-screen { min-height: 100vh; display: grid; place-items: center; padding: 24px; background: linear-gradient(135deg, var(--app-bg), var(--blue-soft)); }
+.auth-card { width: min(100%, 440px); display: grid; gap: 18px; justify-items: center; padding: 46px; border: 1px solid var(--line); border-radius: 20px; background: var(--surface); box-shadow: var(--shadow); text-align: center; }
+.auth-card img, .auth-loading img { width: min(210px, 65vw); height: auto; }
+.auth-card h1, .auth-card p { margin: 0; }
+.auth-card small, .auth-loading { color: var(--muted); }
+.auth-loading { gap: 14px; align-content: center; }
+
 /* Workspace-wide exhaustive Find & Replace and durable pending batches. */
 .find-replace-panel {
   margin: 0 0 1rem;
@@ -798,6 +805,9 @@ textarea:focus-visible {
 .quiet-button { min-height: 38px; padding: 9px 13px; color: var(--navy); background: #fff; border: 1px solid #cfd9e5; }
 .quiet-button:hover:not(:disabled) { background: #f5f8fb; border-color: #aebdce; }
 .quiet-button:disabled { opacity: 0.5; cursor: not-allowed; }
+.account-area { display: inline-flex; align-items: center; gap: 8px; font-size: 0.8rem; }
+.account-area img { width: 26px; height: 26px; border-radius: 50%; }
+.account-area small { color: #a22; max-width: 150px; }
 .text-button { border: 0; background: none; color: var(--navy); padding: 4px; }
 
 .alert { display: grid; gap: 4px; border-radius: 12px; padding: 13px 15px; margin: 16px max(22px, calc((100vw - 1500px) / 2)); }

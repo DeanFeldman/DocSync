@@ -137,7 +137,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="DocumentSync API",
-    version="1.16.0",
+    version="1.17.0",
     description="DocSync structured DOCX viewing and controlled editing service.",
     lifespan=lifespan,
 )
@@ -166,9 +166,10 @@ async def secure_local_application(request: Request, call_next):
 
     response = await call_next(request)
     response.headers["Cache-Control"] = "no-store"
+    connect_src = "connect-src 'self'" + (f" {settings.supabase_origin}" if settings.supabase_origin else "")
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
-        "connect-src 'self'; frame-src 'self'; object-src 'self'; base-uri 'none'; "
+        f"{connect_src}; frame-src 'self'; object-src 'self'; base-uri 'none'; "
         "frame-ancestors 'self'; form-action 'self'"
     )
     response.headers["Referrer-Policy"] = "no-referrer"
@@ -836,3 +837,7 @@ if settings.web_dist_dir.is_dir():
     @app.get("/", include_in_schema=False)
     def read_desktop_application() -> FileResponse:
         return FileResponse(settings.web_dist_dir / "index.html", headers={"Cache-Control": "no-store"})
+
+    @app.get("/theme-bootstrap.js", include_in_schema=False)
+    def read_theme_bootstrap() -> FileResponse:
+        return FileResponse(settings.web_dist_dir / "theme-bootstrap.js", media_type="application/javascript", headers={"Cache-Control": "no-store"})

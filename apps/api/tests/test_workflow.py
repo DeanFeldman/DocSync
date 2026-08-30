@@ -201,7 +201,9 @@ def test_built_desktop_frontend_is_served_by_the_api(tmp_path: Path, monkeypatch
     (web_dist / "assets").mkdir(parents=True)
     (web_dist / "index.html").write_text("<h1>DocSync desktop</h1>", encoding="utf-8")
     (web_dist / "assets" / "app.js").write_text("console.log('ready')", encoding="utf-8")
+    (web_dist / "theme-bootstrap.js").write_text("document.documentElement.dataset.theme = 'light';", encoding="utf-8")
     monkeypatch.setenv("DOCUMENTSYNC_WEB_DIST", str(web_dist))
+    monkeypatch.setenv("DOCUMENTSYNC_SUPABASE_URL", "https://lrgsqwkgokzpurdsvtag.supabase.co")
     monkeypatch.delenv("DOCUMENTSYNC_SESSION_TOKEN", raising=False)
     app = load_test_app(tmp_path)
 
@@ -210,7 +212,12 @@ def test_built_desktop_frontend_is_served_by_the_api(tmp_path: Path, monkeypatch
         assert page.status_code == 200
         assert "DocSync desktop" in page.text
         assert page.headers["x-content-type-options"] == "nosniff"
+        assert "connect-src 'self' https://lrgsqwkgokzpurdsvtag.supabase.co" in page.headers["content-security-policy"]
+        assert "https://evil.example" not in page.headers["content-security-policy"]
         assert client.get("/assets/app.js").status_code == 200
+        bootstrap = client.get("/theme-bootstrap.js")
+        assert bootstrap.status_code == 200
+        assert bootstrap.headers["content-type"].startswith("application/javascript")
 
 
 def test_saved_document_set_library_lists_and_reopens_workspaces(tmp_path: Path) -> None:
