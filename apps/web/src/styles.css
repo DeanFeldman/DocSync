@@ -71,7 +71,7 @@ body {
 
 .auth-screen { min-height: 100vh; display: grid; place-items: center; padding: 24px; background: linear-gradient(135deg, var(--app-bg), var(--blue-soft)); }
 .auth-card { width: min(100%, 440px); display: grid; gap: 18px; justify-items: center; padding: 46px; border: 1px solid var(--line); border-radius: 20px; background: var(--surface); box-shadow: var(--shadow); text-align: center; }
-.auth-card img, .auth-loading img { width: min(210px, 65vw); height: auto; }
+.auth-brand-mark { width: 58px; height: 58px; display: grid; place-items: center; border-radius: 16px; color: #0f3b59; background: #85e0d5; box-shadow: 0 8px 18px rgba(23, 59, 104, .18); font-size: 1rem; font-weight: 900; letter-spacing: .04em; }
 .auth-card h1, .auth-card p { margin: 0; }
 .migration-backdrop { position: fixed; z-index: 100; inset: 0; display: grid; place-items: center; padding: 24px; background: rgb(15 23 42 / 48%); }
 .migration-dialog { width: min(100%, 490px); display: grid; gap: 14px; padding: 30px; border: 1px solid var(--line); border-radius: 16px; color: var(--ink); background: var(--surface); box-shadow: var(--shadow); }

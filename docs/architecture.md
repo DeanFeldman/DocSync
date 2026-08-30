@@ -17,6 +17,33 @@ flowchart LR
 
 The browser never receives database credentials or storage credentials. All document access, matching, preview, generation, and download decisions pass through the backend.
 
+## v1.18 account workspaces and cloud snapshots
+
+Electron owns the local workspace path. After Supabase restores and verifies an
+authenticated UUID, Electron derives `<userData>/accounts/<uuid>/workspace`;
+the renderer never supplies a filesystem path. The backend receives that path
+only when the active account lifecycle starts it, with a fresh local backend
+session. Signed-out startup remains a bootstrap state with no account workspace
+open.
+
+Cloud backup is provider-neutral and local-first. A durable workspace mutation
+marks account-local cloud state dirty. The snapshot engine makes a SQLite-safe
+archive containing the workspace database and required originals/generated
+files, records a manifest and SHA-256 hash, and excludes auth state, environment
+files, logs, render caches, and temporary snapshot files. The provider writes an
+immutable object below the authenticated user's private Storage prefix, verifies
+it, then calls the ownership-checked atomic promotion RPC with the expected
+cloud revision. Only promotion permits a local state to become synced.
+
+Restore downloads into account-scoped temporary storage, verifies the hash, and
+uses the snapshot engine's manifest, ownership, archive-path, and SQLite checks
+to stage the result. The active backend is stopped before promotion and receives
+a fresh session after it restarts. A populated local workspace is retained as a
+pre-restore recovery copy until promotion succeeds. Dirty local work is never
+silently replaced by a newer cloud head; it is reported as a conflict. Retention
+keeps the current and previous known-good snapshots, and cleanup never removes a
+current or recovery-required object before a newer snapshot is promoted.
+
 ## Local-development storage
 
 - Original files: `apps/api/data/originals/{document-set-id}/`
