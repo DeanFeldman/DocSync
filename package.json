@@ -1,6 +1,6 @@
 {
   "name": "docsync-desktop",
-  "version": "1.14.0",
+  "version": "1.15.0",
   "private": true,
   "description": "DocSync Windows desktop application for coordinated DOCX editing",
   "author": "Dean Feldman",
@@ -20,7 +20,7 @@
     "build:desktop": "npm run build:web && npm run build:api:win",
     "test": "npm run test:node && npm run test:api",
     "test:node": "node --test apps/template-api/tests/*.test.cjs apps/desktop-ui/tests/*.test.mjs apps/desktop/tests/*.test.cjs",
-    "test:api": "python -m pytest apps/api",
+    "test:api": "python -m pytest apps/api scripts/tests",
     "prepack:win": "npm run build:desktop",
     "pack:win": "electron-builder --win dir",
     "predist:win": "npm run build:desktop",

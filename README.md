@@ -4,7 +4,7 @@
 [![Release](https://github.com/DeanFeldman/DocSync/actions/workflows/release.yml/badge.svg)](https://github.com/DeanFeldman/DocSync/actions/workflows/release.yml)
 [![Latest Release](https://img.shields.io/github/v/release/DeanFeldman/DocSync)](https://github.com/DeanFeldman/DocSync/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-Windows-0078D4)](#requirements)
-[![Version](https://img.shields.io/badge/version-1.14.0-blue)](#latest-release)
+[![Version](https://img.shields.io/badge/version-1.15.0-blue)](#latest-release)
 
 DocSync is a local-first Windows desktop application for safely coordinating edits across related Microsoft Word documents.
 
@@ -36,24 +36,23 @@ SHA256SUMS.txt
 
 ## Latest Release
 
-### Version 1.14.0
+### Version 1.15.0
 
-DocSync `v1.14.0` unifies Find & Replace with the review-first Pending Changes
-workflow already used by Layout.
+DocSync `v1.15.0` starts preserving public GitHub Release download history with
+a daily, repository-managed snapshot collector.
 
 The application now:
 
-- Stages selected Find & Replace occurrences and direct Layout edits in the same
-  durable Pending Changes batch.
-- Shows eligible Find & Replace and direct-edit replacements over the immutable
-  PDF layout without generating a new Word version.
-- Keeps Preview All side-effect free and applies all valid changes as one new
-  immutable version per affected document.
+- Collects installer asset download counts daily through GitHub Actions.
+- Preserves raw asset-level history and calculated daily deltas in
+  `analytics/download-history.csv`.
+- Generates per-release and 7-day/30-day summary metrics without collecting
+  any in-app user telemetry.
 
 See:
 
-- [v1.14.0 release notes](docs/v1.14.0-release-notes.md)
-- [v1.14.0 manual test plan](docs/v1.14.0-manual-testing.md)
+- [v1.15.0 release notes](docs/v1.15.0-release-notes.md)
+- [Download statistics](analytics/README.md)
 - [Batch editing and complete Word text inventory](docs/batch-find-replace-text-inventory.md)
 - [Measured batch performance](docs/evidence/v1.11.0-batch-find-replace-performance.md)
 
@@ -76,6 +75,13 @@ See:
   auditable batch history.
 
 See [Batch editing and complete Word text inventory](docs/batch-find-replace-text-inventory.md).
+
+### Download Statistics
+
+The scheduled collector stores public GitHub Release installer download
+snapshots in `analytics/download-history.csv` and generated metrics in
+`analytics/summary.json`. These are asset download counts only; DocSync does
+not collect in-app telemetry.
 
 ### Document Sets
 
@@ -480,7 +486,7 @@ The release workflow runs when a tag beginning with `v` is pushed.
 Example:
 
 ```powershell
-$version = "1.14.0"
+$version = "1.15.0"
 
 git switch main
 git pull origin main
