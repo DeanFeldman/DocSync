@@ -1,11 +1,13 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 
 export type SnapshotProviderErrorCode = "authentication_failed" | "object_not_found" | "quota_exceeded" | "provider_unavailable" | "upload_failed" | "download_failed" | "permission_denied";
+export type ProviderAvailability = "available" | "degraded" | "offline" | "quota_exceeded" | "authentication_failed" | "unknown";
+export type StorageCapabilities = { provider: "supabase"; cloud_sync_available: boolean; max_snapshot_bytes: number | null; storage_limit_bytes: number | null; used_storage_bytes: number | null; status: ProviderAvailability };
 export class SnapshotProviderError extends Error { constructor(public readonly code: SnapshotProviderErrorCode) { super(code.replaceAll("_", " ")); } }
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const BUCKET = "docsync-workspaces";
 function validUuid(value: string): string { if (!UUID.test(value)) throw new SnapshotProviderError("permission_denied"); return value.toLowerCase(); }
-function classify(error: unknown, fallback: SnapshotProviderErrorCode): SnapshotProviderError { const status = Number(typeof error === "object" && error !== null && "statusCode" in error ? (error as { statusCode?: string | number }).statusCode : 0); if (status === 401) return new SnapshotProviderError("authentication_failed"); if (status === 403) return new SnapshotProviderError("permission_denied"); if (status === 404) return new SnapshotProviderError("object_not_found"); if (status === 413) return new SnapshotProviderError("quota_exceeded"); if (status >= 500 || !status) return new SnapshotProviderError("provider_unavailable"); return new SnapshotProviderError(fallback); }
+function classify(error: unknown, fallback: SnapshotProviderErrorCode): SnapshotProviderError { const status = Number(typeof error === "object" && error !== null && "statusCode" in error ? (error as { statusCode?: string | number }).statusCode : 0); if (status === 401) return new SnapshotProviderError("authentication_failed"); if (status === 403) return new SnapshotProviderError("permission_denied"); if (status === 404) return new SnapshotProviderError("object_not_found"); if ([413, 429, 507].includes(status)) return new SnapshotProviderError("quota_exceeded"); if (status >= 500 || !status) return new SnapshotProviderError("provider_unavailable"); return new SnapshotProviderError(fallback); }
 
 export interface WorkspaceSnapshotStorageProvider { uploadSnapshot(snapshotId: string, archive: Blob): Promise<{ objectKey: string }>; downloadSnapshot(snapshotId: string): Promise<Blob>; deleteSnapshot(snapshotId: string): Promise<void>; exists(snapshotId: string): Promise<boolean>; metadata(snapshotId: string): Promise<{ name: string; size: number } | null>; }
 
@@ -18,6 +20,7 @@ export class SupabaseWorkspaceSnapshotProvider implements WorkspaceSnapshotStora
   async deleteSnapshot(snapshotId: string): Promise<void> { const { error } = await this.client.storage.from(BUCKET).remove([await this.key(snapshotId)]); if (error) throw classify(error, "upload_failed"); }
   async exists(snapshotId: string): Promise<boolean> { return (await this.metadata(snapshotId)) !== null; }
   async metadata(snapshotId: string): Promise<{ name: string; size: number } | null> { const key = await this.key(snapshotId); const path = key.split("/"); const { data, error } = await this.client.storage.from(BUCKET).list(path.slice(0, -1).join("/"), { search: path.at(-1) }); if (error) { if (Number(error.statusCode) === 404) return null; throw classify(error, "provider_unavailable"); } const item = data?.find((entry) => entry.name === path.at(-1)); return item ? { name: item.name, size: Number(item.metadata?.size || 0) } : null; }
+  async capabilities(): Promise<StorageCapabilities> { const { data, error } = await this.client.auth.getUser(); return { provider: "supabase", cloud_sync_available: Boolean(data.user && !error), max_snapshot_bytes: null, storage_limit_bytes: null, used_storage_bytes: null, status: error ? "authentication_failed" : "available" }; }
 }
 
 export class CloudSnapshotRepository {
