@@ -38,6 +38,7 @@ let backendWorkspacePath = "";
 let mainWindow = null;
 const developmentWebUrl = process.env.DOCUMENTSYNC_WEB_DEV_URL || "";
 const externalBackendOrigin = process.env.DOCUMENTSYNC_BACKEND_ORIGIN || "";
+const publicSupabaseUrl = process.env.DOCUMENTSYNC_SUPABASE_URL || process.env.VITE_SUPABASE_URL || "https://lrgsqwkgokzpurdsvtag.supabase.co";
 const THEME_PREFERENCE_KEY = "docsync-theme";
 let pendingAuthCode = null;
 function authStoragePath() { return path.join(app.getPath("userData"), "auth-session.bin"); }
@@ -220,6 +221,7 @@ async function startBackend() {
       DOCUMENTSYNC_SESSION_TOKEN: backendSessionToken,
       DOCUMENTSYNC_CORS_ORIGINS: backendOrigin,
       DOCUMENTSYNC_PORT: String(backendPort),
+      DOCUMENTSYNC_SUPABASE_URL: publicSupabaseUrl,
       PYTHONUNBUFFERED: "1",
     },
     stdio: ["ignore", "pipe", "pipe"],

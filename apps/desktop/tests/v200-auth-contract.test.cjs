@@ -24,8 +24,20 @@ test("Google OAuth is limited to the Supabase authorization endpoint and exact c
   assert.match(main, /process\.execPath, \[path\.resolve\(process\.argv\[1\]\)\]/);
   assert.match(main, /return app\.setAsDefaultProtocolClient\("za\.co\.docsync"\)/);
   assert.match(main, /registerProtocolClient\(\);/);
+  assert.match(main, /DOCUMENTSYNC_SUPABASE_URL: publicSupabaseUrl/);
   assert.match(packageJson, /"protocols"/);
   assert.match(packageJson, /"schemes": \["za\.co\.docsync"\]/);
+});
+
+test("desktop CSP allows only the configured Supabase origin and serves the built theme bootstrap", () => {
+  const api = read("apps/api/app/main.py");
+  const config = read("apps/api/app/config.py");
+  assert.match(config, /DOCUMENTSYNC_SUPABASE_URL/);
+  assert.match(api, /connect-src 'self'/);
+  assert.match(api, /settings\.supabase_origin/);
+  assert.doesNotMatch(api, /connect-src \*/);
+  assert.match(api, /@app\.get\("\/theme-bootstrap\.js"/);
+  assert.match(api, /media_type="application\/javascript"/);
 });
 
 test("auth persistence is encrypted key/value storage and does not overwrite PKCE or session entries", () => {
