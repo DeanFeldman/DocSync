@@ -53,6 +53,7 @@ See:
 
 - [v1.15.0 release notes](docs/v1.15.0-release-notes.md)
 - [Download statistics](analytics/README.md)
+- [Supabase analytics setup](docs/analytics-supabase.md)
 - [Batch editing and complete Word text inventory](docs/batch-find-replace-text-inventory.md)
 - [Measured batch performance](docs/evidence/v1.11.0-batch-find-replace-performance.md)
 

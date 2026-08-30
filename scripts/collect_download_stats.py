@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any
 from urllib.request import Request, urlopen
 
+from supabase_analytics_store import SupabaseAnalyticsStore
+
 
 FIELDNAMES = [
     "date", "tag", "release_name", "published_at", "asset_name", "asset_size",
@@ -158,8 +160,14 @@ def main() -> None:
     args = parser.parse_args()
     updated_at = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     snapshot_date = args.snapshot_date or updated_at[:10]
-    history = update_history(read_history(args.history), installer_assets(fetch_releases(args.repo, os.getenv("GITHUB_TOKEN"))), snapshot_date)
+    releases = fetch_releases(args.repo, os.getenv("GITHUB_TOKEN"))
+    history = update_history(read_history(args.history), installer_assets(releases), snapshot_date)
     write_outputs(history, args.history, args.summary, args.report, updated_at)
+    store = SupabaseAnalyticsStore.from_environment(
+        os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SECRET_KEY"),
+    )
+    if store is not None:
+        store.sync(releases, snapshot_date, updated_at)
 
 
 if __name__ == "__main__":

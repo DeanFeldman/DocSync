@@ -19,6 +19,8 @@ jobs:
       - name: Collect public GitHub Release download snapshots
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
         run: python scripts/collect_download_stats.py
       - name: Commit updated statistics
         run: |
