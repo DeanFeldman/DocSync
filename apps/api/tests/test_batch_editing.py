@@ -110,6 +110,16 @@ def test_durable_batch_applies_multiple_operations_once_per_document(
             },
         )
         assert first.status_code == 201, first.text
+        staged_occurrences = {
+            occurrence["occurrence_id"]: occurrence
+            for occurrence in first.json()["operations"][0]["occurrences"]
+        }
+        for target in first_targets:
+            assert staged_occurrences[target["occurrence_id"]]["segment_text"] == next(
+                item["text"]
+                for item in editable
+                if item["occurrence_id"] == target["occurrence_id"]
+            )
 
         second_targets = [_occurrence_payload(items[1]) for items in by_document.values()]
         second = client.post(

@@ -185,6 +185,7 @@ def _serialize_occurrence(
         "location_label": _location_label(segment),
         "paragraph_index": int(segment.location.get("paragraph_index", 0) or 0),
         "text": segment.text,
+        "segment_text": segment.text,
         "occurrence_index": index,
         "match_start": start,
         "match_end": end,
