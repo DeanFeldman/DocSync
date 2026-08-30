@@ -227,6 +227,8 @@ async function startBackend(preferredPort = null) {
       DOCUMENTSYNC_CORS_ORIGINS: backendOrigin,
       DOCUMENTSYNC_PORT: String(backendPort),
       DOCUMENTSYNC_SUPABASE_URL: publicSupabaseUrl,
+      DOCUMENTSYNC_ACCOUNT_USER_ID: activeAccountId || "",
+      DOCUMENTSYNC_DEVICE_ID: activeAccountId ? deviceId(app.getPath("userData")) : "",
       PYTHONUNBUFFERED: "1",
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -351,6 +353,9 @@ async function stopBackend() {
   backendProcess = null;
   backendSessionToken = "";
 }
+function cloudStatePath() { return activeAccountId ? path.join(app.getPath("userData"), "accounts", activeAccountId, "cloud-backup-state.json") : null; }
+function readCloudState() { try { const target = cloudStatePath(); return target ? JSON.parse(fs.readFileSync(target, "utf8")) : {}; } catch { return {}; } }
+function writeCloudState(value) { const target = cloudStatePath(); if (!target || !value || typeof value !== "object" || Array.isArray(value) || JSON.stringify(value).length > 4096) return false; fs.mkdirSync(path.dirname(target), { recursive: true }); fs.writeFileSync(target, JSON.stringify(value), "utf8"); return true; }
 
 async function restartBackendForWorkspace(workspace) {
   const previousPort = backendPort;
@@ -382,6 +387,8 @@ if (hasSingleInstanceLock) {
     ipcMain.handle("auth-storage:set", (_event, key, value) => setAuthStorageEntry(key, value));
     ipcMain.handle("auth-storage:remove", (_event, key) => removeAuthStorageEntry(key));
     ipcMain.handle("auth-storage:clear", () => clearAuthStorage());
+    ipcMain.handle("cloud-backup:get-state", () => readCloudState());
+    ipcMain.handle("cloud-backup:set-state", (_event, value) => writeCloudState(value));
     ipcMain.handle("account:activate", async (_event, userId) => {
       if (authenticatedUserId() !== String(userId).toLowerCase()) throw new Error("Account activation does not match the authenticated session.");
       const workspace = accountWorkspacePath(app.getPath("userData"), userId);
