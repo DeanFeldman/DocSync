@@ -11,13 +11,16 @@ const experience = fs.readFileSync(
   "utf8",
 );
 
-test("pending editor operations overlay the immutable Word block", () => {
+test("pending editor and Find & Replace operations overlay the immutable Word block", () => {
   assert.match(experience, /function pendingEditorOperationForBlock/);
   assert.match(experience, /function pendingDraftForBlock/);
   assert.match(experience, /text: target\?\.replacement_text \?\? block\.text/);
   assert.match(experience, /setDraft\(pendingDraftForBlock\(block, pendingBatch\)\)/);
   assert.match(experience, /fetchDraftEditBatch\(documentSet\.id\)/);
   assert.match(experience, /window\.addEventListener\(BATCH_UPDATED_EVENT, refreshPendingBatch\)/);
+  assert.match(experience, /function pendingFindReplacementForBlock/);
+  assert.match(experience, /operation\.operation_type === "find_replace"/);
+  assert.match(experience, /occurrence\.segment_text === block\.text/);
 });
 
 test("staging status preserves user text until a durable pending operation exists", () => {

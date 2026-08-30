@@ -4,7 +4,7 @@
 [![Release](https://github.com/DeanFeldman/DocSync/actions/workflows/release.yml/badge.svg)](https://github.com/DeanFeldman/DocSync/actions/workflows/release.yml)
 [![Latest Release](https://img.shields.io/github/v/release/DeanFeldman/DocSync)](https://github.com/DeanFeldman/DocSync/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-Windows-0078D4)](#requirements)
-[![Version](https://img.shields.io/badge/version-1.13.0-blue)](#latest-release)
+[![Version](https://img.shields.io/badge/version-1.14.0-blue)](#latest-release)
 
 DocSync is a local-first Windows desktop application for safely coordinating edits across related Microsoft Word documents.
 
@@ -36,24 +36,24 @@ SHA256SUMS.txt
 
 ## Latest Release
 
-### Version 1.13.0
+### Version 1.14.0
 
-DocSync `v1.13.0` adds a review-first Pending Changes workflow to Layout,
-alongside safer form-line mapping and restart-stable appearance preferences.
+DocSync `v1.14.0` unifies Find & Replace with the review-first Pending Changes
+workflow already used by Layout.
 
 The application now:
 
-- Stages direct Layout edits automatically into a durable Pending Changes batch.
-- Shows pending replacements over the immutable PDF layout without generating a
-  new Word version; Preview All remains the final layout authority.
-- Supports System, Light, and Dark appearance preferences across desktop restarts.
-- Maps qualified bordered or underlined blank body form lines, including stacked
-  signature fields, while leaving ambiguous drawings read-only.
+- Stages selected Find & Replace occurrences and direct Layout edits in the same
+  durable Pending Changes batch.
+- Shows eligible Find & Replace and direct-edit replacements over the immutable
+  PDF layout without generating a new Word version.
+- Keeps Preview All side-effect free and applies all valid changes as one new
+  immutable version per affected document.
 
 See:
 
-- [v1.13.0 release notes](docs/v1.13.0-release-notes.md)
-- [v1.13.0 manual test plan](docs/v1.13.0-manual-testing.md)
+- [v1.14.0 release notes](docs/v1.14.0-release-notes.md)
+- [v1.14.0 manual test plan](docs/v1.14.0-manual-testing.md)
 - [Batch editing and complete Word text inventory](docs/batch-find-replace-text-inventory.md)
 - [Measured batch performance](docs/evidence/v1.11.0-batch-find-replace-performance.md)
 
@@ -480,7 +480,7 @@ The release workflow runs when a tag beginning with `v` is pushed.
 Example:
 
 ```powershell
-$version = "1.13.0"
+$version = "1.14.0"
 
 git switch main
 git pull origin main

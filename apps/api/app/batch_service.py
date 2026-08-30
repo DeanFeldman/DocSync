@@ -162,6 +162,7 @@ def serialize_edit_batch(session: Session, batch: EditorOperation) -> dict:
                 "match_end": item.match_end,
                 "matched_text": item.matched_text,
                 "location": item.location_json or {},
+                "segment_text": (item.location_json or {}).get("segment_text"),
                 "selected": item.selected,
                 "editable": item.editable,
                 "read_only_reason": item.read_only_reason,
@@ -473,7 +474,9 @@ def add_edit_batch_operation(
                 match_start=selected.match_start,
                 match_end=selected.match_end,
                 matched_text=selected.matched_text,
-                location_json=selected.location,
+                # Keep the immutable segment text with the durable occurrence so
+                # Layout can render a working overlay without reopening the DOCX.
+                location_json={**selected.location, "segment_text": segment.text},
                 selected=True,
                 editable=True,
             )
@@ -528,7 +531,7 @@ def update_edit_batch_operation(
                 match_start=selected.match_start,
                 match_end=selected.match_end,
                 matched_text=selected.matched_text,
-                location_json=selected.location,
+                location_json={**selected.location, "segment_text": segment.text},
                 selected=True,
                 editable=True,
             )

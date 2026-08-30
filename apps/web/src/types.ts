@@ -619,6 +619,7 @@ export interface FindReplaceOccurrence {
   context_before: string;
   matched_text: string;
   context_after: string;
+  segment_text?: string;
   editable: boolean;
   read_only: boolean;
   read_only_reason?: string | null;
@@ -679,6 +680,7 @@ export interface EditBatchOccurrence extends FindReplaceOccurrenceTarget {
   base_version_id: string;
   result_version_id?: string | null;
   selected: boolean;
+  segment_text?: string;
 }
 
 export interface EditBatchOperation {

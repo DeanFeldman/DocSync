@@ -114,6 +114,52 @@ function pendingDraftForBlock(
   };
 }
 
+function pendingFindReplacementForBlock(
+  block: EditorBlock,
+  batch: EditBatch | null,
+  documentId: string | undefined,
+  versionId: string | undefined,
+): PendingLayoutOverride | null {
+  if (!documentId || !versionId) return null;
+  const replacements = (batch?.operations ?? []).flatMap((operation) =>
+    operation.enabled && operation.operation_type === "find_replace"
+      ? operation.occurrences
+          .filter(
+            (occurrence) =>
+              occurrence.selected &&
+              occurrence.document_id === documentId &&
+              occurrence.base_version_id === versionId &&
+              occurrence.element_id === block.element_id &&
+              occurrence.segment_text === block.text,
+          )
+          .map((occurrence) => ({
+            operationId: operation.id,
+            start: occurrence.match_start,
+            end: occurrence.match_end,
+            before: occurrence.matched_text,
+            after: operation.replacement_text ?? "",
+          }))
+      : [],
+  );
+  if (!replacements.length) return null;
+
+  let replacementText = block.text;
+  for (const replacement of replacements.sort((left, right) => right.start - left.start)) {
+    if (
+      replacementText.slice(replacement.start, replacement.end) !== replacement.before
+    ) {
+      return null;
+    }
+    replacementText = `${replacementText.slice(0, replacement.start)}${replacement.after}${replacementText.slice(replacement.end)}`;
+  }
+  return {
+    replacementText,
+    operationId: replacements.map((replacement) => replacement.operationId).join(":"),
+    locationCount: replacements.length,
+    documentCount: 1,
+  };
+}
+
 interface DocumentExperienceProps {
   documentSet: DocumentSetResponse;
   document: DocumentSummary | null;
@@ -724,8 +770,18 @@ export default function DocumentExperience({
         };
       }
     }
+    for (const block of editorContent?.blocks ?? []) {
+      if (overrides[block.element_id]) continue;
+      const replacement = pendingFindReplacementForBlock(
+        block,
+        pendingBatch,
+        document?.id,
+        activeVersionId,
+      );
+      if (replacement) overrides[block.element_id] = replacement;
+    }
     return overrides;
-  }, [pendingBatch]);
+  }, [activeVersionId, document?.id, editorContent?.blocks, pendingBatch]);
   const sourceMatch = useMemo(
     () =>
       matches.find((match) => match.element_id === selectedElementId) ?? null,
