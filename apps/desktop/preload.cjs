@@ -16,5 +16,6 @@ contextBridge.exposeInMainWorld("docSync", Object.freeze({
   getLegacyMigration: () => ipcRenderer.invoke("account:legacy-migration"),
   importLegacyWorkspace: () => ipcRenderer.invoke("account:import-legacy-workspace"),
   declineLegacyMigration: () => ipcRenderer.invoke("account:decline-legacy-migration"),
+  promoteCloudRestore: (snapshotId) => ipcRenderer.invoke("account:promote-cloud-restore", snapshotId),
   deactivateAccount: () => ipcRenderer.invoke("account:deactivate"),
 }));

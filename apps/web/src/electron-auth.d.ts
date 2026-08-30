@@ -7,6 +7,7 @@ interface Window {
     getLegacyMigration(): Promise<AccountActivation>;
     importLegacyWorkspace(): Promise<AccountActivation>;
     declineLegacyMigration(): Promise<AccountActivation>;
+    promoteCloudRestore(snapshotId: string): Promise<boolean>;
     deactivateAccount(): Promise<boolean>;
   };
 }

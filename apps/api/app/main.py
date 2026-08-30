@@ -108,7 +108,7 @@ from .audit_logger import AuditLogger
 from .backup_service import DocumentBackupService
 from .error_mapper import DocuSyncError, ErrorMapper
 from .storage_service import DocumentStorageService
-from .snapshot_service import SnapshotError, create_snapshot
+from .snapshot_service import SnapshotError, create_snapshot, restore_snapshot
 from uuid import UUID
 
 logger = logging.getLogger(__name__)
@@ -238,6 +238,23 @@ def create_local_cloud_snapshot() -> dict:
 @app.get("/api/cloud-snapshots/{snapshot_id}/archive")
 def download_local_cloud_snapshot(snapshot_id: str) -> FileResponse:
     return FileResponse(_cloud_snapshot_path(snapshot_id), media_type="application/zip", filename=f"{snapshot_id}.zip", headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/cloud-restores")
+async def stage_cloud_restore(archive: UploadFile = File(...), sha256: str = Form(...)) -> dict:
+    if not settings.account_user_id:
+        raise HTTPException(status_code=409, detail="An account workspace is not active.")
+    download = settings.data_dir.parent / "cloud-download-temp" / "restore.zip"
+    download.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with download.open("wb") as target:
+            while chunk := await archive.read(1024 * 1024): target.write(chunk)
+        staged = restore_snapshot(archive_path=download, expected_sha256=sha256, account_dir=settings.data_dir.parent, user_id=settings.account_user_id, max_bytes=settings.max_snapshot_bytes)
+        return {"snapshot_id": staged.name, "staged": True}
+    except SnapshotError as error:
+        raise HTTPException(status_code=422, detail=error.code) from error
+    finally:
+        download.unlink(missing_ok=True)
 
 
 @app.get("/api/document-sets")

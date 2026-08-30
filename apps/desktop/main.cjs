@@ -429,6 +429,20 @@ if (hasSingleInstanceLock) {
         throw error;
       }
     });
+    ipcMain.handle("account:promote-cloud-restore", async (_event, snapshotId) => {
+      if (!activeAccountId || !/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(String(snapshotId))) throw new Error("Invalid staged restore.");
+      const workspace = accountWorkspacePath(app.getPath("userData"), activeAccountId);
+      const staged = path.join(path.dirname(workspace), "restore-temp", String(snapshotId).toLowerCase());
+      const backup = path.join(path.dirname(workspace), "pre-restore-backup");
+      if (!fs.existsSync(staged)) throw new Error("The staged restore is unavailable.");
+      await stopBackend(); fs.rmSync(backup, { recursive: true, force: true });
+      try {
+        fs.renameSync(workspace, backup); fs.renameSync(staged, workspace); await startBackend(backendPort); fs.rmSync(backup, { recursive: true, force: true });
+        return true;
+      } catch (error) {
+        await stopBackend(); if (fs.existsSync(workspace)) fs.rmSync(workspace, { recursive: true, force: true }); if (fs.existsSync(backup)) fs.renameSync(backup, workspace); await startBackend(backendPort); throw error;
+      }
+    });
     ipcMain.handle("account:deactivate", async () => { await stopBackend(); activeAccountId = null; activeAccountWorkspaceWasNew = false; return true; });
     configureSession();
     try {
