@@ -1,11 +1,11 @@
 # DocSync Download Statistics
 
-Last updated: 2026-09-28T08:41:12Z
+Last updated: 2026-09-29T08:29:31Z
 
 Total installer downloads: 14
 
 Last 7 days: 0
-Last 30 days: 14
+Last 30 days: 1
 
 ## By Version
 
@@ -38,6 +38,7 @@ Last 30 days: 14
 
 | Date | Downloads |
 | --- | ---: |
+| 2026-09-29 | 0 |
 | 2026-09-28 | 0 |
 | 2026-09-27 | 0 |
 | 2026-09-26 | 0 |
@@ -51,4 +52,3 @@ Last 30 days: 14
 | 2026-09-18 | 0 |
 | 2026-09-17 | 0 |
 | 2026-09-16 | 0 |
-| 2026-09-15 | 0 |
