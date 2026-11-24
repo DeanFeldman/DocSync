@@ -167,11 +167,12 @@ def stage_device_import(
             ):
                 raise SnapshotError("invalid_manifest", "The backup manifest is missing or too large.")
             manifest = json.loads(archive.read(manifest_member))
+            supported_schemas = (9, 10) if schema_version == 10 else (schema_version,)
             if (
                 not isinstance(manifest, dict)
                 or manifest.get("format") != FORMAT
                 or manifest.get("version") != VERSION
-                or manifest.get("database_schema_version") != schema_version
+                or manifest.get("database_schema_version") not in supported_schemas
                 or manifest.get("appearance") not in tuple(APPEARANCES)
                 or not isinstance(manifest.get("files"), dict)
             ):
@@ -192,7 +193,7 @@ def stage_device_import(
                     shutil.copyfileobj(source, output, length=1024 * 1024)
                 if _hash_file(destination) != details.get("sha256"):
                     raise SnapshotError("invalid_checksum", "A file did not match its backup checksum.")
-            summary = _inspect_workspace(staged, schema_version, files)
+            summary = _inspect_workspace(staged, manifest["database_schema_version"], files)
         (staged / "import-settings.json").write_text(
             json.dumps({"appearance": manifest["appearance"]}), encoding="utf-8"
         )

@@ -951,7 +951,7 @@ const canUpload = files.length >= 2 && !busyAction;
                 <p className="eyebrow">Start a workspace</p>
                 <h2 id="upload-title">Upload a related document set</h2>
               </div>
-              <p>Choose 2–20 DOCX files. DocSync creates editable plain-text working copies and keeps the originals in version history.</p>
+              <p>Choose 2–20 DOCX files. DocSync keeps the Word layout and converts saved cross-reference values to editable text.</p>
             </div>
 
             {error && (

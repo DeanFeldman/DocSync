@@ -61,7 +61,7 @@ def test_export_and_explicit_import_keep_history_and_validate_files(tmp_path: Pa
         )
         assert staged.status_code == 200, staged.text
         content = staged.json()
-        assert (content["sets"], content["documents"], content["versions"]) == (1, 2, 5)
+        assert (content["sets"], content["documents"], content["versions"]) == (1, 2, 3)
         assert client.get(f"/api/document-versions/{first['id']}/download").content == source
         assert b"An updated clause." in zipfile.ZipFile(BytesIO(
             client.get(f"/api/document-versions/{latest}/download").content

@@ -806,7 +806,7 @@ def test_unsafe_table_structures_remain_read_only_while_merged_text_is_editable(
         assert all(
             block["read_only"] and not block["supported"]
             for block in table_blocks
-            if block["text"] != "Merged content appears once"
+            if block["text"] not in {"Merged content appears once", "Nested content"}
         )
         assert all(block["text"] for block in table_blocks)
         assert content["unsupported_count"] >= 2

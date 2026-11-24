@@ -17,6 +17,7 @@ from uuid import uuid4
 from docx import Document
 from docx.document import Document as DocxDocument
 from docx.oxml.ns import qn
+from docx.table import Table
 from docx.text.paragraph import Paragraph
 from fastapi import HTTPException, UploadFile, status
 from sqlalchemy import column, delete, func, insert, select, table, text
@@ -385,9 +386,53 @@ def _is_safe_empty_body_form_field(paragraph: Paragraph) -> bool:
     return False
 
 
+def unwrap_smart_tags(document: DocxDocument) -> bool:
+    """Expose labeled runs as ordinary text while retaining their Word styles."""
+    changed = False
+    for part in document.part.package.parts:
+        root = getattr(part, "element", None)
+        if root is None:
+            continue
+        for tag in list(root.iter(qn("w:smartTag"))):
+            parent = tag.getparent()
+            index = parent.index(tag)
+            content = [child for child in tag if child.tag != qn("w:smartTagPr")]
+            parent[index:index + 1] = content
+            changed = True
+    return changed
+
+
+def body_tables(document: DocxDocument) -> list[Table]:
+    """Keep existing indexes for top-level tables and append nested tables."""
+    top_level = list(document.tables)
+    nested = [
+        Table(node, document)
+        for table in top_level
+        for node in table._tbl.iterdescendants(qn("w:tbl"))
+        if node.getparent().tag == qn("w:tc")
+    ]
+    return top_level + nested
+
+
+def _cell_paragraphs(table: Table):
+    seen_cells = set()
+    for row_index, row in enumerate(table.rows):
+        for column_index, cell in enumerate(row.cells):
+            if cell._tc in seen_cells:
+                continue
+            seen_cells.add(cell._tc)
+            paragraphs = list(cell.paragraphs)
+            has_text = any(paragraph.text.strip() for paragraph in paragraphs)
+            for paragraph_index, paragraph in enumerate(paragraphs):
+                text = paragraph.text.strip()
+                if text or (not has_text and paragraph_index == 0):
+                    yield row_index, column_index, paragraph_index, text
+
+
 def _extract_paragraphs(
     document: DocxDocument,
 ) -> list[tuple[int, str, str | None]]:
+    unwrap_smart_tags(document)
     body_elements: list[tuple[int, str, str | None]] = []
     body_paragraph_index = 0
     table_index = 0
@@ -405,10 +450,8 @@ def _extract_paragraphs(
         paragraph._p: paragraph
         for paragraph in paragraphs
     }
-    table_lookup = {
-        table._tbl: table
-        for table in tables
-    }
+    table_lookup = {table._tbl: table for table in tables}
+    table_orders = {}
 
     for child in document.element.body.iterchildren():
         paragraph = paragraph_lookup.get(child)
@@ -442,34 +485,15 @@ def _extract_paragraphs(
         if table is None:
             continue
 
-        seen_cells: set[object] = set()
-        for row_index, row in enumerate(table.rows):
-            for column_index, cell in enumerate(row.cells):
-                cell_key = cell._tc
-                if cell_key in seen_cells:
-                    continue
-                seen_cells.add(cell_key)
-
-                cell_paragraphs = list(cell.paragraphs)
-                cell_has_text = any(
-                    paragraph.text.strip() for paragraph in cell_paragraphs
-                )
-                for paragraph_index, paragraph in enumerate(cell_paragraphs):
-                    text = paragraph.text.strip()
-                    if not text and (cell_has_text or paragraph_index > 0):
-                        continue
-                    body_elements.append(
-                        (
-                            block_order,
-                            text,
-                            (
-                                f"table_paragraph_order:{block_order}:"
-                                f"{document_order}:{table_index}:{row_index}:"
-                                f"{column_index}:{paragraph_index}"
-                            ),
-                        )
-                    )
-                    block_order += 1
+        table_orders[table._tbl] = document_order
+        for row_index, column_index, paragraph_index, text in _cell_paragraphs(table):
+            body_elements.append((
+                block_order,
+                text,
+                f"table_paragraph_order:{block_order}:{document_order}:{table_index}:"
+                f"{row_index}:{column_index}:{paragraph_index}",
+            ))
+            block_order += 1
 
         table_index += 1
         document_order += 1
@@ -615,6 +639,21 @@ def _extract_paragraphs(
         )
         footer_document_order += 1
 
+    # Preserve the stored indexes of existing paragraphs. The separate Word
+    # document order lets the renderer place these targets beside the outer table.
+    for index, table in enumerate(body_tables(document)[len(tables):], start=len(tables)):
+        outer = next(node for node in table._tbl.iterancestors() if node in table_orders)
+        for row, column, paragraph, text in _cell_paragraphs(table):
+            if not text:
+                continue
+            order = len(elements)
+            elements.append((
+                order,
+                text,
+                f"table_paragraph_order:{order}:{table_orders[outer]}:{index}:"
+                f"{row}:{column}:{paragraph}",
+            ))
+
     return elements
 
 
@@ -644,7 +683,10 @@ def _prepare_imported_versions(
     from .editor_service import prepare_original_version_rows
 
     original, head, revisions = prepare_original_version_rows(record, parsed_document, elements)
-    converted = create_plain_working_copy(original_path.read_bytes())
+    payload = original_path.read_bytes()
+    converted = create_plain_working_copy(payload)
+    if converted is payload:
+        return [original], head, revisions, elements
 
     working_document = DocumentValidationService.parse_file(
         converted, filename=record["original_name"]
@@ -2088,7 +2130,7 @@ def generate_versions(
                         paragraph_index,
                     ) = table_location
                     try:
-                        cell = docx.tables[table_index].rows[row_index].cells[column_index]
+                        cell = body_tables(docx)[table_index].rows[row_index].cells[column_index]
                         paragraph = cell.paragraphs[paragraph_index]
                     except (IndexError, TypeError) as exc:
                         raise HTTPException(

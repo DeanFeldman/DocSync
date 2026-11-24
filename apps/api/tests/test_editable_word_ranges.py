@@ -42,12 +42,7 @@ def test_table_text_edit_preserves_embedded_word_field(tmp_path, monkeypatch):
         workspace = uploaded.json()
         primary = next(item for item in workspace["documents"] if item["name"] == "Primary.docx")
         related = next(item for item in workspace["documents"] if item["name"] == "Related.docx")
-        restored = client.post(
-            f"/api/documents/{primary['id']}/versions/{primary['id']}/restore",
-            json={"expected_current_version_id": primary["version_id"]},
-        )
-        assert restored.status_code == 201, restored.text
-        version_id = restored.json()["version"]["version_id"]
+        version_id = primary["version_id"]
         version_url = f"/api/document-versions/{version_id}"
         blocks = client.get(f"{version_url}/editor-content").json()["blocks"]
         block = next(block for block in blocks if "existing party" in block["text"])

@@ -25,8 +25,8 @@ from .models import DocumentBlockRevision, DocumentVersion
 
 logger = logging.getLogger(__name__)
 
-RENDER_MAP_SCHEMA_VERSION = 6
-RENDER_MAP_ENGINE = "docsync-contextual-pdf-map-v6-word-order"
+RENDER_MAP_SCHEMA_VERSION = 7
+RENDER_MAP_ENGINE = "docsync-contextual-pdf-map-v7-nested-tables"
 WORD_RENDER_ENGINE = "Microsoft Word ExportAsFixedFormat PDF"
 TOKEN_PATTERN = re.compile(r"\w+", re.UNICODE)
 RENDER_ID_PATTERN = re.compile(r"^[a-f0-9]{24}$")
@@ -116,6 +116,12 @@ def _context_for_version(version: DocumentVersion) -> _RenderContext | None:
         return None
     source_path = _source_path(version)
     pdf_stat = pdf_path.stat()
+    blocks = [_serialise_block(block) for block in version.blocks]
+    blocks.sort(key=lambda block: (
+        block["location"].get("document_order", block["ordinal"]), block["ordinal"]
+    ))
+    for ordinal, block in enumerate(blocks):
+        block["ordinal"] = ordinal
     return _RenderContext(
         version_id=version.id,
         document_id=version.document_id,
@@ -126,7 +132,7 @@ def _context_for_version(version: DocumentVersion) -> _RenderContext | None:
         pdf_size=pdf_stat.st_size,
         pdf_mtime_ns=pdf_stat.st_mtime_ns,
         cache_path=_cache_path(document.document_set_id, version.id),
-        blocks=tuple(_serialise_block(block) for block in version.blocks),
+        blocks=tuple(blocks),
     )
 
 

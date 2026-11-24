@@ -223,7 +223,7 @@ async function startBackend(preferredPort = null) {
       !backendProcess.killed
     ),
     getExitDetails: () => backendExitDetails,
-    timeoutMs: startupTimeoutMs(app.isPackaged),
+    timeoutMs: startupTimeoutMs(app.isPackaged || !developmentWebUrl),
   });
 }
 
