@@ -34,22 +34,23 @@ SHA256SUMS.txt
 
 ---
 
-## Latest Release
+## Local workspaces and manual transfers
 
-### Version 1.17.0
+DocSync opens a workspace stored on this device without requiring an account.
+If you already used an account-based local workspace, you can open it from
+**Local data**. DocSync keeps previous workspace folders on this device.
 
-DocSync `v1.17.0` adds the local desktop foundation for optional Google sign-in.
+1. Choose **Local data → Export all DocSync data**. Save the ZIP.
+2. Transfer the file yourself via USB or another channel you choose.
+3. On the other device, choose **Local data → Import backup ZIP**, select the ZIP,
+   review the reported contents, and confirm.
 
-The application now:
+The versioned ZIP contains the workspace database, originals, generated files,
+and appearance preference. DocSync regenerates previews and caches. The ZIP
+contains your documents, so store it somewhere you trust. Import opens a
+separate workspace and keeps any workspace already on the destination.
+DocSync does not automatically transfer or restore this data.
 
-- Uses Supabase Auth PKCE with a system-browser Google sign-in flow.
-- Stores a restored session only through Electron safeStorage.
-- Keeps local documents on the device; document content is not uploaded.
-
-See:
-
-- [v1.17.0 release notes](docs/v1.17.0-release-notes.md)
-- [v1.17.0 manual test plan](docs/v1.17.0-manual-testing.md)
 - [Download statistics](analytics/README.md)
 - [Supabase analytics setup](docs/analytics-supabase.md)
 - [Batch editing and complete Word text inventory](docs/batch-find-replace-text-inventory.md)

@@ -8,11 +8,6 @@ import {
   useState,
 } from "react";
 import { absoluteApiUrl, fetchRenderMap } from "./api";
-import {
-  getWorkspaceResource,
-  refreshWorkspaceResource,
-  renderMapResourceKey,
-} from "./workspaceResources";
 import InlineLayoutEditor, {
   type InlineEditorCommand,
 } from "./InlineLayoutEditor";
@@ -34,6 +29,7 @@ export interface LayoutSelectionIntent {
   pageNumber: number;
   caretFraction: number;
   keyboard: boolean;
+  textRanges?: boolean;
   requestId: number;
 }
 
@@ -60,7 +56,7 @@ interface WordPreviewOverlayProps {
   onSelect: (intent: LayoutSelectionIntent) => void;
   onDraftChange: (draft: QuillDraft) => void;
   onExitInline: (regionId: string) => void;
-  onRetryPreview: () => void;
+  onRetryPreview: () => Promise<void>;
 }
 
 function CachedTextPreview({ pages }: { pages: ViewerPage[] }) {
@@ -129,7 +125,7 @@ function regionLabel(region: RenderMapRegion): string {
   const preview = region.text_preview.trim() || "Empty Word element";
   const action = region.interactive
     ? "Click to edit"
-    : `Read-only: ${region.read_only_reason ?? "this structure is not safe to edit"}`;
+    : "Open text editing options";
   return `${locationDescription(region)}, page ${region.page_number}: ${preview}. ${action}.`;
 }
 
@@ -215,7 +211,6 @@ function MapPage({
   }, [pendingOverridesByElementId, regions]);
 
   function pointerIntent(region: RenderMapRegion, event: MouseEvent<HTMLButtonElement>) {
-    if (!region.interactive) return;
     const elementRegions = regions
       .filter((candidate) => candidate.element_id === region.element_id)
       .sort((left, right) => left.y - right.y || left.x - right.x);
@@ -235,6 +230,7 @@ function MapPage({
       pageNumber: region.page_number,
       caretFraction: (lineIndex + lineFraction) / Math.max(1, elementRegions.length),
       keyboard: false,
+      textRanges: !region.interactive,
       requestId: Date.now(),
     });
   }
@@ -245,7 +241,6 @@ function MapPage({
   ) {
     if (event.key !== "Enter" && event.key !== " ") return;
     event.preventDefault();
-    if (!region.interactive) return;
     onSelect({
       elementId: region.element_id,
       versionId: region.version_id,
@@ -253,6 +248,7 @@ function MapPage({
       pageNumber: region.page_number,
       caretFraction: 0,
       keyboard: true,
+      textRanges: !region.interactive,
       requestId: Date.now(),
     });
   }
@@ -262,7 +258,10 @@ function MapPage({
       inlineBounds &&
       inlineSelection?.pageNumber === page.page_number &&
       inlineSelection.elementId === selectedElementId &&
+      !inlineSelection.textRanges &&
       selectedBlock?.element_id === selectedElementId &&
+      selectedBlock.supported &&
+      !selectedBlock.read_only &&
       draft,
   );
 
@@ -283,6 +282,12 @@ function MapPage({
             alt={`Page ${page.page_number} of the Word preview`}
             loading={page.page_number <= 2 ? "eager" : "lazy"}
             draggable={false}
+            onError={() =>
+              console.warn("docsync.render_page.image_load_failed", {
+                image_url: page.image_url,
+                page_number: page.page_number,
+              })
+            }
           />
           <div
             className={`render-map-overlay${showSelectableAreas ? " show-areas" : ""}`}
@@ -302,11 +307,10 @@ function MapPage({
                   height: `${region.height * 100}%`,
                 }}
                 aria-label={regionLabel(region)}
-                aria-disabled={!region.interactive}
                 title={
                   region.interactive
                     ? `${locationDescription(region)} · Page ${region.page_number}\nClick to edit`
-                    : region.read_only_reason ?? "This area is not safe to edit."
+                    : "Click to open text and check which parts can be edited"
                 }
                 onClick={(event) => pointerIntent(region, event)}
                 onKeyDown={(event) => keyboardIntent(region, event)}
@@ -388,6 +392,7 @@ export default function WordPreviewOverlay({
 }: WordPreviewOverlayProps) {
   const [renderMap, setRenderMap] = useState<RenderMapResponse | null>(null);
   const [mapError, setMapError] = useState("");
+  const [previewAttempt, setPreviewAttempt] = useState(0);
   const [scaleMode, setScaleMode] = useState<ScaleMode>("fit-width");
   const [customScale, setCustomScale] = useState(BASE_SCALE);
   const [showSelectableAreas, setShowSelectableAreas] = useState(false);
@@ -399,19 +404,14 @@ export default function WordPreviewOverlay({
     let cancelled = false;
     let timer = 0;
     let delay = 200;
-    const resourceKey = renderMapResourceKey(documentSetId, versionId);
-    const cached = getWorkspaceResource<RenderMapResponse>(resourceKey);
-    setRenderMap(cached ?? null);
+    setRenderMap(null);
     setMapError("");
     renderStartedRef.current = performance.now();
     const load = async () => {
       try {
-        const response = await refreshWorkspaceResource(
-          resourceKey,
-          () => fetchRenderMap(versionId),
-        );
+        const response = await fetchRenderMap(versionId);
         if (cancelled) return;
-        if (response.version_id !== versionId) {
+        if (response.version_id !== versionId || response.document_set_id !== documentSetId) {
           setMapError("The selectable-area map did not match the displayed version.");
           return;
         }
@@ -433,7 +433,12 @@ export default function WordPreviewOverlay({
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [documentSetId, versionId]);
+  }, [documentSetId, versionId, previewAttempt]);
+
+  async function retryPreview() {
+    await onRetryPreview();
+    setPreviewAttempt((attempt) => attempt + 1);
+  }
 
   useEffect(() => {
     const viewport = viewportRef.current;
@@ -543,7 +548,7 @@ export default function WordPreviewOverlay({
         >
           Show selectable areas
         </button>
-        <button type="button" onClick={onRetryPreview}>Retry preview</button>
+        <button type="button" onClick={() => void retryPreview()}>Retry preview</button>
       </div>
       <div className="render-map-status" role="status" aria-live="polite">
         <strong>

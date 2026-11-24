@@ -235,6 +235,16 @@ def test_preview_job_returns_before_word_finishes_and_reuses_cache(
         assert render_started.wait(timeout=2), "Word rendering did not start."
         assert request_finished.wait(timeout=2), "Preview request did not return."
         assert not render_finished.is_set()
+        editor_content = client.get(
+            f"/api/document-versions/{version_id}/editor-content"
+        )
+        assert editor_content.status_code == 200, editor_content.text
+        assert any(
+            block["text"] == text
+            and block["supported"]
+            and not block["read_only"]
+            for block in editor_content.json()["blocks"]
+        )
         accepted = accepted_holder["response"]
         assert isinstance(accepted, type(client.get("/api/health")))
         allow_render_to_finish.set()
@@ -750,6 +760,13 @@ def test_later_pdf_pages_render_only_on_demand_and_reuse_cache(
         page_directory = pdf_path.parent / f"{version_id}.pages" / render_id
         assert not (page_directory / "page-5.png").exists()
         assert not (page_directory / "page-6.png").exists()
+
+        assert any(region["page_number"] == 1 for region in mapped["regions"])
+        first_page = client.get(mapped["pages"][0]["image_url"])
+        assert first_page.status_code == 200, first_page.text
+        assert first_page.headers["content-type"] == "image/png"
+        assert first_page.content.startswith(b"\x89PNG\r\n\x1a\n")
+        assert (page_directory / "page-1.png").is_file()
 
         page_url = mapped["pages"][4]["image_url"]
         first = client.get(page_url)

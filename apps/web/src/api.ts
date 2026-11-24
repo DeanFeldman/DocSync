@@ -14,6 +14,7 @@ import type {
   EditorOperationRequest,
   EditorPreviewResponse,
   GenerationResponse,
+  FindReplaceOccurrence,
   FindReplaceSearchOptions,
   FindReplaceSearchResponse,
   GlobalSearchResponse,
@@ -362,6 +363,18 @@ export async function fetchEditorGeneration(
     { signal },
   );
   return parseResponse<EditorGenerationResponse>(response);
+}
+
+export async function fetchBlockTextRanges(
+  versionId: string,
+  elementId: string,
+  signal?: AbortSignal,
+): Promise<{ ranges: FindReplaceOccurrence[] }> {
+  const response = await fetch(
+    `${API_URL}/document-versions/${versionId}/blocks/${elementId}/text-ranges`,
+    { signal },
+  );
+  return parseResponse<{ ranges: FindReplaceOccurrence[] }>(response);
 }
 
 export async function findReplaceSearch(

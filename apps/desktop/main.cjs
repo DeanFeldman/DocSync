@@ -6,8 +6,8 @@ const fs = require("node:fs");
 const http = require("node:http");
 const net = require("node:net");
 const path = require("node:path");
-const { accountWorkspacePath, deviceId } = require("./account-workspace.cjs");
-const { copyToStaging, declineMigration, finalizeStaging, migrationStatus, validateStagingLayout } = require("./legacy-workspace-migration.cjs");
+const { workspaceChoices, selectInitialWorkspace, rememberWorkspace,
+  stageLocation, moveImportedWorkspace } = require("./device-workspaces.cjs");
 const {
   appendBounded,
   formatStartupFailure,
@@ -20,8 +20,6 @@ const {
   dialog,
   ipcMain,
   session,
-  shell,
-  safeStorage,
 } = require("electron");
 
 app.enableSandbox();
@@ -38,56 +36,9 @@ let backendExitDetails = { exitCode: null, signal: null };
 let backendSessionToken = "";
 let backendWorkspacePath = "";
 let mainWindow = null;
-let activeAccountId = null;
-let activeAccountWorkspaceWasNew = false;
 const developmentWebUrl = process.env.DOCUMENTSYNC_WEB_DEV_URL || "";
 const externalBackendOrigin = process.env.DOCUMENTSYNC_BACKEND_ORIGIN || "";
-const publicSupabaseUrl = process.env.DOCUMENTSYNC_SUPABASE_URL || process.env.VITE_SUPABASE_URL || "https://lrgsqwkgokzpurdsvtag.supabase.co";
 const THEME_PREFERENCE_KEY = "docsync-theme";
-let pendingAuthCode = null;
-function authStoragePath() { return path.join(app.getPath("userData"), "auth-session.bin"); }
-function validAuthStorageKey(key) { return typeof key === "string" && key.length > 0 && key.length <= 256 && /^[A-Za-z0-9._:-]+$/.test(key); }
-function validAuthStorageValue(value) { return typeof value === "string" && value.length <= 65_536; }
-function readAuthStorageEntries() {
-  if (!safeStorage.isEncryptionAvailable()) return {};
-  try {
-    const entries = JSON.parse(safeStorage.decryptString(fs.readFileSync(authStoragePath())));
-    if (!entries || Array.isArray(entries) || typeof entries !== "object") return {};
-    return Object.fromEntries(Object.entries(entries).filter(([key, value]) => validAuthStorageKey(key) && validAuthStorageValue(value)));
-  } catch { return {}; }
-}
-function writeAuthStorageEntries(entries) {
-  if (!safeStorage.isEncryptionAvailable()) return false;
-  try { fs.mkdirSync(app.getPath("userData"), { recursive: true }); fs.writeFileSync(authStoragePath(), safeStorage.encryptString(JSON.stringify(entries))); return true; } catch { return false; }
-}
-function getAuthStorageEntry(key) { return validAuthStorageKey(key) ? readAuthStorageEntries()[key] || null : null; }
-function setAuthStorageEntry(key, value) {
-  if (!validAuthStorageKey(key) || !validAuthStorageValue(value)) return false;
-  const entries = readAuthStorageEntries();
-  if (!(key in entries) && Object.keys(entries).length >= 50) return false;
-  entries[key] = value;
-  return writeAuthStorageEntries(entries);
-}
-function removeAuthStorageEntry(key) {
-  if (!validAuthStorageKey(key)) return false;
-  const entries = readAuthStorageEntries(); delete entries[key];
-  if (Object.keys(entries).length === 0) return clearAuthStorage();
-  return writeAuthStorageEntries(entries);
-}
-function clearAuthStorage() { try { fs.rmSync(authStoragePath(), { force: true }); return true; } catch { return false; } }
-function authenticatedUserId() { try { for (const value of Object.values(readAuthStorageEntries())) { const token = JSON.parse(value).access_token; const payload = token && JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString("utf8")); if (payload && /^[0-9a-f-]{36}$/i.test(payload.sub || "")) return payload.sub.toLowerCase(); } } catch {} return null; }
-function authCallback(url) {
-  try { const value = new URL(url); if (value.protocol !== "za.co.docsync:" || value.hostname !== "auth" || value.pathname !== "/callback") return null; const code = value.searchParams.get("code"); return code && /^[A-Za-z0-9._~-]+$/.test(code) ? code : null; } catch { return null; }
-}
-function deliverAuthCallback(url) { const code = authCallback(url); if (!code) return false; pendingAuthCode = code; if (mainWindow) { if (mainWindow.isMinimized()) mainWindow.restore(); mainWindow.focus(); mainWindow.webContents.send("auth:callback", code); } return true; }
-function trustedOAuthUrl(value) { try { const url = new URL(value); return url.protocol === "https:" && /(^|\.)supabase\.co$/i.test(url.hostname) && url.pathname === "/auth/v1/authorize"; } catch { return false; } }
-function registerProtocolClient() {
-  if (process.defaultApp) {
-    if (process.argv.length < 2) return false;
-    return app.setAsDefaultProtocolClient("za.co.docsync", process.execPath, [path.resolve(process.argv[1])]);
-  }
-  return app.setAsDefaultProtocolClient("za.co.docsync");
-}
 
 function themePreferencePath() {
   return path.join(app.getPath("userData"), "preferences.json");
@@ -210,7 +161,7 @@ async function startBackend(preferredPort = null) {
   backendPort = preferredPort || await findAvailablePort();
   backendOrigin = `http://127.0.0.1:${backendPort}`;
   backendSessionToken = crypto.randomBytes(32).toString("base64url");
-  backendWorkspacePath = backendWorkspacePath || path.join(app.getPath("userData"), "bootstrap");
+  backendWorkspacePath = backendWorkspacePath || selectInitialWorkspace(app.getPath("userData")).path;
   backendErrorLog = "";
   backendOutputLog = "";
   backendExitDetails = { exitCode: null, signal: null };
@@ -220,15 +171,16 @@ async function startBackend(preferredPort = null) {
     env: {
       ...process.env,
       DOCUMENTSYNC_DATA_DIR: backendWorkspacePath,
+      DOCUMENTSYNC_DATABASE_URL: "sqlite:///" + path.join(backendWorkspacePath, "documentsync.db").replaceAll("\\", "/"),
       DOCUMENTSYNC_WEB_DIST: paths.webDist,
       DOCUMENTSYNC_RENDER_SCRIPT: paths.renderScript,
       DOCUMENTSYNC_WORD_WORKER_SCRIPT: paths.wordWorkerScript,
       DOCUMENTSYNC_SESSION_TOKEN: backendSessionToken,
       DOCUMENTSYNC_CORS_ORIGINS: backendOrigin,
       DOCUMENTSYNC_PORT: String(backendPort),
-      DOCUMENTSYNC_SUPABASE_URL: publicSupabaseUrl,
-      DOCUMENTSYNC_ACCOUNT_USER_ID: activeAccountId || "",
-      DOCUMENTSYNC_DEVICE_ID: activeAccountId ? deviceId(app.getPath("userData")) : "",
+      DOCUMENTSYNC_SUPABASE_URL: "",
+      DOCUMENTSYNC_ACCOUNT_USER_ID: "",
+      DOCUMENTSYNC_DEVICE_ID: "",
       PYTHONUNBUFFERED: "1",
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -294,7 +246,7 @@ function configureSession() {
       return;
     }
     item.setSaveDialogOptions({
-      title: "Save updated DocSync documents",
+      title: "Save DocSync files",
       buttonLabel: "Save",
       defaultPath: item.getFilename(),
     });
@@ -348,15 +300,11 @@ async function stopBackend() {
       new Promise((resolve) => backendProcess.once("exit", () => resolve(true))),
       new Promise((resolve) => setTimeout(() => resolve(false), 5_000)),
     ]);
-    if (!exited) throw new Error("The previous account workspace did not stop in time.");
+    if (!exited) throw new Error("The previous workspace did not stop in time.");
   }
   backendProcess = null;
   backendSessionToken = "";
 }
-function cloudStatePath() { return activeAccountId ? path.join(app.getPath("userData"), "accounts", activeAccountId, "cloud-backup-state.json") : null; }
-function readCloudState() { try { const target = cloudStatePath(); return target ? JSON.parse(fs.readFileSync(target, "utf8")) : {}; } catch { return {}; } }
-function writeCloudState(value) { const target = cloudStatePath(); if (!target || !value || typeof value !== "object" || Array.isArray(value) || JSON.stringify(value).length > 4096) return false; fs.mkdirSync(path.dirname(target), { recursive: true }); fs.writeFileSync(target, JSON.stringify(value), "utf8"); return true; }
-
 async function restartBackendForWorkspace(workspace) {
   const previousPort = backendPort;
   await stopBackend();
@@ -366,10 +314,8 @@ async function restartBackendForWorkspace(workspace) {
 
 if (hasSingleInstanceLock) {
   app.setAppUserModelId("za.co.docsync.desktop");
-  registerProtocolClient();
 
-  app.on("second-instance", (_event, argv) => {
-    argv.forEach(deliverAuthCallback);
+  app.on("second-instance", () => {
     if (!mainWindow) return;
     if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.focus();
@@ -378,78 +324,69 @@ if (hasSingleInstanceLock) {
   app.whenReady().then(async () => {
     ipcMain.on("theme:get-preference", (event) => { event.returnValue = readThemePreference(); });
     ipcMain.on("theme:set-preference", (_event, preference) => persistThemePreference(preference));
-    ipcMain.handle("auth:open-oauth", (_event, url) => {
-      if (!trustedOAuthUrl(url)) return false;
-      return shell.openExternal(url).then(() => true);
-    });
-    ipcMain.handle("auth:callback", () => { const code = pendingAuthCode; pendingAuthCode = null; return code; });
-    ipcMain.handle("auth-storage:get", (_event, key) => getAuthStorageEntry(key));
-    ipcMain.handle("auth-storage:set", (_event, key, value) => setAuthStorageEntry(key, value));
-    ipcMain.handle("auth-storage:remove", (_event, key) => removeAuthStorageEntry(key));
-    ipcMain.handle("auth-storage:clear", () => clearAuthStorage());
-    ipcMain.handle("cloud-backup:get-state", () => readCloudState());
-    ipcMain.handle("cloud-backup:set-state", (_event, value) => writeCloudState(value));
-    ipcMain.handle("account:activate", async (_event, userId) => {
-      if (authenticatedUserId() !== String(userId).toLowerCase()) throw new Error("Account activation does not match the authenticated session.");
-      const workspace = accountWorkspacePath(app.getPath("userData"), userId);
-      // The renderer only receives this IPC after Supabase has established the user;
-      // Electron derives the path and never accepts a renderer filesystem path.
-      activeAccountWorkspaceWasNew = !fs.existsSync(workspace);
-      activeAccountId = userId.toLowerCase();
-      await restartBackendForWorkspace(workspace);
-      return { workspace_ready: true, ...migrationStatus({ userData: app.getPath("userData"), workspace, workspaceWasNew: activeAccountWorkspaceWasNew }), device_id: deviceId(app.getPath("userData")) };
-    });
-    ipcMain.handle("account:legacy-migration", () => {
-      if (!activeAccountId) throw new Error("No authenticated account is active.");
-      return migrationStatus({ userData: app.getPath("userData"), workspace: backendWorkspacePath, workspaceWasNew: activeAccountWorkspaceWasNew });
-    });
-    ipcMain.handle("account:decline-legacy-migration", () => {
-      if (!activeAccountId) throw new Error("No authenticated account is active.");
-      declineMigration(backendWorkspacePath);
-      return migrationStatus({ userData: app.getPath("userData"), workspace: backendWorkspacePath, workspaceWasNew: activeAccountWorkspaceWasNew });
-    });
-    ipcMain.handle("account:import-legacy-workspace", async () => {
-      if (!activeAccountId || authenticatedUserId() !== activeAccountId) throw new Error("Legacy import requires the active authenticated account.");
-      const workspace = backendWorkspacePath;
-      const status = migrationStatus({ userData: app.getPath("userData"), workspace, workspaceWasNew: activeAccountWorkspaceWasNew });
-      if (!status.migration_ready) throw new Error(status.message || "Legacy import is not available for this account.");
-      const { staging, sourceFingerprint } = copyToStaging({ userData: app.getPath("userData"), workspace });
+    let workspaceChanging = false;
+    const deviceRoot = app.getPath("userData");
+    async function activateLocalWorkspace(choice) {
+      if (externalBackendOrigin || workspaceChanging) throw new Error("A local workspace switch is unavailable.");
+      workspaceChanging = true;
+      const previous = backendWorkspacePath;
       try {
-        validateStagingLayout(staging);
-        await restartBackendForWorkspace(staging); // Existing backend init/migrations validate the copied SQLite workspace.
-        await stopBackend();
-        finalizeStaging({ workspace, staging, sourceFingerprint });
-        await startBackend(backendPort);
-        activeAccountWorkspaceWasNew = false;
-        return migrationStatus({ userData: app.getPath("userData"), workspace, workspaceWasNew: false });
+        await restartBackendForWorkspace(choice.path);
+        rememberWorkspace(deviceRoot, choice.id);
       } catch (error) {
-        await stopBackend();
-        backendWorkspacePath = workspace;
-        await startBackend(backendPort);
+        await restartBackendForWorkspace(previous);
+        throw error;
+      } finally {
+        workspaceChanging = false;
+      }
+    }
+    function requireLocalSender(event) {
+      if (event.sender !== mainWindow?.webContents ||
+          event.senderFrame !== event.sender.mainFrame || !isTrustedUrl(event.senderFrame.url)) {
+        throw new Error("The workspace request did not come from the local DocSync window.");
+      }
+    }
+    ipcMain.handle("device-data:list", (event) => {
+      requireLocalSender(event);
+      if (externalBackendOrigin) return [];
+      return workspaceChoices(deviceRoot).map(({ id, name, path }) => ({
+        id, name, active: path === backendWorkspacePath,
+      }));
+    });
+    ipcMain.handle("device-data:open", async (event, id) => {
+      requireLocalSender(event);
+      const choice = workspaceChoices(deviceRoot).find((item) => item.id === id);
+      if (!choice) throw new Error("The selected workspace is unavailable.");
+      if (choice.path !== backendWorkspacePath) await activateLocalWorkspace(choice);
+    });
+    ipcMain.handle("device-data:import", async (event, id) => {
+      requireLocalSender(event);
+      if (externalBackendOrigin || workspaceChanging) throw new Error("Local workspace import is unavailable.");
+      const imported = moveImportedWorkspace(deviceRoot, backendWorkspacePath, id);
+      try {
+        await activateLocalWorkspace(imported);
+      } catch (error) {
+        fs.renameSync(imported.path, imported.staged);
+        fs.rmdirSync(path.dirname(imported.path));
         throw error;
       }
+      const settings = path.join(imported.path, "import-settings.json");
+      try { fs.unlinkSync(settings); } catch { /* The imported workspace is already usable. */ }
+      try { persistThemePreference(imported.appearance); } catch { /* Settings do not block a restore. */ }
     });
-    ipcMain.handle("account:promote-cloud-restore", async (_event, snapshotId) => {
-      if (!activeAccountId || !/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(String(snapshotId))) throw new Error("Invalid staged restore.");
-      const workspace = accountWorkspacePath(app.getPath("userData"), activeAccountId);
-      const staged = path.join(path.dirname(workspace), "restore-temp", String(snapshotId).toLowerCase());
-      const backup = path.join(path.dirname(workspace), "pre-restore-backup");
-      if (!fs.existsSync(staged)) throw new Error("The staged restore is unavailable.");
-      await stopBackend(); fs.rmSync(backup, { recursive: true, force: true });
-      try {
-        fs.renameSync(workspace, backup); fs.renameSync(staged, workspace); await startBackend(backendPort); fs.rmSync(backup, { recursive: true, force: true });
-        return true;
-      } catch (error) {
-        await stopBackend(); if (fs.existsSync(workspace)) fs.rmSync(workspace, { recursive: true, force: true }); if (fs.existsSync(backup)) fs.renameSync(backup, workspace); await startBackend(backendPort); throw error;
+    ipcMain.handle("device-data:discard", (event, id) => {
+      requireLocalSender(event);
+      if (externalBackendOrigin || workspaceChanging) throw new Error("Local workspace import is unavailable.");
+      const staging = stageLocation(backendWorkspacePath, id);
+      if (fs.existsSync(path.join(staging, "import-settings.json"))) {
+        fs.rmSync(staging, { recursive: true, force: true });
       }
     });
-    ipcMain.handle("account:deactivate", async () => { await stopBackend(); activeAccountId = null; activeAccountWorkspaceWasNew = false; return true; });
     configureSession();
     try {
-      backendWorkspacePath = path.join(app.getPath("userData"), "bootstrap");
+      backendWorkspacePath = selectInitialWorkspace(app.getPath("userData")).path;
       await startBackend();
       createWindow();
-      process.argv.forEach(deliverAuthCallback);
     } catch (error) {
       dialog.showErrorBox(
         "DocSync could not start",
@@ -470,4 +407,4 @@ if (hasSingleInstanceLock) {
   app.on("window-all-closed", () => app.quit());
 }
 
-module.exports = { applicationPaths, findAvailablePort, isTrustedUrl, registerProtocolClient, getAuthStorageEntry, setAuthStorageEntry, removeAuthStorageEntry, clearAuthStorage };
+module.exports = { applicationPaths, findAvailablePort, isTrustedUrl };

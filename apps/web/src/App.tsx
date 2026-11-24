@@ -32,11 +32,12 @@ import type {
 
 import DocumentExperience from "./DocumentExperience";
 import FindReplacePanel from "./FindReplacePanel";
-import AuthAccount from "./AuthAccount";
+import DocSyncData from "./DocSyncData";
+import { useConfirmation } from "./ConfirmationDialog";
+import { useDismissibleMenu } from "./useDismissibleMenu";
 import {
   clearWorkspaceResourcesForDocument,
   clearWorkspaceResourcesForSet,
-  clearWorkspaceViewStateForDocument,
   invalidateDocumentHeadResources,
 } from "./workspaceResources";
 import {
@@ -135,6 +136,8 @@ function readableDate(value: string): string {
 }
 
 function App() {
+  const confirm = useConfirmation();
+  const appearanceMenuRef = useDismissibleMenu();
   const [themePreference, setThemePreference] = useState<ThemePreference>(() => initialThemePreference());
   const [theme, setTheme] = useState<AppTheme>(() => resolveTheme(initialThemePreference()));
 const [setName, setSetName] = useState("");
@@ -201,6 +204,18 @@ const [setNameTouched, setSetNameTouched] = useState(false);
     document.body.classList.toggle("workspace-open", Boolean(documentSet));
     return () => document.body.classList.remove("workspace-open");
   }, [documentSet?.id]);
+
+  useEffect(() => {
+    if (!globalSearchOpen) return;
+
+    function dismissSearch(event: PointerEvent) {
+      const search = globalSearchContainerRef.current;
+      if (search && !event.composedPath().includes(search)) setGlobalSearchOpen(false);
+    }
+
+    document.addEventListener("pointerdown", dismissSearch, true);
+    return () => document.removeEventListener("pointerdown", dismissSearch, true);
+  }, [globalSearchOpen]);
 
   function selectThemePreference(preference: ThemePreference) {
     persistThemePreference(preference);
@@ -540,13 +555,6 @@ const [setNameTouched, setSetNameTouched] = useState(false);
   }
 
   function resetWorkspace(updateHistory = true) {
-    if (editorDirty && documentSet && activeDocumentId) {
-      clearWorkspaceViewStateForDocument(
-        documentSet.id,
-        activeDocumentId,
-      );
-    }
-
     if (
       updateHistory &&
       documentSet &&
@@ -678,9 +686,12 @@ async function handleUpload(event: FormEvent) {
 
 
   async function handleDeleteDocumentSet(item: DocumentSetLibraryItem) {
-    const confirmed = window.confirm(
-      `Delete "${item.name}" permanently?\n\nThis removes the saved set and its local files. This cannot be undone.`,
-    );
+    const confirmed = await confirm({
+      title: `Delete "${item.name}" permanently?`,
+      message: "This removes the saved set and its local files. This cannot be undone.",
+      action: "Delete set",
+      destructive: true,
+    });
     if (!confirmed) return;
 
     setError("");
@@ -726,9 +737,12 @@ async function handleUpload(event: FormEvent) {
 
   async function handleRemoveDocument(document: DocumentSummary) {
     if (!documentSet) return;
-    const confirmed = window.confirm(
-      `Remove "${document.name}" from this set?\n\nThe set must retain at least two documents.`,
-    );
+    const confirmed = await confirm({
+      title: `Remove "${document.name}" from this set?`,
+      message: "The set must retain at least two documents.",
+      action: "Remove document",
+      destructive: true,
+    });
     if (!confirmed) return;
 
     setError("");
@@ -806,13 +820,6 @@ async function handleUpload(event: FormEvent) {
     document: DocumentSummary,
     searchResult: GlobalSearchResult | null = null,
   ) {
-    if (editorDirty && documentSet && activeDocumentId) {
-      clearWorkspaceViewStateForDocument(
-        documentSet.id,
-        activeDocumentId,
-      );
-    }
-
     const deferredDocument = deferredDocumentUpdates[document.id];
     if (deferredDocument) {
       setDocumentSet((current) =>
@@ -900,7 +907,7 @@ const canUpload = files.length >= 2 && !busyAction;
           >
             v{__DOCSYNC_VERSION__}
           </span>
-          <details className="theme-selector">
+          <details ref={appearanceMenuRef} className="theme-selector">
             <summary aria-label="Choose appearance"><span className="theme-toggle-icon" aria-hidden="true">{themePreference === "dark" ? "☾" : themePreference === "light" ? "☀" : "▣"}</span> Appearance</summary>
             <div className="theme-selector-menu" role="menu" aria-label="Appearance">
               <strong>Appearance</strong>
@@ -911,7 +918,7 @@ const canUpload = files.length >= 2 && !busyAction;
               ))}
             </div>
           </details>
-          <AuthAccount />
+          <DocSyncData appearance={themePreference} />
           {documentSet && (
             <button type="button" className="quiet-button" onClick={() => resetWorkspace()}>
               Home
@@ -944,7 +951,7 @@ const canUpload = files.length >= 2 && !busyAction;
                 <p className="eyebrow">Start a workspace</p>
                 <h2 id="upload-title">Upload a related document set</h2>
               </div>
-              <p>Choose 2–20 DOCX files.</p>
+              <p>Choose 2–20 DOCX files. DocSync creates editable plain-text working copies and keeps the originals in version history.</p>
             </div>
 
             {error && (
@@ -1150,7 +1157,8 @@ const canUpload = files.length >= 2 && !busyAction;
                   onChange={(event) => setGlobalSearchQuery(event.target.value)}
                   onFocus={() => setGlobalSearchOpen(true)}
                   onKeyDown={(event) => {
-                    if (event.key === "Escape") {
+                    if (event.key === "Escape" && globalSearchOpen) {
+                      event.preventDefault();
                       setGlobalSearchOpen(false);
                     } else if (event.key === "ArrowDown") {
                       const firstResult =

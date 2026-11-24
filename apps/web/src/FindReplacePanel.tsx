@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { wordDifferenceSpans } from "./editorUtils";
 
 import {
@@ -42,7 +42,7 @@ function message(error: unknown): string {
   return error instanceof Error ? error.message : "The batch request failed.";
 }
 
-function occurrenceTarget(item: FindReplaceOccurrence): FindReplaceOccurrenceTarget {
+export function occurrenceTarget(item: FindReplaceOccurrence): FindReplaceOccurrenceTarget {
   return {
     occurrence_id: item.occurrence_id,
     segment_id: item.segment_id,
@@ -115,6 +115,20 @@ export default function FindReplacePanel({
   const [batch, setBatch] = useState<EditBatch | null>(null);
   const [preview, setPreview] = useState<EditBatchPreview | null>(null);
   const [previewOpen, setPreviewOpen] = useState(false);
+  const panelCloseRef = useRef<HTMLButtonElement>(null);
+  const previewTriggerRef = useRef<HTMLButtonElement>(null);
+  const previewRequestRef = useRef(0);
+  const panelOpen = Boolean(panel);
+
+  useEffect(() => {
+    if (!panelOpen) return;
+    const trigger = document.activeElement;
+    panelCloseRef.current?.focus();
+    return () => {
+      previewRequestRef.current += 1;
+      if (trigger instanceof HTMLElement) trigger.focus();
+    };
+  }, [panelOpen]);
   const [replacementDrafts, setReplacementDrafts] = useState<Record<string, string>>({});
   const [action, setAction] = useState("");
   const [error, setError] = useState("");
@@ -312,17 +326,25 @@ export default function FindReplacePanel({
 
   async function handlePreviewBatch() {
     if (!batch) return;
+    const request = ++previewRequestRef.current;
     setAction("preview");
     setError("");
     try {
       const response = await previewEditBatch(batch.id);
-      setPreview(response);
-      setPreviewOpen(true);
+      if (request === previewRequestRef.current) {
+        setPreview(response);
+        setPreviewOpen(true);
+      }
     } catch (caught) {
       setError(message(caught));
     } finally {
       setAction("");
     }
+  }
+
+  function closePreview() {
+    setPreviewOpen(false);
+    requestAnimationFrame(() => previewTriggerRef.current?.focus());
   }
 
   async function handleApplyBatch() {
@@ -345,7 +367,19 @@ export default function FindReplacePanel({
   }
 
   return (
-    <section className={`find-replace-panel ${panel ? "open" : ""} ${panel ?? ""}`}>
+    <section
+      className={`find-replace-panel ${panel ? "open" : ""} ${panel ?? ""}`}
+      onPointerDown={(event) => {
+        if (panel && !previewOpen && event.target === event.currentTarget) onPanelChange(null);
+      }}
+      onKeyDown={(event) => {
+        if (panel && !event.defaultPrevented && event.key === "Escape") {
+          event.preventDefault();
+          if (previewOpen) closePreview();
+          else onPanelChange(null);
+        }
+      }}
+    >
 
       {panel && (
         <div className="find-replace-workspace" aria-label="Find and replace across document set">
@@ -354,7 +388,7 @@ export default function FindReplacePanel({
               {panel === "find" && <p className="eyebrow">Complete text inventory</p>}
               <h2>{panel === "find" ? "Find & Replace" : "Pending changes"}</h2>
             </div>
-            <button type="button" className="quiet-button" onClick={() => onPanelChange(null)}>
+            <button ref={panelCloseRef} type="button" className="quiet-button" onClick={() => onPanelChange(null)}>
               Close
             </button>
           </header>
@@ -523,23 +557,29 @@ export default function FindReplacePanel({
                   ))}
                 </div>
                 <div className="pending-batch-actions">
-                  <button type="button" className="primary-button" onClick={() => void handlePreviewBatch()} disabled={Boolean(action)}>Preview all changes</button>
+                  <button ref={previewTriggerRef} type="button" className="primary-button" onClick={() => void handlePreviewBatch()} disabled={Boolean(action)}>Preview all changes</button>
                 </div>
               </>
             )}
           </section>
         </div>
       )}
-      {preview && previewOpen && (
-        <div className="modal-backdrop batch-diff-backdrop" role="presentation">
+      {panel && preview && previewOpen && (
+        <div
+          className="modal-backdrop batch-diff-backdrop"
+          role="presentation"
+          onPointerDown={(event) => {
+            if (event.target === event.currentTarget) closePreview();
+          }}
+        >
           <section className="preview-dialog batch-diff-preview" role="dialog" aria-modal="true" aria-labelledby="batch-diff-title">
-            <header className="preview-dialog-header"><div><p className="eyebrow">Pending changes</p><h2 id="batch-diff-title">Review every proposed change</h2><p>{preview.affected_location_count} locations across {preview.affected_document_count} documents</p></div><button type="button" className="dialog-close" onClick={() => setPreviewOpen(false)} aria-label="Back to changes">×</button></header>
+            <header className="preview-dialog-header"><div><p className="eyebrow">Pending changes</p><h2 id="batch-diff-title">Review every proposed change</h2><p>{preview.affected_location_count} locations across {preview.affected_document_count} documents</p></div><button type="button" className="dialog-close" autoFocus onClick={closePreview} aria-label="Back to changes">×</button></header>
             <div className="batch-diff-scroll">
               {preview.status !== "ready" ? <div className="batch-preview-summary conflicted"><strong>{preview.conflict_count} conflicts need attention</strong>{preview.conflicts.map((item, index) => <em key={`${item.code}-${index}`}>{item.message}</em>)}</div> : preview.documents.map((document) => (
                 <section className="preview-document" key={document.document_id}><header><strong>{document.document_name}</strong><span>{document.change_count} changes</span></header>{document.changes.map((change, index) => <article className="comparison-card" key={`${change.operation_id}-${change.occurrence_id ?? change.element_id}-${index}`}><header><strong>{change.operation_type === "find_replace" ? "Find & replace" : "Editor edit"}</strong><small>{change.element_type.replaceAll("_", " ")} · Block {change.paragraph_index + 1}</small></header><div className="batch-diff-values"><div className="before"><small>Before</small><p>{change.before}</p></div><div className="after"><small>After</small><p>{wordDifferenceSpans(change.before, change.after).map((span, spanIndex) => <mark className={`difference-span ${span.kind}`} key={spanIndex}>{span.text}</mark>)}</p></div></div></article>)}</section>
               ))}
             </div>
-            <footer className="preview-dialog-footer"><button type="button" className="quiet-button" onClick={() => { setPreviewOpen(false); onPanelChange("pending"); }}>Back to changes</button><button type="button" className="generate-version-button" onClick={() => void handleApplyBatch()} disabled={preview.status !== "ready" || Boolean(action)}>{action === "apply" ? "Submitting batch…" : "Apply all"}</button></footer>
+            <footer className="preview-dialog-footer"><button type="button" className="quiet-button" onClick={() => { closePreview(); onPanelChange("pending"); }}>Back to changes</button><button type="button" className="generate-version-button" onClick={() => void handleApplyBatch()} disabled={preview.status !== "ready" || Boolean(action)}>{action === "apply" ? "Submitting batch…" : "Apply all"}</button></footer>
           </section>
         </div>
       )}

@@ -633,6 +633,56 @@ def _unique_set_filename(existing_names: set[str], filename: str) -> str:
         counter += 1
 
 
+def _prepare_imported_versions(
+    record: dict,
+    parsed_document: DocxDocument,
+    elements: list[dict],
+    original_path: Path,
+    generated_paths: list[Path],
+) -> tuple[list[dict], dict, list[dict], list[dict]]:
+    from .plain_working_copy import create_plain_working_copy
+    from .editor_service import prepare_original_version_rows
+
+    original, head, revisions = prepare_original_version_rows(record, parsed_document, elements)
+    converted = create_plain_working_copy(original_path.read_bytes())
+
+    working_document = DocumentValidationService.parse_file(
+        converted, filename=record["original_name"]
+    )
+    version_id = new_id()
+    previous_ids = {element["paragraph_index"]: element["id"] for element in elements}
+    working_elements = [
+        {
+            "id": previous_ids.get(index) or new_id(),
+            "document_id": record["id"],
+            "paragraph_index": index,
+            "text": text,
+            "normalized_text": normalise_text(text),
+            "style_name": style,
+        }
+        for index, text, style in _extract_paragraphs(working_document)
+    ]
+    working, _, working_revisions = prepare_original_version_rows(
+        record, working_document, working_elements
+    )
+    storage_name = f"{record['document_set_id']}/{version_id}.docx"
+    path = settings.data_dir / "generated" / storage_name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    generated_paths.append(path)
+    path.write_bytes(converted)
+    working.update(
+        id=version_id, parent_version_id=original["id"], version_number=2,
+        storage_area="generated", storage_name=storage_name,
+        checksum_sha256=hashlib.sha256(converted).hexdigest(),
+    )
+    head.update(current_version_id=version_id, revision=2)
+    for revision in working_revisions:
+        revision["version_id"] = version_id
+    working_ids = {element["id"] for element in working_elements}
+    historical_only = [element for element in elements if element["id"] not in working_ids]
+    return [original, working], head, revisions + working_revisions, working_elements + historical_only
+
+
 async def create_document_set(
     session: Session,
     name: str,
@@ -669,6 +719,7 @@ async def create_document_set(
             list[tuple[int, str, str | None]],
         ]
     ] = []
+    generated_paths: list[Path] = []
     try:
         for upload in files:
             raw_name = upload.filename or "document.docx"
@@ -704,7 +755,6 @@ async def create_document_set(
         version_rows: list[dict] = []
         head_rows: list[dict] = []
         revision_rows: list[dict] = []
-        from .editor_service import prepare_original_version_rows
 
         for original_name, payload, parsed_document, extracted in prepared:
             document_id = new_id()
@@ -730,16 +780,14 @@ async def create_document_set(
                 }
                 for paragraph_index, text, style_name in extracted
             ]
-            version_row, head_row, current_revision_rows = (
-                prepare_original_version_rows(
-                    document_row,
-                    parsed_document,
-                    current_element_rows,
+            imported_versions, head_row, current_revision_rows, current_element_rows = (
+                _prepare_imported_versions(
+                    document_row, parsed_document, current_element_rows, target, generated_paths
                 )
             )
             document_rows.append(document_row)
             element_rows.extend(current_element_rows)
-            version_rows.append(version_row)
+            version_rows.extend(imported_versions)
             head_rows.append(head_row)
             revision_rows.extend(current_revision_rows)
 
@@ -775,6 +823,8 @@ async def create_document_set(
     except Exception:
         session.rollback()
         shutil.rmtree(original_dir, ignore_errors=True)
+        for path in generated_paths:
+            path.unlink(missing_ok=True)
         raise
 
     timings["service_total_ms"] = (perf_counter() - started_at) * 1000
@@ -857,7 +907,6 @@ async def add_documents_to_set(
             ]
             prepared_records.append((record, parsed_document, elements))
 
-        from .editor_service import prepare_original_version_rows
 
         document_rows: list[dict] = []
         element_rows: list[dict] = []
@@ -865,14 +914,15 @@ async def add_documents_to_set(
         head_rows: list[dict] = []
         revision_rows: list[dict] = []
         for record_row, parsed_document, current_element_rows in prepared_records:
-            version_row, head_row, current_revision_rows = prepare_original_version_rows(
-                record_row,
-                parsed_document,
-                current_element_rows,
+            imported_versions, head_row, current_revision_rows, current_element_rows = (
+                _prepare_imported_versions(
+                    record_row, parsed_document, current_element_rows,
+                    settings.data_dir / "originals" / record_row["stored_name"], created_paths,
+                )
             )
             document_rows.append(record_row)
             element_rows.extend(current_element_rows)
-            version_rows.append(version_row)
+            version_rows.extend(imported_versions)
             head_rows.append(head_row)
             revision_rows.extend(current_revision_rows)
         session.execute(insert(DocumentRecord.__table__), document_rows)
