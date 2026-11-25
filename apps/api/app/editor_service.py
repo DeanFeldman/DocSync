@@ -3712,7 +3712,25 @@ def restore_document_version(
     request: VersionRestoreRequest,
 ) -> dict:
     """Copy a historical immutable version into a new current version."""
+    return _save_document_copy(session, document_id, request.expected_current_version_id,
+                               target_version_id=target_version_id)
 
+
+def save_external_document_version(
+    session: Session, document_id: str, expected_version_id: str, path: Path,
+) -> dict:
+    """Promote a reviewed local editor draft as a new immutable version."""
+    return _save_document_copy(session, document_id, expected_version_id, edited_path=path)
+
+
+def _save_document_copy(
+    session: Session,
+    document_id: str,
+    expected_version_id: str,
+    *,
+    target_version_id: str | None = None,
+    edited_path: Path | None = None,
+) -> dict:
     with EDITOR_GENERATION_LOCK:
         committed = False
         staging_directory: Path | None = None
@@ -3722,8 +3740,8 @@ def restore_document_version(
             if document is None:
                 raise HTTPException(status_code=404, detail="Document not found.")
 
-            target_version = get_version_or_404(session, target_version_id)
-            if target_version.document_id != document.id:
+            target_version = get_version_or_404(session, target_version_id) if target_version_id else None
+            if target_version is not None and target_version.document_id != document.id:
                 raise HTTPException(
                     status_code=422,
                     detail="The version to restore does not belong to this document.",
@@ -3736,21 +3754,33 @@ def restore_document_version(
                     status_code=500,
                     detail="Document version head is missing.",
                 )
-            if head.current_version_id != request.expected_current_version_id:
+            if head.current_version_id != expected_version_id:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail=(
                         f"{document.original_name} changed after version history was "
                         "opened. Reload the current version and try again."
+                        if target_version else
+                        "The current version changed. Reopen the latest version before applying the saved copy."
                     ),
                 )
-            if target_version.id == current_version.id:
+            if target_version is not None and target_version.id == current_version.id:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail="The selected version is already current.",
                 )
 
-            source_path = document_version_path(target_version)
+            if target_version is None:
+                if edited_path is None:
+                    raise ValueError("A document version or a saved copy is required.")
+                source_path = edited_path
+                restoration = {}
+            else:
+                source_path = document_version_path(target_version)
+                restoration = {
+                    "restored_from_version_id": target_version.id,
+                    "restored_from_version_number": target_version.version_number,
+                }
             operation_id = new_id()
             generated_root = (
                 settings.data_dir / "generated" / document.document_set_id
@@ -3828,18 +3858,17 @@ def restore_document_version(
             operation = EditorOperation(
                 id=operation_id,
                 document_set_id=document.document_set_id,
-                operation_type="version_restore",
+                operation_type="version_restore" if target_version else "external_edit",
                 status="completed",
                 stage="completed",
                 expected_head_revision=head.revision,
                 preview_json={
                     "document_id": document.id,
                     "document_name": document.original_name,
-                    "restored_from_version_id": target_version.id,
-                    "restored_from_version_number": target_version.version_number,
+                    **restoration,
                     "previous_current_version_id": current_version.id,
                     "result_version_id": result_version_id,
-                    "expected_current_version_id": request.expected_current_version_id,
+                    "expected_current_version_id": expected_version_id,
                     "writes_performed": True,
                     "status": "completed",
                 },
@@ -3870,7 +3899,7 @@ def restore_document_version(
                 document=document,
                 version=version,
                 source_path=final_directory / output_name,
-                base_version_id=target_version.id,
+                base_version_id=target_version.id if target_version else current_version.id,
             )
 
             head.current_version_id = version.id
@@ -3903,8 +3932,7 @@ def restore_document_version(
                 "status": operation.status,
                 "document_id": document.id,
                 "document_name": document.original_name,
-                "restored_from_version_id": target_version.id,
-                "restored_from_version_number": target_version.version_number,
+                **restoration,
                 "previous_current_version_id": current_version.id,
                 "version": {
                     "id": version.id,
@@ -3913,8 +3941,7 @@ def restore_document_version(
                     "version_id": version.id,
                     "version_number": version.version_number,
                     "parent_version_id": version.parent_version_id,
-                    "restored_from_version_id": target_version.id,
-                    "restored_from_version_number": target_version.version_number,
+                    **restoration,
                     "checksum_sha256": version.checksum_sha256,
                     "created_at": utc_isoformat(version.created_at),
                     "status": "completed",

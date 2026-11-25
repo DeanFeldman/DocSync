@@ -56,6 +56,7 @@ import {
 } from "./editorUtils";
 import { useConfirmation } from "./ConfirmationDialog";
 import { useDismissibleMenu } from "./useDismissibleMenu";
+import LocalOfficeEditor from "./LocalOfficeEditor";
 import WordPreviewOverlay, {
   type LayoutSelectionIntent,
   type PendingLayoutOverride,
@@ -2653,58 +2654,66 @@ export default function DocumentExperience({
             aria-label="Document layout"
             className="editor-mode-panel layout-mode-panel"
           >
-            {(layoutStatus === "loading" ||
-              (contentStatus === "loading" && !layoutView && !editorContent)) && (
-              <div className="editor-loading-state nonblocking" role="status">
-                <span className="spinner" aria-hidden="true" />
-                <span>
-                  <strong>
+            <LocalOfficeEditor
+              key={activeVersionId}
+              documentId={document.id}
+              versionId={activeVersionId}
+              disabled={dirty || perDocumentDirty || Boolean(action) || Boolean(pendingEditorOperation)}
+              onGenerated={onGenerated}
+            >
+              {(layoutStatus === "loading" ||
+                (contentStatus === "loading" && !layoutView && !editorContent)) && (
+                <div className="editor-loading-state nonblocking" role="status">
+                  <span className="spinner" aria-hidden="true" />
+                  <span>
+                    <strong>
+                      {layoutView || editorContent
+                        ? "Updating preview…"
+                        : "Opening document…"}
+                    </strong>
                     {layoutView || editorContent
-                      ? "Updating preview…"
-                      : "Opening document…"}
-                  </strong>
-                  {layoutView || editorContent
-                    ? ` ${previewStageLabel(previewJob?.stage)} continues in the background.`
-                    : " Loading the cached document content."}
-                </span>
-              </div>
-            )}
-            {layoutStatus === "error" && !layoutView?.pdf_url && (
-              <div className="editor-empty-state">
-                <strong>Layout preview unavailable</strong>
-                <p>
-                  Retry the Word preview after closing any open Word dialogue.
-                </p>
-              </div>
-            )}
-            {layoutView?.pdf_url && (
-              <div className="layout-iframe-shell">
-                <WordPreviewOverlay
-                  documentSetId={documentSet.id}
-                  documentName={document.name}
-                  versionId={layoutView.version_id}
-                  previewPages={layoutView.pages}
-                  selectedElementId={selectedElementId}
-                  selectedBlock={selectedBlock}
-                  draft={draft}
-                  pendingOverridesByElementId={pendingLayoutOverridesByElementId}
-                  editorResetToken={editorResetToken}
-                  inlineSelection={inlineSelection}
-                  inlineCommand={inlineCommand}
-                  editorDisabled={action === "generate"}
-                  onSelect={(intent) =>
-                    selectElementById(intent.elementId, {
-                      sourceVersionId: intent.versionId,
-                      sourceLabel: "Word preview region",
-                      inlineSelection: intent,
-                    })
-                  }
-                  onDraftChange={handleDraftChange}
-                  onExitInline={exitInlineEditing}
-                  onRetryPreview={() => loadWordPreview(true)}
-                />
-              </div>
-            )}
+                      ? ` ${previewStageLabel(previewJob?.stage)} continues in the background.`
+                      : " Loading the cached document content."}
+                  </span>
+                </div>
+              )}
+              {layoutStatus === "error" && !layoutView?.pdf_url && (
+                <div className="editor-empty-state">
+                  <strong>Layout preview unavailable</strong>
+                  <p>
+                    Retry the Word preview after closing any open Word dialogue.
+                  </p>
+                </div>
+              )}
+              {layoutView?.pdf_url && (
+                <div className="layout-iframe-shell">
+                  <WordPreviewOverlay
+                    documentSetId={documentSet.id}
+                    documentName={document.name}
+                    versionId={layoutView.version_id}
+                    previewPages={layoutView.pages}
+                    selectedElementId={selectedElementId}
+                    selectedBlock={selectedBlock}
+                    draft={draft}
+                    pendingOverridesByElementId={pendingLayoutOverridesByElementId}
+                    editorResetToken={editorResetToken}
+                    inlineSelection={inlineSelection}
+                    inlineCommand={inlineCommand}
+                    editorDisabled={action === "generate"}
+                    onSelect={(intent) =>
+                      selectElementById(intent.elementId, {
+                        sourceVersionId: intent.versionId,
+                        sourceLabel: "Word preview region",
+                        inlineSelection: intent,
+                      })
+                    }
+                    onDraftChange={handleDraftChange}
+                    onExitInline={exitInlineEditing}
+                    onRetryPreview={() => loadWordPreview(true)}
+                  />
+                </div>
+              )}
+            </LocalOfficeEditor>
           </section>
 
         </div>

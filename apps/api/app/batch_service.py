@@ -243,6 +243,12 @@ def create_edit_batch(
     document_set_id: str,
     request: EditBatchCreate,
 ) -> dict:
+    batch = _draft_batch(session, document_set_id, request.title)
+    session.commit()
+    return serialize_edit_batch(session, get_edit_batch(session, batch.id))
+
+
+def _draft_batch(session: Session, document_set_id: str, title: str) -> EditorOperation:
     if session.get(DocumentSet, document_set_id) is None:
         raise HTTPException(status_code=404, detail="Document set not found.")
     existing = session.scalar(
@@ -255,18 +261,18 @@ def create_edit_batch(
         .order_by(EditorOperation.created_at.desc())
     )
     if existing is not None:
-        return serialize_edit_batch(session, existing)
+        return existing
     batch = EditorOperation(
         id=new_id(),
         document_set_id=document_set_id,
         operation_type="batch",
         status="draft",
         stage="draft",
-        preview_json={"title": request.title, "base_versions": {}},
+        preview_json={"title": title, "base_versions": {}},
     )
     session.add(batch)
-    session.commit()
-    return serialize_edit_batch(session, get_edit_batch(session, batch.id))
+    session.flush()
+    return batch
 
 
 def _validate_find_occurrences(
@@ -433,6 +439,13 @@ def add_edit_batch_operation(
     request: EditBatchOperationRequest,
 ) -> dict:
     batch = get_edit_batch(session, batch_id)
+    _append_batch_operation(session, batch, request)
+    _rebuild_batch_base_versions(session, batch)
+    session.commit()
+    return serialize_edit_batch(session, get_edit_batch(session, batch.id))
+
+
+def _append_batch_operation(session: Session, batch: EditorOperation, request: EditBatchOperationRequest) -> None:
     _require_draft(batch)
     validated, bases = _validate_batch_operation(session, batch, request)
     _merge_base_versions(batch, bases)
@@ -482,9 +495,39 @@ def add_edit_batch_operation(
             )
         )
     session.flush()
-    _rebuild_batch_base_versions(session, batch)
-    session.commit()
-    return serialize_edit_batch(session, get_edit_batch(session, batch.id))
+
+
+def stage_related_find_operations(
+    session: Session,
+    document_set_id: str,
+    operations: list[EditBatchOperationRequest],
+) -> dict:
+    """Append explicitly selected related edits atomically and allow safe retries."""
+    with EDITOR_GENERATION_LOCK:
+        try:
+            batch = _draft_batch(session, document_set_id, "Pending changes")
+            pending = {
+                occurrence.occurrence_id: operation.replacement_text
+                for operation in batch.batch_operations if operation.enabled
+                for occurrence in operation.occurrences if occurrence.selected
+            }
+            added = 0
+            for operation in operations:
+                selected = []
+                for occurrence in operation.occurrences:
+                    if occurrence.occurrence_id not in pending:
+                        selected.append(occurrence)
+                    elif pending[occurrence.occurrence_id] != operation.replacement_text:
+                        raise HTTPException(409, "An overlapping replacement is already pending. Review Pending changes first.")
+                if selected:
+                    _append_batch_operation(session, batch, operation.model_copy(update={"occurrences": selected}))
+                    added += len(selected)
+            _rebuild_batch_base_versions(session, batch)
+            session.commit()
+            return {"batch_id": batch.id, "targets_added": added}
+        except Exception:
+            session.rollback()
+            raise
 
 
 def update_edit_batch_operation(

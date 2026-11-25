@@ -116,6 +116,7 @@ from starlette.concurrency import run_in_threadpool
 
 from .device_transfer import APPEARANCES, export_device_workspace, stage_device_import
 from .snapshot_service import SnapshotError, _database_schema_version
+from .local_office import office_origin, router as local_office_router
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +151,8 @@ app = FastAPI(
     description="DocSync structured DOCX viewing and controlled editing service.",
     lifespan=lifespan,
 )
+app.include_router(local_office_router)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=list(settings.cors_origins),
@@ -180,14 +183,19 @@ async def secure_local_application(request: Request, call_next):
             response.headers["X-DocSync-Workspace-Mutated"] = "1"
     response.headers["Cache-Control"] = "no-store"
     connect_src = "connect-src 'self'"
-    response.headers["Content-Security-Policy"] = (
+    bridge = request.url.path.startswith("/onlyoffice-bridge/")
+    frames = "'self'"
+    if office_origin() and request.url.hostname == "127.0.0.1" and request.url.port:
+        frames += f" http://localhost:{request.url.port}"
+    response.headers.setdefault("Content-Security-Policy", (
         "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
-        f"{connect_src}; frame-src 'self'; object-src 'self'; base-uri 'none'; "
+        f"{connect_src}; frame-src {frames}; object-src 'self'; base-uri 'none'; "
         "frame-ancestors 'self'; form-action 'self'"
-    )
+    ))
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "SAMEORIGIN"
+    if not bridge or response.status_code >= 400:
+        response.headers["X-Frame-Options"] = "SAMEORIGIN"
     return response
 
 

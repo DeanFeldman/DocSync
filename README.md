@@ -34,6 +34,33 @@ SHA256SUMS.txt
 
 ---
 
+## Optional local ONLYOFFICE prototype
+
+The prototype embeds the ONLYOFFICE editor in Layout. Use the regular desktop
+launcher with the built web bundle. The prototype requires a trusted local
+ONLYOFFICE Docs service that can reach DocSync on `127.0.0.1`. Configure the
+document service to allow connections to that loopback address and enable its
+browser and callback JWT signatures with the same secret. Set these environment
+variables before launching the desktop app:
+
+```powershell
+$env:DOCSYNC_ONLYOFFICE_URL = 'http://127.0.0.1:8080'
+$env:DOCSYNC_ONLYOFFICE_SECRET = '<the local document server JWT secret>'
+npm start
+```
+
+Set the loopback origin to the exact origin that ONLYOFFICE uses in its saved
+file URLs. The prototype accepts loopback HTTP origins with an explicit port and
+a shared secret of at least 24 characters. For the prototype, run the service
+where `127.0.0.1` reaches DocSync directly, or use a host-networked environment
+with that property. The standard installer does not bundle this dependency.
+
+Choose **Edit in ONLYOFFICE** in Layout. Click **Save** inside the editor, review
+the saved copy, and choose **Apply saved copy** to create a version of that
+document. To update other files, select the exact paragraph matches in the
+saved-copy review and add them to **Pending changes** before applying the saved
+copy. Review and apply those edits from **Pending changes**.
+
 ## Local workspaces and manual transfers
 
 DocSync opens a workspace stored on this device without requiring an account.
