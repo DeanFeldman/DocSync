@@ -212,8 +212,9 @@ def test_built_desktop_frontend_is_served_by_the_api(tmp_path: Path, monkeypatch
         assert page.status_code == 200
         assert "DocSync desktop" in page.text
         assert page.headers["x-content-type-options"] == "nosniff"
-        assert "connect-src 'self' https://lrgsqwkgokzpurdsvtag.supabase.co" in page.headers["content-security-policy"]
-        assert "https://evil.example" not in page.headers["content-security-policy"]
+        policy = page.headers["content-security-policy"]
+        assert "connect-src 'self'" in {directive.strip() for directive in policy.split(";")}
+        assert "https://evil.example" not in policy
         assert client.get("/assets/app.js").status_code == 200
         bootstrap = client.get("/theme-bootstrap.js")
         assert bootstrap.status_code == 200
