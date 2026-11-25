@@ -1,7 +1,7 @@
 """Local ONLYOFFICE editing bridge for the optional desktop prototype."""
 
 import base64
-from difflib import unified_diff
+from collections import Counter
 from ipaddress import IPv4Address
 import hashlib
 import hmac
@@ -10,30 +10,35 @@ import os
 from pathlib import Path
 import secrets
 from threading import Lock
+from typing import Literal
 from urllib.parse import urlsplit
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, Response
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse
 from sqlalchemy.orm import Session
 
-from .batch_service import stage_related_find_operations
 from .config import settings
 from .database import get_session
+from .document_service import get_document_set_or_404, serialize_document_set
 from .editor_service import (
+    EDITOR_GENERATION_LOCK,
     current_version_for_document,
     document_version_path,
     get_version_or_404,
-    save_external_document_version,
+    save_office_document_versions,
+    serialize_editor_generation_status,
 )
-from .office_related import related_operations, suggest_related_edits
+from .models import DocumentRecord, EditorOperation
+from .office_related import sync_related_paragraphs
 from .validation_service import DocumentValidationService
-from .text_inventory_service import build_text_inventory
 
 
 router = APIRouter()
 lock = Lock()
+save_state_lock = Lock()
+active_saves: Counter[str] = Counter()
+failed_saves: dict[str, str] = {}
 MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
 
@@ -56,7 +61,7 @@ def office_origin() -> str:
 def _enabled(request: Request) -> tuple[str, str]:
     origin = office_origin()
     if not origin or request.url.hostname not in {"127.0.0.1", "localhost"} or not request.url.port:
-        raise HTTPException(404, "The local ONLYOFFICE editor is disabled.")
+        raise HTTPException(503, "The local ONLYOFFICE service is unavailable. Start it and try again.")
     return origin, f"http://127.0.0.1:{request.url.port}"
 
 
@@ -79,8 +84,11 @@ def _callback_claims(token: str) -> dict:
         header, claims, signature = token.split(".")
         if hmac.compare_digest(signature, _signature(header + "." + claims)):
             packet = json.loads(base64.urlsafe_b64decode(claims + "=" * (-len(claims) % 4)))
-            if packet.get("operation", "callback") == "callback" and isinstance(packet.get("payload"), dict):
-                return packet["payload"]
+            if isinstance(packet, dict) and packet.get("operation", "callback") == "callback":
+                if isinstance(packet.get("payload"), dict):
+                    return packet["payload"]
+                if "payload" not in packet and packet.get("operation") == "callback":
+                    return packet
     except (ValueError, TypeError, UnicodeError, AttributeError):
         pass
     raise HTTPException(403, "The document server signature is invalid.")
@@ -104,15 +112,17 @@ def _draft_path(version_id: str) -> Path:
     return _directory(version_id) / "draft.docx"
 
 
-def _digest(value: bytes) -> str:
-    return hashlib.sha256(value).hexdigest()
-
-
-def _current(session: Session, version_id: str):
-    version = get_version_or_404(session, version_id)
-    if current_version_for_document(session, version.document).id != version.id:
-        raise HTTPException(409, "The current version changed. Reopen the latest version before editing in ONLYOFFICE.")
-    return version
+def _session_version(session: Session, version_id: str):
+    base = get_version_or_404(session, version_id)
+    current = current_version_for_document(session, base.document)
+    if current.id == version_id:
+        return current, None
+    operation = session.get(EditorOperation, current.editor_operation_id) if current.editor_operation_id else None
+    if operation:
+        metadata = operation.preview_json or {}
+        if metadata.get("office_session_version_id") == version_id and metadata.get("document_id") == base.document_id:
+            return current, operation
+    raise HTTPException(409, "This document was updated elsewhere. Reopen the latest version before editing.")
 
 
 @router.get("/api/onlyoffice")
@@ -120,10 +130,12 @@ def check_onlyoffice():
     return {"enabled": bool(office_origin())}
 
 
-@router.post("/api/onlyoffice/{version_id}/open")
-def open_editor(version_id: str, request: Request, session: Session = Depends(get_session)):
-    _, local_origin = _enabled(request)
-    _current(session, version_id)
+def _save_scope(version_id: str) -> str:
+    path = _directory(version_id) / "save-scope.txt"
+    return path.read_text(encoding="ascii") if path.is_file() else "shared"
+
+
+def _open_editor(version_id: str, local_origin: str) -> dict:
     with lock:
         directory = _directory(version_id)
         directory.mkdir(parents=True, exist_ok=True)
@@ -131,7 +143,48 @@ def open_editor(version_id: str, request: Request, session: Session = Depends(ge
         if not key_file.exists():
             key_file.write_text(secrets.token_hex(24), encoding="ascii")
         key = _read_key(version_id)
-    return {"embed_url": f"{local_origin.replace('127.0.0.1', 'localhost')}/onlyoffice-bridge/{version_id}/{key}"}
+        scope = _save_scope(version_id)
+    return {
+        "embed_url": f"{local_origin.replace('127.0.0.1', 'localhost')}/onlyoffice-bridge/{version_id}/{key}",
+        "version_id": version_id,
+        "save_scope": scope,
+    }
+
+
+@router.post("/api/onlyoffice/{version_id}/open")
+def open_editor(version_id: str, request: Request, session: Session = Depends(get_session)):
+    _, local_origin = _enabled(request)
+    current, _ = _session_version(session, version_id)
+    if current.id != version_id:
+        raise HTTPException(409, "Open the latest version before starting a new editor session.")
+    return _open_editor(version_id, local_origin)
+
+
+@router.post("/api/documents/{document_id}/onlyoffice/open")
+def open_document_editor(document_id: str, request: Request, session: Session = Depends(get_session)):
+    _, local_origin = _enabled(request)
+    document = session.get(DocumentRecord, document_id)
+    if document is None:
+        raise HTTPException(404, "Document not found.")
+    return _open_editor(current_version_for_document(session, document).id, local_origin)
+
+
+@router.put("/api/onlyoffice/{version_id}/save-scope")
+def set_save_scope(
+    version_id: str,
+    request: Request,
+    scope: Literal["shared", "document"] = Body(embed=True),
+    session: Session = Depends(get_session),
+):
+    _enabled(request)
+    with lock:
+        _read_key(version_id)
+        _session_version(session, version_id)
+        path = _directory(version_id) / "save-scope.txt"
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(scope, encoding="ascii")
+        temporary.replace(path)
+    return {"save_scope": scope}
 
 
 @router.get("/onlyoffice-bridge/{version_id}/{key}", response_class=HTMLResponse)
@@ -140,7 +193,7 @@ def editor_bridge(version_id: str, key: str, request: Request, session: Session 
     if request.url.hostname != "localhost":
         raise HTTPException(404, "This editor frame uses a separate local origin.")
     _read_key(version_id, key)
-    version = get_version_or_404(session, version_id)
+    version, _ = _session_version(session, version_id)
     service_origin = local_origin
     relay_host = os.getenv("DOCSYNC_ONLYOFFICE_WSL_RELAY_HOST")
     if relay_host:
@@ -159,7 +212,7 @@ def editor_bridge(version_id: str, key: str, request: Request, session: Session 
             "url": root + "/source", "permissions": {"edit": True, "download": False, "print": False},
         },
         "editorConfig": {"mode": "edit", "callbackUrl": root + "/callback",
-                         "customization": {"forcesave": True}},
+                         "customization": {"forcesave": True, "anonymous": {"request": False}}},
     }
     config["token"] = _sign(config)
     serialized = json.dumps(config).replace("<", "\\u003c")
@@ -191,9 +244,9 @@ def editor_bridge(version_id: str, key: str, request: Request, session: Session 
 def office_source(version_id: str, key: str, request: Request, session: Session = Depends(get_session)):
     _enabled(request)
     _read_key(version_id, key)
-    version = _current(session, version_id)
+    version, operation = _session_version(session, version_id)
     path = _draft_path(version_id)
-    if not path.is_file():
+    if operation is not None or not path.is_file():
         path = document_version_path(version)
     return FileResponse(path, media_type=MIME)
 
@@ -217,109 +270,74 @@ def _download_draft(origin: str, url: str) -> bytes:
 
 
 @router.post("/onlyoffice-service/{version_id}/{key}/callback")
-def office_callback(version_id: str, key: str, request: Request, body: dict):
+def office_callback(version_id: str, key: str, request: Request, body: dict, session: Session = Depends(get_session)):
     origin, _ = _enabled(request)
     _read_key(version_id, key)
     token = body.get("token") or request.headers.get("Authorization", "").removeprefix("Bearer ")
     claims = _callback_claims(token if isinstance(token, str) else "")
     if claims.get("key") != key:
         raise HTTPException(403, "The document server signed a different editing session.")
-    if claims.get("status") in {2, 6}:
-        url = claims.get("url")
-        if not isinstance(url, str):
-            raise HTTPException(422, "The document server did not return a DOCX URL.")
-        with lock:
+    if claims.get("status") not in (2, 6):
+        return {"error": 0}
+
+    url = claims.get("url")
+    if not isinstance(url, str):
+        raise HTTPException(422, "The document server did not return a DOCX URL.")
+    with save_state_lock:
+        active_saves[version_id] += 1
+        failed_saves.pop(version_id, None)
+
+    with lock, EDITOR_GENERATION_LOCK:
+        failure = None
+        try:
             _read_key(version_id, key)
+            current, _ = _session_version(session, version_id)
             content = _download_draft(origin, url)
-            DocumentValidationService.validate_package(content, filename="draft.docx")
-            DocumentValidationService.parse_file(content, filename="draft.docx")
-            path = _draft_path(version_id)
-            temporary = path.with_suffix(".tmp")
-            temporary.write_bytes(content)
-            temporary.replace(path)
+            original = document_version_path(current).read_bytes()
+            if original != content:
+                DocumentValidationService.validate_package(content, filename="draft.docx")
+                DocumentValidationService.parse_file(content, filename="draft.docx")
+                related = {}
+                if _save_scope(version_id) == "shared":
+                    related = sync_related_paragraphs(session, current, original, content)
+                save_office_document_versions(session, current.document_id, current.id, version_id, content, related)
+        except HTTPException as exc:
+            failure = str(exc.detail)
+            raise
+        except Exception:
+            failure = "DocSync couldn’t save the document. Try saving again in ONLYOFFICE."
+            raise
+        finally:
+            with save_state_lock:
+                active_saves[version_id] -= 1
+                if not active_saves[version_id]:
+                    del active_saves[version_id]
+                if failure:
+                    failed_saves[version_id] = failure
+                    if len(failed_saves) > 64:
+                        del failed_saves[next(iter(failed_saves))]
+                else:
+                    failed_saves.pop(version_id, None)
     return {"error": 0}
 
 
-@router.get("/api/onlyoffice/{version_id}/draft")
-def office_draft(version_id: str, request: Request):
+@router.get("/api/onlyoffice/{version_id}/save-status")
+def office_save_status(
+    version_id: str,
+    request: Request,
+    session: Session = Depends(get_session),
+    after_operation: str | None = None,
+):
     _enabled(request)
     _read_key(version_id)
-    with lock:
-        path = _draft_path(version_id)
-        return {"draft_sha256": _digest(path.read_bytes()) if path.is_file() else None}
-
-
-@router.get("/api/onlyoffice/{version_id}/draft/download")
-def download_draft(version_id: str, request: Request):
-    _enabled(request)
-    _read_key(version_id)
-    with lock:
-        path = _draft_path(version_id)
-        if not path.is_file():
-            raise HTTPException(404, "Save the document in ONLYOFFICE first.")
-        return Response(path.read_bytes(), media_type=MIME, headers={"Content-Disposition": 'attachment; filename="DocSync-draft.docx"'})
-
-
-@router.get("/api/onlyoffice/{version_id}/review")
-def review_draft(version_id: str, request: Request, session: Session = Depends(get_session)):
-    _enabled(request)
-    _read_key(version_id)
-    version = _current(session, version_id)
-    with lock:
-        path = _draft_path(version_id)
-        if not path.is_file():
-            raise HTTPException(404, "Save the document in ONLYOFFICE first.")
-        draft = path.read_bytes()
-
-    def lines(content: bytes) -> list[str]:
-        inventory = build_text_inventory(content, document_id=version.document_id, version_id=version.id)
-        return [segment.text for segment in inventory.segments
-                if segment.structure_type not in {"field_instruction", "tracked_delete"}]
-
-    original = document_version_path(version).read_bytes()
-    changes = list(unified_diff(lines(original), lines(draft), lineterm=""))
-    related = suggest_related_edits(session, version, original, draft)
-    return {
-        "draft_sha256": _digest(draft), "changes": changes[:160], "truncated": len(changes) > 160,
-        "related_edits": [edit.preview() for edit in related],
-    }
-
-
-class AcceptDraft(BaseModel):
-    draft_sha256: str
-
-
-class StageRelatedEdits(AcceptDraft):
-    target_ids: set[str] = Field(min_length=1, max_length=20000)
-
-
-@router.post("/api/documents/{document_id}/onlyoffice/{version_id}/stage-related", status_code=201)
-def stage_related_draft(document_id: str, version_id: str, body: StageRelatedEdits, request: Request, session: Session = Depends(get_session)):
-    _enabled(request)
-    with lock:
-        _read_key(version_id)
-        version = _current(session, version_id)
-        if version.document_id != document_id:
-            raise HTTPException(404, "The saved copy does not belong to this document.")
-        path = _draft_path(version_id)
-        if not path.is_file():
-            raise HTTPException(409, "Save the document before staging related edits.")
-        draft = path.read_bytes()
-        if _digest(draft) != body.draft_sha256:
-            raise HTTPException(409, "The saved draft changed. Review the latest saved copy.")
-        related = suggest_related_edits(session, version, document_version_path(version).read_bytes(), draft)
-        chosen = [edit for edit in related if edit.target.occurrence_id in body.target_ids]
-        if len(chosen) != len(body.target_ids):
-            raise HTTPException(409, "A related version changed. Review the current matches before staging.")
-        return stage_related_find_operations(session, version.document.document_set_id, related_operations(chosen))
-
-
-@router.post("/api/documents/{document_id}/onlyoffice/{version_id}/apply", status_code=201)
-def apply_draft(document_id: str, version_id: str, body: AcceptDraft, request: Request, session: Session = Depends(get_session)):
-    _enabled(request)
-    with lock:
-        _read_key(version_id)
-        path = _draft_path(version_id)
-        if not path.is_file() or _digest(path.read_bytes()) != body.draft_sha256:
-            raise HTTPException(409, "The saved draft changed. Review the latest saved copy before applying.")
-        return save_external_document_version(session, document_id, version_id, path)
+    current, operation = _session_version(session, version_id)
+    with save_state_lock:
+        if active_saves[version_id]:
+            return {"save": None, "saving": True}
+        if version_id in failed_saves:
+            return {"save": None, "save_error": failed_saves[version_id]}
+    if operation is None or operation.id == after_operation:
+        return {"save": None}
+    result = serialize_editor_generation_status(session, operation.id)
+    result["document_set"] = serialize_document_set(get_document_set_or_404(session, current.document.document_set_id))
+    return {"save": result}

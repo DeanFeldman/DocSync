@@ -1,41 +1,28 @@
-"""Suggest exact, version-bound text edits from a reviewed ONLYOFFICE save."""
+"""Apply wording changes to exact paragraph matches in the same document set."""
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from difflib import SequenceMatcher
+import re
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .editor_service import document_version_path
-from .models import DocumentHead, DocumentRecord, DocumentVersion
-from .schemas import EditBatchOperationRequest, FindReplaceOccurrenceTarget, TextSearchRequest
+from .find_replace_service import bind_inventory_to_revisions
+from .models import DocumentBlockRevision, DocumentHead, DocumentRecord, DocumentVersion
 from .text_inventory_service import (
+    DocumentTextInventory,
     DocumentTextSegment,
+    ParagraphInsertion,
+    TextReplacementPatch,
+    apply_text_replacements,
     build_text_inventory,
-    find_occurrence_ranges,
     occurrence_id,
 )
 
 
-@dataclass(frozen=True)
-class RelatedEdit:
-    document_name: str
-    before: str
-    after: str
-    replacement: str
-    target: FindReplaceOccurrenceTarget
-
-    def preview(self) -> dict:
-        return {
-            "id": self.target.occurrence_id,
-            "document_name": self.document_name,
-            "before": self.before,
-            "after": self.after,
-        }
-
-
-def _paragraphs(content: bytes, version: DocumentVersion) -> list[DocumentTextSegment]:
-    inventory = build_text_inventory(content, document_id=version.document_id, version_id=version.id)
+def _paragraphs(inventory: DocumentTextInventory) -> list[DocumentTextSegment]:
     return [
         segment for segment in inventory.segments
         if segment.location.get("kind") in {"body", "table_paragraph", "header_paragraph", "footer_paragraph"}
@@ -43,16 +30,19 @@ def _paragraphs(content: bytes, version: DocumentVersion) -> list[DocumentTextSe
     ]
 
 
-def _position(segment: DocumentTextSegment) -> tuple:
+def _container(segment: DocumentTextSegment) -> tuple:
     location = segment.location
     cell = tuple((part["table_index"], part["row_index"], part["column_index"])
                  for part in location.get("table_path", []))
-    return (segment.part_path, location["kind"], cell, location["paragraph_index"])
+    return (segment.part_path, location["kind"], cell)
 
 
 def _context(segment: DocumentTextSegment) -> tuple:
     location = segment.location
-    return (segment.structure_type, location.get("part_kind"), location.get("header_footer_type"))
+    kind = location.get("part_kind") or location["kind"]
+    if kind in {"body", "table_paragraph"}:
+        kind = "main"
+    return (kind, location.get("header_footer_type"))
 
 
 def _changed_span(before: str, after: str) -> tuple[int, int, str] | None:
@@ -74,84 +64,247 @@ def _changed_span(before: str, after: str) -> tuple[int, int, str] | None:
         after_end += 1
     previous = before[start:end]
     replacement = after[start:after_end]
-    if not previous.strip() or len(previous) > 500 or len(replacement) > 20_000:
+    if not previous.strip():
         return None
     return start, end, replacement
 
 
-def suggest_related_edits(
-    session: Session, version: DocumentVersion, original: bytes, draft: bytes,
-) -> list[RelatedEdit]:
-    old = _paragraphs(original, version)
-    new = _paragraphs(draft, version)
-    if [_position(item) for item in old] != [_position(item) for item in new]:
-        return []
+def _wording(segment: DocumentTextSegment) -> str:
+    return " ".join(segment.text.split())
 
-    original_counts = Counter((_context(item), item.text) for item in old)
-    remaining_text = {(_context(item), item.text) for item in new}
+
+def _actual_span(text: str, start: int, end: int) -> tuple[int, int]:
+    # Count each whitespace run as one character, as in _wording, and keep
+    # the original offsets for DOCX write-back.
+    trimmed_start = len(text) - len(text.lstrip())
+    spans = list(re.finditer(r"\s+|\S", text.strip()))
+    return trimmed_start + spans[start].start(), trimmed_start + spans[end - 1].end()
+
+
+def _wording_key(segment: DocumentTextSegment) -> tuple[tuple, str]:
+    return _context(segment), _wording(segment)
+
+
+def _detached_revisions(session: Session, inventory: DocumentTextInventory) -> set[str]:
+    detached = set(session.scalars(
+        select(DocumentBlockRevision.id).where(
+            DocumentBlockRevision.version_id == inventory.version_id,
+            DocumentBlockRevision.shared_state == "detached",
+        )
+    ))
+    if detached:
+        bind_inventory_to_revisions(session, inventory)
+    return detached
+
+
+def _paragraph_changes(
+    before: list[DocumentTextSegment],
+    after: list[DocumentTextSegment],
+    detached: set[str],
+) -> dict[tuple[tuple, str], tuple[int, int, str]]:
+    old = [_wording_key(segment) for segment in before]
+    new = [_wording_key(segment) for segment in after]
+    original_counts = Counter(old)
+    remaining = set(new)
     changes = {}
-    for before, after in zip(old, new):
-        key = (_context(before), before.text)
-        if before.text == after.text or original_counts[key] != 1 or key in remaining_text:
+    matcher = SequenceMatcher(a=old, b=new, autojunk=False)
+    for tag, old_start, old_end, new_start, new_end in matcher.get_opcodes():
+        if tag == "replace" and old_end - old_start == new_end - new_start:
+            pairs = zip(before[old_start:old_end], after[new_start:new_end])
+        elif tag == "delete" and new:
+            # A deleted paragraph has no new paragraph to pair with. Clear
+            # the corresponding wording in other files without reflowing
+            # their table rows, paragraphs, or numbering.
+            pairs = ((paragraph, None) for paragraph in before[old_start:old_end])
+        else:
             continue
-        if _context(before) != _context(after):
-            continue
-        span = _changed_span(before.text, after.text)
-        if span is not None and before.editability_for_range(*span[:2])[0]:
-            changes[key] = after.text, span
-    if not changes:
-        return []
+        for previous, updated in pairs:
+            key = _wording_key(previous)
+            if previous.revision_id in detached or original_counts[key] != 1 or key in remaining:
+                continue
+            if updated is not None and _container(previous) != _container(updated):
+                continue
+            span = _changed_span(key[1], _wording(updated) if updated is not None else "")
+            if span is None:
+                continue
+            start, end = _actual_span(previous.text, *span[:2])
+            if previous.editability_for_range(start, end, allow_whitespace_deletion=not span[2])[0]:
+                changes[key] = span
+    return changes
 
-    related = session.scalars(
+
+@dataclass(frozen=True)
+class ParagraphAddition:
+    previous: tuple[tuple, str] | None
+    following: tuple[tuple, str] | None
+    kind: str
+    blank_count: int
+    texts: tuple[str, ...]
+
+
+def _paragraph_groups(paragraphs: list[DocumentTextSegment]) -> dict[tuple, list[DocumentTextSegment]]:
+    groups = defaultdict(list)
+    for paragraph in paragraphs:
+        groups[_container(paragraph)].append(paragraph)
+    return groups
+
+
+def _paragraph_additions(
+    before: list[DocumentTextSegment],
+    after: list[DocumentTextSegment],
+    detached: set[str],
+) -> list[ParagraphAddition]:
+    before_groups = _paragraph_groups(before)
+    counts = Counter(_wording_key(paragraph) for paragraph in before)
+    additions = []
+    for container, paragraphs in _paragraph_groups(after).items():
+        original = before_groups.get(container)
+        kind = container[1]
+        if not original or kind not in {"body", "table_paragraph"}:
+            continue
+        old = [_wording(paragraph) for paragraph in original]
+        new = [_wording(paragraph) for paragraph in paragraphs]
+        matcher = SequenceMatcher(a=old, b=new, autojunk=False)
+        for tag, start, end, new_start, new_end in matcher.get_opcodes():
+            if tag == "insert":
+                blank_count = 0
+            elif tag == "replace" and end - start == new_end - new_start and not any(old[start:end]):
+                blank_count = end - start
+            else:
+                continue
+            if not any(new[new_start:new_end]):
+                continue
+            block = paragraphs[new_start:new_end]
+            if any(
+                span.role != "ordinary" or span.node_kind not in {"text", "tab", "line_break"}
+                or span.hyperlink_key or span.content_control_key
+                for paragraph in block for span in paragraph.spans
+            ):
+                continue
+            previous = original[start - 1] if start else None
+            following = original[end] if end < len(original) else None
+            if previous is None and following is None:
+                continue
+            if any(
+                not _wording(anchor) or counts[_wording_key(anchor)] != 1 or anchor.revision_id in detached
+                for anchor in (previous, following) if anchor is not None
+            ):
+                continue
+            if previous is not None and (not new_start or new[new_start - 1] != old[start - 1]):
+                continue
+            if following is not None and (new_end == len(new) or new[new_end] != old[end]):
+                continue
+            additions.append(ParagraphAddition(
+                _wording_key(previous) if previous else None,
+                _wording_key(following) if following else None,
+                kind,
+                blank_count,
+                tuple(paragraph.text for paragraph in block),
+            ))
+    return additions
+
+
+def _target_insertions(
+    paragraphs: list[DocumentTextSegment],
+    additions: list[ParagraphAddition],
+    detached: set[str],
+) -> tuple[ParagraphInsertion, ...]:
+    groups = _paragraph_groups(paragraphs)
+    by_wording = defaultdict(list)
+    for paragraph in paragraphs:
+        by_wording[_wording_key(paragraph)].append(paragraph)
+    insertions = []
+    for addition in additions:
+        before = by_wording.get(addition.previous, [])
+        after = by_wording.get(addition.following, [])
+        if (addition.previous is not None and len(before) != 1) or (
+            addition.following is not None and len(after) != 1
+        ):
+            continue
+        previous = before[0] if before else None
+        following = after[0] if after else None
+        container = _container(previous or following)
+        if container[1] != addition.kind or any(
+            _container(anchor) != container or anchor.revision_id in detached
+            for anchor in (previous, following) if anchor is not None
+        ):
+            continue
+        group = groups[container]
+        start = group.index(previous) + 1 if previous is not None else 0
+        end = group.index(following) if following is not None else len(group)
+        if end - start != addition.blank_count or any(_wording(item) for item in group[start:end]):
+            continue
+        insertions.append(ParagraphInsertion(
+            previous_id=previous.segment_id if previous else None,
+            next_id=following.segment_id if following else None,
+            empty_ids=tuple(item.segment_id for item in group[start:end]),
+            texts=addition.texts,
+        ))
+    return tuple(insertions)
+
+
+def sync_related_paragraphs(
+    session: Session, version: DocumentVersion, original: bytes, edited: bytes,
+) -> dict[str, tuple[str, bytes]]:
+    inventory_options = {
+        "document_id": version.document_id, "version_id": version.id, "include_empty_paragraphs": True,
+    }
+    original_inventory = build_text_inventory(original, **inventory_options)
+    detached = _detached_revisions(session, original_inventory)
+    before = _paragraphs(original_inventory)
+    after = _paragraphs(build_text_inventory(edited, **inventory_options))
+    changes = _paragraph_changes(before, after, detached)
+    additions = _paragraph_additions(before, after, detached)
+    if not changes and not additions:
+        return {}
+
+    candidates = session.scalars(
         select(DocumentVersion)
         .join(DocumentHead, DocumentHead.current_version_id == DocumentVersion.id)
         .join(DocumentRecord, DocumentRecord.id == DocumentHead.document_id)
         .where(DocumentRecord.document_set_id == version.document.document_set_id,
                DocumentRecord.id != version.document_id)
-        .order_by(DocumentRecord.original_name, DocumentRecord.id)
     )
-    suggestions = []
-    for candidate in related:
+    synced = {}
+    for candidate in candidates:
+        content = document_version_path(candidate).read_bytes()
+        inventory = build_text_inventory(
+            content, document_id=candidate.document_id, version_id=candidate.id,
+            include_empty_paragraphs=bool(additions),
+        )
+        paragraphs = _paragraphs(inventory)
         matches = defaultdict(list)
-        for segment in _paragraphs(document_version_path(candidate).read_bytes(), candidate):
-            key = (_context(segment), segment.text)
+        for segment in paragraphs:
+            key = _wording_key(segment)
             if key in changes:
                 matches[key].append(segment)
+        if not matches and not additions:
+            continue
+        detached = _detached_revisions(session, inventory)
+        patches = []
         for key, segments in matches.items():
             if len(segments) != 1:
                 continue
             segment = segments[0]
-            after, (start, end, replacement) = changes[key]
-            query = segment.text[start:end]
-            if not segment.editability_for_range(start, end)[0]:
+            start, end, replacement = changes[key]
+            start, end = _actual_span(segment.text, start, end)
+            if segment.revision_id in detached or not segment.editability_for_range(
+                start, end, allow_whitespace_deletion=not replacement,
+            )[0]:
                 continue
-            if (start, end) not in find_occurrence_ranges(segment.text, query, match_case=True):
-                continue
-            target = FindReplaceOccurrenceTarget(
+            patches.append(TextReplacementPatch(
                 occurrence_id=occurrence_id(segment, start, end),
                 segment_id=segment.segment_id,
-                document_id=candidate.document_id,
-                version_id=candidate.id,
                 part_path=segment.part_path,
-                structure_type=segment.structure_type,
                 match_start=start,
                 match_end=end,
-                matched_text=query,
-                location=segment.location,
-            )
-            suggestions.append(RelatedEdit(candidate.document.original_name, segment.text, after, replacement, target))
-    return suggestions
-
-
-def related_operations(edits: list[RelatedEdit]) -> list[EditBatchOperationRequest]:
-    grouped = defaultdict(list)
-    for edit in edits:
-        grouped[(edit.target.matched_text, edit.replacement)].append(edit.target)
-    return [
-        EditBatchOperationRequest(
-            operation_type="find_replace", label="ONLYOFFICE paragraph edit",
-            replacement_text=replacement,
-            find_request=TextSearchRequest(query=query, match_case=True), occurrences=targets,
-        )
-        for (query, replacement), targets in grouped.items()
-    ]
+                expected_text=segment.text[start:end],
+                replacement_text=replacement,
+                allow_whitespace_deletion=not replacement,
+            ))
+        insertions = _target_insertions(paragraphs, additions, detached) if additions else ()
+        if patches or insertions:
+            updated = apply_text_replacements(content, inventory, patches, insertions=insertions)
+            if updated != content:
+                synced[candidate.document_id] = (candidate.id, updated)
+    return synced

@@ -9,6 +9,7 @@ import shutil
 from time import perf_counter
 
 from fastapi import (
+    Body,
     Depends,
     FastAPI,
     File,
@@ -41,6 +42,7 @@ from .document_service import (
     list_document_sets,
     preview_edit,
     remove_document_from_set,
+    safe_download_name,
     render_document_with_word,
     rendered_pdf_path,
     serialize_document_set_history,
@@ -157,7 +159,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=list(settings.cors_origins),
     allow_credentials=False,
-    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type"],
 )
 
@@ -335,6 +337,38 @@ async def add_document_set_documents(
     return serialize_document_set(
         await add_documents_to_set(session, document_set_id, files)
     )
+
+
+@app.patch("/api/document-sets/{document_set_id}/documents/{document_id}")
+def rename_document_set_document(
+    document_set_id: str,
+    document_id: str,
+    name: str = Body(embed=True, max_length=255),
+    session: Session = Depends(get_session),
+) -> dict:
+    name = name.strip()
+    if name.casefold().endswith(".docx"):
+        stem = name[:-5].strip()
+    else:
+        stem = name
+    if not stem or stem != stem.strip(" ."):
+        raise HTTPException(422, "Enter a valid document name.")
+    filename = f"{stem}.docx"
+    if safe_download_name(filename) != filename:
+        raise HTTPException(422, "Enter a valid Windows file name of 255 characters or fewer.")
+
+    with EDITOR_GENERATION_LOCK:
+        document = get_document_or_404(session, document_id)
+        if document.document_set_id != document_set_id:
+            raise HTTPException(404, "Document not found in this set.")
+        if any(
+            other.id != document.id and other.original_name.casefold() == filename.casefold()
+            for other in document.document_set.documents
+        ):
+            raise HTTPException(409, "This set already contains a file with that name.")
+        document.original_name = filename
+        session.commit()
+    return {"id": document.id, "name": document.original_name}
 
 
 @app.delete("/api/document-sets/{document_set_id}/documents/{document_id}")

@@ -9,7 +9,6 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "quill": "^2.0.3",
     "react": "19.2.7",
     "react-dom": "19.2.7"
   },

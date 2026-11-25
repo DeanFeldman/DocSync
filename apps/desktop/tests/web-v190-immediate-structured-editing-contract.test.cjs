@@ -1,32 +1,22 @@
-"use strict";
-
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
 
-const repositoryRoot = path.resolve(__dirname, "../../..");
+const read = (name) => fs.readFileSync(path.join(__dirname, "../../..", "apps/web/src", name), "utf8");
 
-function read(relativePath) {
-  return fs.readFileSync(path.join(repositoryRoot, relativePath), "utf8");
-}
-
-test("the workspace opens directly in Layout, with a text editor when geometry is unavailable", () => {
-  const experience = read("apps/web/src/DocumentExperience.tsx");
-  assert.match(experience, /id="workspace-panel-layout"/);
-  assert.doesNotMatch(experience, /workspace-panel-edit|workspace-mode-tabs/);
-  assert.match(experience, /preloadInlineLayoutEditor\(\)/);
-  assert.match(experience, /!inlineSelection && draft && \([\s\S]*?<InlineLayoutEditor/);
-  assert.match(experience, /previewVersionStartedRef\.current = activeVersionId[\s\S]*void loadWordPreview\(\)/);
-});
-
-test("both Layout editing paths preserve drafts across selections", () => {
-  const experience = read("apps/web/src/DocumentExperience.tsx");
-  const resources = read("apps/web/src/workspaceResources.ts");
-  assert.match(resources, /getWorkspaceDraft/);
-  assert.match(resources, /setWorkspaceDraft/);
-  assert.match(resources, /clearWorkspaceDraft/);
-  assert.match(experience, /setWorkspaceDraft\(activeViewStateKey, selectedElementId, nextDraft\)/);
-  assert.match(experience, /onChange=\{handleDraftChange\}/);
-  assert.match(experience, /onDraftChange=\{handleDraftChange\}/);
+test("the workspace opens ONLYOFFICE for the selected document", () => {
+  const app = read("App.tsx");
+  const history = read("DocumentVersionHistory.tsx");
+  const office = read("LocalOfficeEditor.tsx");
+  assert.match(app, /<LocalOfficeEditor/);
+  assert.doesNotMatch(app, /FindReplacePanel|>Pending changes|Find &amp; Replace/);
+  assert.doesNotMatch(app, /WordPreview|InlineLayoutEditor|edit-sidebar|editor-document-header/);
+  assert.match(app, /setHistoryDocumentId\(document.id\)/);
+  assert.match(history, /restoreDocumentVersion/);
+  assert.match(office, /\/onlyoffice\/open/);
+  assert.match(office, /<iframe/);
+  assert.match(office, /Matching files/);
+  assert.match(office, /This file only/);
+  assert.doesNotMatch(office, /Back to Layout|Edit in ONLYOFFICE/);
 });

@@ -1,8 +1,7 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { absoluteApiUrl } from "./api";
 import type { EditorGenerationResponse } from "./types";
-import { useConfirmation } from "./ConfirmationDialog";
-import { BATCH_UPDATED_EVENT } from "./FindReplacePanel";
 
 async function read<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(absoluteApiUrl(path), options);
@@ -13,190 +12,143 @@ async function read<T>(path: string, options?: RequestInit): Promise<T> {
   return data;
 }
 
+type SaveScope = "shared" | "document";
+
 interface Props {
   documentId: string;
-  versionId: string;
-  disabled: boolean;
-  children: ReactNode;
+  toolbarTarget: HTMLElement | null;
   onGenerated: (result: EditorGenerationResponse) => void;
 }
 
-interface RelatedEdit {
-  id: string;
-  document_name: string;
-  before: string;
-  after: string;
-}
-
-interface Review {
-  draft_sha256: string;
-  changes: string[];
-  truncated: boolean;
-  related_edits: RelatedEdit[];
-}
-
-export default function LocalOfficeEditor({ documentId, versionId, disabled, children, onGenerated }: Props) {
-  const confirm = useConfirmation();
-  const [enabled, setEnabled] = useState(false);
-  const [editorUrl, setEditorUrl] = useState("");
-  const [saved, setSaved] = useState<string | null>(null);
-  const [review, setReview] = useState<Review | null>(null);
-  const [selected, setSelected] = useState<string[]>([]);
-  const [staged, setStaged] = useState<string[]>([]);
-  const [stageMessage, setStageMessage] = useState("");
-  const [busy, setBusy] = useState(false);
+export default function LocalOfficeEditor({ documentId, toolbarTarget, onGenerated }: Props) {
+  const [editor, setEditor] = useState<{ url: string; endpoint: string } | null>(null);
+  const [scope, setScope] = useState<SaveScope>("shared");
+  const [saveMessage, setSaveMessage] = useState("");
+  const [saveOperation, setSaveOperation] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
+  const [scopeBusy, setScopeBusy] = useState(false);
+  const [retry, setRetry] = useState(0);
+  const [openError, setOpenError] = useState("");
   const [error, setError] = useState("");
-  const endpoint = `/api/onlyoffice/${encodeURIComponent(versionId)}`;
+  const onGeneratedRef = useRef(onGenerated);
+  onGeneratedRef.current = onGenerated;
 
   useEffect(() => {
     const controller = new AbortController();
-    void read<{ enabled: boolean }>("/api/onlyoffice", { signal: controller.signal })
-      .then((value) => setEnabled(value.enabled)).catch(() => {});
+    void read<{ embed_url: string; version_id: string; save_scope: SaveScope }>(
+      `/api/documents/${encodeURIComponent(documentId)}/onlyoffice/open`,
+      { method: "POST", signal: controller.signal },
+    ).then((result) => {
+      if (controller.signal.aborted) return;
+      setScope(result.save_scope);
+      setEditor({ url: result.embed_url, endpoint: `/api/onlyoffice/${encodeURIComponent(result.version_id)}` });
+    }).catch((cause) => {
+      if (!controller.signal.aborted) setOpenError(cause instanceof Error ? cause.message : String(cause));
+    });
     return () => controller.abort();
-  }, []);
+  }, [documentId, retry]);
 
   useEffect(() => {
-    if (!editorUrl) return;
+    if (!editor) return;
     const controller = new AbortController();
-    async function check() {
+    let lastOperation = "";
+    let timer: number | undefined;
+    async function check(endpoint: string) {
       try {
-        const draft = await read<{ draft_sha256: string | null }>(endpoint + "/draft", { signal: controller.signal });
-        setSaved(draft.draft_sha256);
+        const params = new URLSearchParams({ after_operation: lastOperation });
+        const progress = await read<{
+          save: EditorGenerationResponse | null;
+          saving?: boolean;
+          save_error?: string;
+        }>(
+          endpoint + "/save-status?" + params, { signal: controller.signal },
+        );
+        if (controller.signal.aborted) return;
+        setSaving(Boolean(progress.saving));
+        setSaveError(progress.save_error ?? "");
+        const { save } = progress;
+        if (!save) return;
+        lastOperation = save.generation_id;
+        setSaveOperation(save.generation_id);
+        const related = (save.affected_documents ?? []).filter((document) => document.id !== documentId);
+        setSaveMessage(related.length
+          ? `Saved. Shared paragraphs updated in ${related.map((document) => document.name).join(", ")}.`
+          : "Saved. No shared paragraph updates in this save.");
+        setError("");
+        onGeneratedRef.current(save);
       } catch (error) {
-        if (!controller.signal.aborted) setError(String(error));
+        if (!controller.signal.aborted) {
+          setSaving(false);
+          setError(error instanceof Error ? error.message : String(error));
+        }
+      } finally {
+        if (!controller.signal.aborted) timer = window.setTimeout(() => void check(endpoint), 750);
       }
     }
-    void check();
-    const timer = window.setInterval(() => void check(), 2500);
+    void check(editor.endpoint);
     return () => {
       controller.abort();
-      window.clearInterval(timer);
+      window.clearTimeout(timer);
     };
-  }, [editorUrl, endpoint]);
+  }, [editor, documentId]);
 
-  async function open() {
-    setBusy(true);
+  async function changeScope(nextScope: SaveScope) {
+    if (!editor) return;
+    setScopeBusy(true);
     setError("");
     try {
-      const result = await read<{ embed_url: string }>(endpoint + "/open", { method: "POST" });
-      setEditorUrl(result.embed_url);
-    } catch (error) {
-      setError(String(error));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function reviewSavedCopy() {
-    setBusy(true);
-    setError("");
-    try {
-      setReview(await read<Review>(endpoint + "/review"));
-      setSelected([]);
-      setStaged([]);
-      setStageMessage("");
-    } catch (error) {
-      setError(String(error));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  const currentReview = review?.draft_sha256 === saved ? review : null;
-
-  async function stageRelated() {
-    if (!currentReview || !selected.length) return;
-    setBusy(true);
-    setError("");
-    setStageMessage("");
-    try {
-      const path = `/api/documents/${encodeURIComponent(documentId)}/onlyoffice/${encodeURIComponent(versionId)}/stage-related`;
-      await read(path, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ draft_sha256: currentReview.draft_sha256, target_ids: selected }),
+      const result = await read<{ save_scope: SaveScope }>(editor.endpoint + "/save-scope", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scope: nextScope }),
       });
-      setStaged([...staged, ...selected]);
-      setSelected([]);
-      setStageMessage("Selected edits are in Pending changes for review and apply.");
-      window.dispatchEvent(new Event(BATCH_UPDATED_EVENT));
-    } catch (error) {
-      setError(String(error));
+      setScope(result.save_scope);
+      setSaveMessage("");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
-      setBusy(false);
+      setScopeBusy(false);
     }
   }
 
-  async function apply() {
-    if (!currentReview || disabled) return;
-    const reviewed = currentReview.draft_sha256;
-    if (!(await confirm({
-      title: "Apply the saved copy?",
-      message: "This creates a new version of the current document from the last save in ONLYOFFICE.",
-      action: "Create version",
-    }))) return;
-    setBusy(true);
-    setError("");
-    try {
-      const path = `/api/documents/${encodeURIComponent(documentId)}/onlyoffice/${encodeURIComponent(versionId)}/apply`;
-      const result = await read<EditorGenerationResponse>(path, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ draft_sha256: reviewed }),
-      });
-      setEditorUrl("");
-      onGenerated(result);
-    } catch (error) {
-      setError(String(error));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  if (!enabled) return <>{children}</>;
+  if (!editor) return <div className="local-office-empty">
+    {openError ? <>
+      <p role="alert">{openError}</p>
+      <button type="button" className="quiet-button" onClick={() => {
+        setOpenError("");
+        setRetry((value) => value + 1);
+      }}>Try again</button>
+    </> : <p role="status">Opening ONLYOFFICE…</p>}
+  </div>;
 
   return <>
-    <div className="local-office-toolbar" aria-label="Local document editor">
-      {editorUrl ? <>
-        <button type="button" className="quiet-button" disabled={busy} onClick={() => {
-          setEditorUrl("");
-          setSaved(null);
-          setReview(null);
-          setSelected([]);
-          setStaged([]);
-          setStageMessage("");
-          setError("");
-        }}>Back to Layout</button>
-        <span role="status">{saved ? "Saved copy ready for review" : "Click Save in ONLYOFFICE to prepare a copy for review"}</span>
-        {saved && <>
-          <a className="quiet-button" href={absoluteApiUrl(endpoint + "/draft/download")} download>Download saved copy</a>
-          {currentReview ? <button type="button" className="quiet-button" onClick={() => void apply()} disabled={busy || disabled}>Apply to this document</button>
-            : <button type="button" className="quiet-button" onClick={() => void reviewSavedCopy()} disabled={busy}>Review saved copy</button>}
-        </>}
-      </> : <button type="button" className="quiet-button" onClick={() => void open()} disabled={busy || disabled}>Edit in ONLYOFFICE</button>}
-    </div>
-    {error && <p className="editor-operation-error" role="alert">{error}</p>}
-    {editorUrl && currentReview && <section className="local-office-review" aria-label="Saved document changes">
-      <strong>Text changes in the saved copy</strong>
-      {currentReview.changes.length ? <pre>{currentReview.changes.join("\n")}</pre>
-        : <p>No text changes detected. Review formatting in the document editor.</p>}
-      {currentReview.truncated && <p>Download the saved copy to review the complete document.</p>}
-      {currentReview.related_edits.length ? <fieldset className="local-office-related">
-        <legend>Update matching paragraphs in other files</legend>
-        {currentReview.related_edits.map((match) => <label key={match.id}>
-          <input type="checkbox" checked={selected.includes(match.id) || staged.includes(match.id)}
-            disabled={busy || staged.includes(match.id)} onChange={(event) => {
-              setSelected(event.target.checked ? [...selected, match.id] : selected.filter(id => id !== match.id));
-            }} />
-          <span><strong>{match.document_name}</strong><br />{match.before}<br />→ {match.after}</span>
-        </label>)}
-        <button type="button" className="quiet-button" disabled={busy || !selected.length} onClick={() => void stageRelated()}>Add selected edits to Pending changes</button>
-        {stageMessage && <p role="status">{stageMessage}</p>}
-      </fieldset> : <p>No unambiguous matching paragraphs found in the other files.</p>}
-    </section>}
-    {editorUrl ? <iframe
+    {toolbarTarget && createPortal(<div className="local-office-toolbar" aria-label="Document sync">
+      <label>
+        Apply wording changes to
+        <select value={scope} disabled={scopeBusy || saving} onChange={(event) => void changeScope(event.target.value as SaveScope)}>
+          <option value="shared">Matching files</option>
+          <option value="document">This file only</option>
+        </select>
+      </label>
+      <span className="local-office-save-status" role="status">
+        {saving ? <>
+          <span className="local-office-save-spinner" aria-hidden="true" />
+          Saving…
+        </> : saveError ? null : saveMessage ? <>
+          <span key={saveOperation} className="local-office-save-check" aria-hidden="true">✓</span>
+          {saveMessage}
+        </> : scope === "shared"
+          ? "Save to sync matching files."
+          : "Save in ONLYOFFICE to update this file."}
+      </span>
+    </div>, toolbarTarget)}
+    {(saveError || error) && <p className="local-office-error" role="alert">{saveError || error}</p>}
+    <iframe
       className="local-office-frame"
-      src={editorUrl}
+      src={editor.url}
       title="Local ONLYOFFICE editor"
       sandbox="allow-scripts allow-same-origin allow-forms allow-downloads"
-    /> : children}
+    />
   </>;
 }

@@ -8,7 +8,7 @@
 
 DocSync is a local-first Windows desktop application for safely coordinating edits across related Microsoft Word documents.
 
-Users can upload a group of `.docx` files, view their Word layouts, edit supported content, compare repeated wording across documents, preview proposed changes, and generate new document versions without overwriting the originals.
+Upload related DOCX files, edit them in ONLYOFFICE, and sync matching paragraph wording across the set. DocSync keeps the originals and every saved version.
 
 ---
 
@@ -34,10 +34,10 @@ SHA256SUMS.txt
 
 ---
 
-## Optional local ONLYOFFICE prototype
+## Local ONLYOFFICE editor
 
-The prototype embeds the ONLYOFFICE editor in Layout. Use the regular desktop
-launcher with the built web bundle. The prototype requires a trusted local
+Selecting a file opens the embedded editor. Use the desktop launcher with
+the built web bundle. DocSync requires a trusted local
 ONLYOFFICE Docs service that can reach DocSync on `127.0.0.1`. Configure the
 document service to allow connections to that loopback address and enable its
 browser and callback JWT signatures with the same secret. Set these environment
@@ -50,16 +50,19 @@ npm start
 ```
 
 Set the loopback origin to the exact origin that ONLYOFFICE uses in its saved
-file URLs. The prototype accepts loopback HTTP origins with an explicit port and
-a shared secret of at least 24 characters. For the prototype, run the service
+file URLs. DocSync accepts loopback HTTP origins with an explicit port and
+a shared secret of at least 24 characters. Run the service
 where `127.0.0.1` reaches DocSync directly, or use a host-networked environment
 with that property. The standard installer does not bundle this dependency.
 
-Choose **Edit in ONLYOFFICE** in Layout. Click **Save** inside the editor, review
-the saved copy, and choose **Apply saved copy** to create a version of that
-document. To update other files, select the exact paragraph matches in the
-saved-copy review and add them to **Pending changes** before applying the saved
-copy. Review and apply those edits from **Pending changes**.
+With **Matching files** selected, click **Save** in ONLYOFFICE to save the
+edited file and update unambiguous paragraph matches in the set. Matching
+compares wording while ignoring spacing differences. Deleting a shared
+paragraph clears its wording in the other files and preserves their layout.
+**This file only** saves the current file. The toolbar shows the files
+updated by each save. New paragraphs sync as text when matching surrounding
+paragraphs identify the same insertion point. Formatting-only changes stay
+in the file you edited.
 
 ## Local workspaces and manual transfers
 
@@ -87,22 +90,6 @@ DocSync does not automatically transfer or restore this data.
 
 ## Main Features
 
-### Batch Find & Replace
-
-- Discover every occurrence separately across logical Word text, including text
-  split across runs and supported complex structures.
-- Report protected text as read-only with a specific reason instead of silently
-  omitting it.
-- Review and select editable occurrences across all, current, or selected
-  documents.
-- Combine Find & Replace and reviewed rich-editor changes in durable pending
-  batches.
-- Detect overlaps and stale versions before writing files.
-- Generate at most one new immutable version per affected document and keep an
-  auditable batch history.
-
-See [Batch editing and complete Word text inventory](docs/batch-find-replace-text-inventory.md).
-
 ### Download Statistics
 
 The scheduled collector stores public GitHub Release installer download
@@ -122,109 +109,10 @@ not collect in-app telemetry.
 - Download individual documents or the complete set.
 - Switch between light and dark mode.
 
-### Word Layout Preview
-
-- Render high-fidelity Word layouts in the background.
-- Cache previews using immutable document versions.
-- Reuse previously generated previews.
-- Display document pages inside a scrollable workspace.
-- Resolve generated numbering, TOC decorations, repeated text, and cross-page
-  paragraphs with contextual PDF mapping.
-- Map blank bordered table cells and long signature/form underlines geometrically.
-- Continue using the application while rendering completes.
-- Retry a failed Word preview without substituting a synthetic document layout.
-
-### Controlled Editing
-
-DocSync maps supported Word content into stable editable blocks.
-
-Supported content includes:
-
-- Headings
-- Body paragraphs
-- Ordered lists
-- Unordered lists
-- Top-level table paragraphs
-- Empty bordered table cells and mapped signature/form lines
-- Supported merged top-level table paragraphs
-- Header paragraphs
-- Footer paragraphs
-
-Supported formatting includes:
-
-- Bold
-- Italic
-- Underline
-- Heading levels
-- Ordered and unordered lists
-- Indentation
-- Alignment
-- Soft line breaks within one Word paragraph or table cell
-
-Editing is intentionally restricted to operations that can be mapped safely back to the original Word document.
-
-### Inline Layout Editing
-
-Reliable text regions can be selected directly from the Word layout.
-
-When a supported paragraph is selected:
-
-1. A controlled Quill editor opens over the selected content.
-2. The user edits the block, including multiline typing or plain-text paste.
-3. Matching wording is identified across the document set.
-4. The user chooses which documents should be updated.
-5. DocSync previews the complete result.
-6. New immutable document versions are generated.
-
-Low-confidence or ambiguous layout regions remain read-only.
-
-Pressing Enter creates a Word line break inside the selected block. It does not
-insert a new structural Word paragraph, table row, or table column.
-
-### Compare Related Documents
-
-DocSync can:
-
-- Find exact repeated wording.
-- Find bounded near-match candidates.
-- Display similarity scores.
-- Highlight word-level differences.
-- Require confirmation before changing near matches.
-- Include or exclude individual targets.
-
-### Editing Modes
-
-#### Shared Wording
-
-Apply the active replacement to selected exact matches across the document set.
-
-#### Per-Document Values
-
-Provide a different replacement value for each selected document.
-
-#### Whole-Paragraph Override
-
-Change only the selected paragraph and detach it from future shared wording updates.
-
-### Preview and Generation
-
-Before changing any document, DocSync shows:
-
-- Every affected document
-- The selected editing mode
-- The original text
-- The proposed replacement
-- The exact Word location
-- Included and excluded targets
-
-Confirmed changes are generated through durable background jobs.
-
 ### Downloads and Version History
 
 - Download the current document.
 - Download any recorded version.
-- Download the complete document set as a ZIP file.
-- Download generated operation output.
 - Inspect version lineage.
 - Restore an earlier version as a new current version.
 - Keep all previous versions available.
@@ -233,35 +121,18 @@ Confirmed changes are generated through durable background jobs.
 
 ## Safety Model
 
-DocSync is designed around controlled document editing.
-
-- Original uploaded files are never overwritten.
-- Confirmed edits create new immutable versions.
-- Every supported editor block is mapped to a stored Word element.
-- Preview operations do not write new files.
-- Stale edits are rejected when a document changes before generation.
-- Failed generation operations are rolled back.
-- Unsupported Word structures are preserved.
-- Unsafe or ambiguous structures remain read-only.
-- Local documents stay on the user's computer.
-
----
+- Every save creates immutable document versions and preserves the uploaded originals.
+- Related wording updates use exact, unambiguous matches and preserve each file's other paragraphs.
+- DocSync rejects stale saves and rolls back a failed multi-document write.
+- Documents stay on this device and the local ONLYOFFICE service.
 
 ## How It Works
 
-1. Create a document set.
-2. Upload related Microsoft Word documents.
-3. Select a document.
-4. Review its structured or high-fidelity Word layout.
-5. Select a supported paragraph.
-6. Edit the text and formatting.
-7. Review exact and near matches.
-8. Choose the editing mode and targets.
-9. Preview the resolved changes.
-10. Generate new immutable versions.
-11. Download or restore document versions when required.
-
----
+1. Upload related Word documents as a set.
+2. Select a file to open ONLYOFFICE.
+3. Choose whether wording changes apply to matching files or this file only.
+4. Edit and click **Save** in ONLYOFFICE.
+5. Download or restore versions through **Version history** when needed.
 
 ## Technology Stack
 
@@ -270,7 +141,7 @@ DocSync is designed around controlled document editing.
 | Desktop shell | Electron |
 | Installer | Electron Builder and NSIS |
 | Frontend | React, TypeScript, Vite |
-| Rich-text editor | Quill 2 |
+| Word editor | ONLYOFFICE Docs |
 | Backend | FastAPI and Python |
 | Document processing | `python-docx` and PyMuPDF |
 | Database | SQLAlchemy and SQLite |
@@ -605,17 +476,8 @@ http://localhost:8001/docs
 ## Known Limitations
 
 - The packaged desktop release currently targets Windows.
-- High-fidelity layout rendering works best when Microsoft Word desktop is installed.
-- The PDF preview is a fixed visual snapshot and is not modified directly.
-- Final Word wrapping and pagination appear after generation and rerendering.
-- Low-confidence or ambiguous text mappings cannot be edited inline.
-- Layout editing is limited to reliably mapped Word blocks and blank fields.
-- Soft line breaks within one block are supported. Adding, deleting, splitting,
-  merging, or moving structural Word paragraphs, rows, or columns is not.
-- Complex fields, drawings, text boxes, shapes, watermarks, and content controls
-  remain read-only in Layout editing even when Find can discover their text.
-- Nested tables and table cells containing protected objects remain read-only in
-  Layout editing.
+- The editor needs a running local ONLYOFFICE Docs service.
+- Automatic cross-file updates cover exact matches for wording edits in existing paragraphs.
 - Authentication and multi-user collaboration are not included.
 - PostgreSQL, cloud storage, and document synchronisation are not included in the local desktop release.
 - The Windows installer is not commercially code-signed.
@@ -626,8 +488,6 @@ http://localhost:8001/docs
 
 Planned improvements include:
 
-- Support for additional complex Word structures
-- Structural paragraph and table row/column operations
 - Linux and macOS feasibility
 - Commercial code signing
 - Automatic update channels

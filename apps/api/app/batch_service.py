@@ -497,39 +497,6 @@ def _append_batch_operation(session: Session, batch: EditorOperation, request: E
     session.flush()
 
 
-def stage_related_find_operations(
-    session: Session,
-    document_set_id: str,
-    operations: list[EditBatchOperationRequest],
-) -> dict:
-    """Append explicitly selected related edits atomically and allow safe retries."""
-    with EDITOR_GENERATION_LOCK:
-        try:
-            batch = _draft_batch(session, document_set_id, "Pending changes")
-            pending = {
-                occurrence.occurrence_id: operation.replacement_text
-                for operation in batch.batch_operations if operation.enabled
-                for occurrence in operation.occurrences if occurrence.selected
-            }
-            added = 0
-            for operation in operations:
-                selected = []
-                for occurrence in operation.occurrences:
-                    if occurrence.occurrence_id not in pending:
-                        selected.append(occurrence)
-                    elif pending[occurrence.occurrence_id] != operation.replacement_text:
-                        raise HTTPException(409, "An overlapping replacement is already pending. Review Pending changes first.")
-                if selected:
-                    _append_batch_operation(session, batch, operation.model_copy(update={"occurrences": selected}))
-                    added += len(selected)
-            _rebuild_batch_base_versions(session, batch)
-            session.commit()
-            return {"batch_id": batch.id, "targets_added": added}
-        except Exception:
-            session.rollback()
-            raise
-
-
 def update_edit_batch_operation(
     session: Session,
     batch_id: str,

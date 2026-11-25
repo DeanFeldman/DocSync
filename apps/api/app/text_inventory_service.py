@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from io import BytesIO
 import hashlib
+import re
 from pathlib import Path
 import posixpath
 import unicodedata
@@ -129,7 +130,9 @@ class DocumentTextSegment:
             if not span.editable and span.logical_end > span.logical_start
         ]
 
-    def editability_for_range(self, start: int, end: int) -> tuple[bool, str | None]:
+    def editability_for_range(
+        self, start: int, end: int, *, allow_whitespace_deletion: bool = False,
+    ) -> tuple[bool, str | None]:
         if start < 0 or end <= start or end > len(self.text):
             return False, "The selected occurrence is outside its logical text segment."
         intersecting = [
@@ -139,7 +142,14 @@ class DocumentTextSegment:
         ]
         if not intersecting:
             return False, "The selected occurrence cannot be mapped back to OOXML text nodes."
-        protected = next((span for span in intersecting if not span.editable), None)
+        protected = next((
+            span for span in intersecting if not span.editable
+            and not (
+                allow_whitespace_deletion
+                and span.role == "ordinary"
+                and span.node_kind in {"tab", "line_break"}
+            )
+        ), None)
         if protected is not None:
             return False, protected.read_only_reason or (
                 "This text is inside a structure that DocSync can detect but cannot "
@@ -216,6 +226,15 @@ class TextReplacementPatch:
     match_end: int
     expected_text: str
     replacement_text: str
+    allow_whitespace_deletion: bool = False
+
+
+@dataclass(frozen=True)
+class ParagraphInsertion:
+    previous_id: str | None
+    next_id: str | None
+    empty_ids: tuple[str, ...]
+    texts: tuple[str, ...]
 
 
 @dataclass
@@ -228,6 +247,7 @@ class CompiledTextReplacementPlan:
         tuple[str, tuple[int, ...]],
         list[tuple[int, int, str, str]],
     ]
+    node_removals: set[tuple[str, tuple[int, ...]]]
 
 
 @dataclass
@@ -634,7 +654,10 @@ def _visible_atom_value(node: etree._Element) -> tuple[str, str, bool, str | Non
     if node.tag == W_TAB:
         return "\t", "tab", False, PROTECTED_SPECIAL_CHARACTER
     if node.tag in {W_BR, W_CR}:
-        return "\n", "line_break", False, PROTECTED_SPECIAL_CHARACTER
+        kind = "line_break"
+        if node.tag == W_BR and node.get(_qname(WORD_NS, "type"), "textWrapping") != "textWrapping":
+            kind = "layout_break"
+        return "\n", kind, False, PROTECTED_SPECIAL_CHARACTER
     if node.tag == W_NO_BREAK_HYPHEN:
         return "\u2011", "no_break_hyphen", False, PROTECTED_SPECIAL_CHARACTER
     if node.tag == W_SOFT_HYPHEN:
@@ -656,6 +679,7 @@ def _paragraph_segments(
     *,
     document_id: str,
     version_id: str,
+    include_empty_paragraphs: bool,
 ) -> list[DocumentTextSegment]:
     structure_type, location = _paragraph_location(part, paragraph, paragraph_number)
     visible_values: list[str] = []
@@ -770,7 +794,7 @@ def _paragraph_segments(
         suffix: str,
     ) -> None:
         text_value = "".join(values)
-        if not text_value:
+        if not text_value and not (include_empty_paragraphs and suffix == "visible"):
             return
         identity = (
             f"docsync:text-segment:{version_id}:{part.path}:"
@@ -880,6 +904,7 @@ def build_text_inventory(
     *,
     document_id: str,
     version_id: str,
+    include_empty_paragraphs: bool = False,
 ) -> DocumentTextInventory:
     payload = _read_source(source)
     try:
@@ -908,6 +933,7 @@ def build_text_inventory(
                     paragraph_number,
                     document_id=document_id,
                     version_id=version_id,
+                    include_empty_paragraphs=include_empty_paragraphs,
                 )
             )
         inventory.segments.extend(
@@ -1053,6 +1079,7 @@ def compile_text_replacement_plan(
 ) -> CompiledTextReplacementPlan:
     by_segment = inventory.by_id
     node_edits: dict[tuple[str, tuple[int, ...]], list[tuple[int, int, str, str]]] = {}
+    node_removals: set[tuple[str, tuple[int, ...]]] = set()
     logical_ranges: dict[str, list[tuple[int, int, str]]] = {}
 
     for patch in patches:
@@ -1073,6 +1100,7 @@ def compile_text_replacement_plan(
         editable, reason = segment.editability_for_range(
             patch.match_start,
             patch.match_end,
+            allow_whitespace_deletion=patch.allow_whitespace_deletion and not patch.replacement_text,
         )
         if not editable:
             raise HTTPException(status_code=422, detail=reason)
@@ -1101,6 +1129,9 @@ def compile_text_replacement_plan(
             and span.logical_end > patch.match_start
         ]
         for index, span in enumerate(intersecting):
+            if not span.editable:
+                node_removals.add((segment.part_path, span.node_path))
+                continue
             local_start = max(patch.match_start, span.logical_start) - span.logical_start
             local_end = min(patch.match_end, span.logical_end) - span.logical_start
             replacement = patch.replacement_text if index == 0 else ""
@@ -1112,13 +1143,69 @@ def compile_text_replacement_plan(
         patch_count=len(patches),
         segment_count=len(logical_ranges),
         node_edits=node_edits,
+        node_removals=node_removals,
     )
+
+
+def _paragraph_insertion_nodes(roots, by_segment, insertion: ParagraphInsertion):
+    previous = by_segment[insertion.previous_id] if insertion.previous_id else None
+    following = by_segment[insertion.next_id] if insertion.next_id else None
+    anchor = previous or following
+    slots = [by_segment[item] for item in insertion.empty_ids]
+    segments = [item for item in (previous, *slots, following) if item is not None]
+    if not anchor or any(item.part_path != anchor.part_path for item in segments):
+        return None
+
+    root = roots[anchor.part_path]
+    nodes = [_resolve_node(root, item.node_path) for item in segments]
+    parent = nodes[0].getparent()
+    if parent.tag not in {_qname(WORD_NS, "body"), W_TC}:
+        return None
+    if any(node.tag != W_P or node.getparent() is not parent for node in nodes):
+        return None
+    if any(left.getnext() is not right for left, right in zip(nodes, nodes[1:])):
+        return None
+
+    if previous is None:
+        sibling = nodes[0].getprevious()
+        if sibling is not None and sibling.tag != _qname(WORD_NS, "tcPr"):
+            return None
+    if following is None:
+        sibling = nodes[-1].getnext()
+        if sibling is not None and sibling.tag != _qname(WORD_NS, "sectPr"):
+            return None
+
+    slot_nodes = nodes[int(previous is not None):int(previous is not None) + len(slots)]
+    if any(node.xpath(
+        "./*[not(self::w:pPr or self::w:r)] | ./w:pPr/w:sectPr | "
+        "./w:r/*[not(self::w:rPr or self::w:t)] | ./w:r/w:t[normalize-space(.) != '']",
+        namespaces=NS,
+    ) for node in slot_nodes):
+        return None
+    return anchor.part_path, nodes[0] if previous is not None else nodes[-1], previous is not None, slot_nodes
+
+
+def _write_inserted_paragraph(paragraph: etree._Element, text: str) -> None:
+    if not text:
+        return
+    run = etree.SubElement(paragraph, _qname(WORD_NS, "r"))
+    for part in re.split(r"([\t\n])", text):
+        if not part:
+            continue
+        if part in {"\t", "\n"}:
+            etree.SubElement(run, W_TAB if part == "\t" else W_BR)
+        else:
+            node = etree.SubElement(run, W_T)
+            node.set(_qname(XML_NS, "space"), "preserve")
+            node.text = part
 
 
 def apply_text_replacements(
     source: Path | bytes,
     inventory: DocumentTextInventory,
     patches: list[TextReplacementPatch],
+    *,
+    insertions: tuple[ParagraphInsertion, ...] = (),
 ) -> bytes:
     payload = _read_source(source)
     if hashlib.sha256(payload).hexdigest() != inventory.package_sha256:
@@ -1141,15 +1228,23 @@ def apply_text_replacements(
         raise HTTPException(status_code=422, detail="The immutable DOCX package is invalid.") from exc
 
     roots: dict[str, etree._Element] = {}
-    for part_path, _node_path_value in node_edits:
-        if part_path not in roots:
-            part_payload = files.get(part_path)
-            if part_payload is None:
-                raise HTTPException(
-                    status_code=409,
-                    detail="A target Word XML part is no longer present. Re-scan required.",
-                )
-            roots[part_path] = _parse_xml(part_payload, part_path)
+    changed_parts = {part for part, _ in node_edits.keys() | plan.node_removals}
+    by_segment = inventory.by_id
+    insertion_parts = {by_segment[item.previous_id or item.next_id].part_path for item in insertions}
+    for part_path in changed_parts | insertion_parts:
+        part_payload = files.get(part_path)
+        if part_payload is None:
+            raise HTTPException(
+                status_code=409,
+                detail="A target Word XML part is no longer present. Re-scan required.",
+            )
+        roots[part_path] = _parse_xml(part_payload, part_path)
+
+    prepared_insertions = [
+        (nodes, insertion.texts)
+        for insertion in insertions
+        if (nodes := _paragraph_insertion_nodes(roots, by_segment, insertion)) is not None
+    ]
 
     for (part_path, node_path_value), edits in node_edits.items():
         node = _resolve_node(roots[part_path], node_path_value)
@@ -1176,7 +1271,28 @@ def apply_text_replacements(
         ):
             node.set(_qname(XML_NS, "space"), "preserve")
 
-    modified_files = {path: _serialize_xml(root) for path, root in roots.items()}
+    removed_nodes = [_resolve_node(roots[part], path) for part, path in plan.node_removals]
+    for node in removed_nodes:
+        node.getparent().remove(node)
+
+    for (part_path, anchor, insert_after, slots), texts in prepared_insertions:
+        changed_parts.add(part_path)
+        if slots:
+            for paragraph, text in zip(slots, texts, strict=True):
+                _write_inserted_paragraph(paragraph, text)
+        else:
+            for text in texts:
+                paragraph = etree.Element(W_P)
+                _write_inserted_paragraph(paragraph, text)
+                if insert_after:
+                    anchor.addnext(paragraph)
+                    anchor = paragraph
+                else:
+                    anchor.addprevious(paragraph)
+
+    if not changed_parts:
+        return payload
+    modified_files = {path: _serialize_xml(roots[path]) for path in changed_parts}
     output = BytesIO()
     with zipfile.ZipFile(output, mode="w") as target_archive:
         with zipfile.ZipFile(BytesIO(payload)) as source_archive:
