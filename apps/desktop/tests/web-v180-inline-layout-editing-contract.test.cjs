@@ -78,14 +78,15 @@ test("inline Quill supports soft lines and shares the central draft", () => {
   assert.match(inlineEditor, /insertText\(range\.index, "\\n", "user"\)/);
   assert.match(inlineEditor, /aria-multiline", "true"/);
   assert.match(inlineEditor, /replace\(\/\\r\\n\?\/g, "\\n"\)/);
-  assert.match(inlineEditor, /event\.key !== "Escape"/);
+  assert.match(inlineEditor, /event\.key === "Escape"/);
+  assert.match(inlineEditor, /\["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"\]/);
   assert.match(inlineEditor, /quill\.history\.undo/);
   assert.match(inlineEditor, /quill\.history\.redo/);
   assert.match(inlineEditor, /import\("quill"\)/);
   assert.match(inlineEditor, /import\("quill\/dist\/quill\.snow\.css"\)/);
   assert.doesNotMatch(inlineEditor, /^import Quill from "quill"/m);
-  assert.match(experience, /remainInLayout: true/);
-  assert.match(experience, /setWorkspaceMode\("layout"\)/);
+  assert.match(experience, /inlineSelection: intent/);
+  assert.match(experience, /id="workspace-panel-layout"/);
   assert.match(experience, /onDraftChange=\{handleDraftChange\}/);
   assert.match(experience, /setDraft\(nextDraft\)/);
   assert.doesNotMatch(experience, /setPendingBlockSelection\(/);

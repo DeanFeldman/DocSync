@@ -15,7 +15,7 @@ test("pending editor and Find & Replace operations overlay the immutable Word bl
   assert.match(experience, /function pendingEditorOperationForBlock/);
   assert.match(experience, /function pendingDraftForBlock/);
   assert.match(experience, /text: target\?\.replacement_text \?\? block\.text/);
-  assert.match(experience, /setDraft\(pendingDraftForBlock\(block, pendingBatch\)\)/);
+  assert.match(experience, /setDraft\(localDraft \?\? pendingDraftForBlock\(block, pendingBatch\)\)/);
   assert.match(experience, /fetchDraftEditBatch\(documentSet\.id\)/);
   assert.match(experience, /window\.addEventListener\(BATCH_UPDATED_EVENT, refreshPendingBatch\)/);
   assert.match(experience, /function pendingFindReplacementForBlock/);

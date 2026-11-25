@@ -21,7 +21,7 @@ test("v1.5 table paragraphs have a paragraph-aware typed Layout contract", () =>
   assert.match(utils, /"table_paragraph"/);
   assert.match(experience, /Paragraph \$\{item\.paragraph_index \+ 1\}/);
   assert.match(overlay, /data-element-id=\{region\.element_id\}/);
-  assert.match(experience, /locationLabel\(block\)/);
+  assert.match(experience, /locationLabel\(selectedBlock\)/);
   assert.match(experience, /Source version/);
   assert.match(experience, /preview\.edit_mode\.replaceAll/);
 });
@@ -34,13 +34,13 @@ test("Layout selection keeps and focuses the exact supported table paragraph inl
   assert.match(experience, /selectElementById\(intent\.elementId/);
   assert.match(overlay, /data-element-id=\{region\.element_id\}/);
   assert.match(experience, /block\.version_id !== editorContent\.version_id/);
-  assert.match(experience, /setWorkspaceMode\("layout"\)/);
+  assert.match(experience, /id="workspace-panel-layout"/);
   assert.match(
     experience,
-    /setInlineSelection\(remainInLayout \? selection : null\)/,
+    /setInlineSelection\(selection\)/,
   );
   assert.doesNotMatch(experience, /setWorkspaceMode\("edit"\)/);
-  assert.match(experience, /block\.unsupported_reason/);
+  assert.match(experience, /<WordTextRanges/);
   assert.match(overlay, /region\.element_id === selectedElementId/);
 });
 

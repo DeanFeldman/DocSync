@@ -9,6 +9,7 @@ import logging
 import math
 from pathlib import Path
 import re
+from tempfile import NamedTemporaryFile
 import threading
 from time import perf_counter
 import unicodedata
@@ -24,8 +25,8 @@ from .models import DocumentBlockRevision, DocumentVersion
 
 logger = logging.getLogger(__name__)
 
-RENDER_MAP_SCHEMA_VERSION = 5
-RENDER_MAP_ENGINE = "docsync-contextual-pdf-map-v5-form-line-fields"
+RENDER_MAP_SCHEMA_VERSION = 7
+RENDER_MAP_ENGINE = "docsync-contextual-pdf-map-v7-nested-tables"
 WORD_RENDER_ENGINE = "Microsoft Word ExportAsFixedFormat PDF"
 TOKEN_PATTERN = re.compile(r"\w+", re.UNICODE)
 RENDER_ID_PATTERN = re.compile(r"^[a-f0-9]{24}$")
@@ -115,6 +116,12 @@ def _context_for_version(version: DocumentVersion) -> _RenderContext | None:
         return None
     source_path = _source_path(version)
     pdf_stat = pdf_path.stat()
+    blocks = [_serialise_block(block) for block in version.blocks]
+    blocks.sort(key=lambda block: (
+        block["location"].get("document_order", block["ordinal"]), block["ordinal"]
+    ))
+    for ordinal, block in enumerate(blocks):
+        block["ordinal"] = ordinal
     return _RenderContext(
         version_id=version.id,
         document_id=version.document_id,
@@ -125,7 +132,7 @@ def _context_for_version(version: DocumentVersion) -> _RenderContext | None:
         pdf_size=pdf_stat.st_size,
         pdf_mtime_ns=pdf_stat.st_mtime_ns,
         cache_path=_cache_path(document.document_set_id, version.id),
-        blocks=tuple(_serialise_block(block) for block in version.blocks),
+        blocks=tuple(blocks),
     )
 
 
@@ -594,6 +601,47 @@ def _match_blocks(
     return matches, unmapped
 
 
+def _token_key(token: dict) -> tuple:
+    return *(_line_key(token)), token["word_number"], token["value"]
+
+
+def _match_visual_fallback(
+    blocks: tuple[dict, ...],
+    tokens: list[dict],
+    visual_tokens: list[dict],
+    matches: dict[str, dict],
+) -> None:
+    if not visual_tokens or all(block["element_id"] in matches for block in blocks):
+        return
+    positions = {_token_key(token): index for index, token in enumerate(tokens)}
+    occupied = {
+        index for match in matches.values() for start, end in match["ranges"]
+        for index in range(start, end)
+    }
+    visual_matches, _ = _match_blocks(blocks, visual_tokens)
+    for element_id, match in visual_matches.items():
+        if element_id in matches:
+            continue
+        recovered = []
+        for start, end in match["ranges"]:
+            indices = [
+                positions.get(_token_key(visual_tokens[index]))
+                for index in range(start, end)
+            ]
+            if any(index is None or index in occupied for index in indices):
+                continue
+            # A visual match can visit words in a different order. Each range
+            # still indexes the one shared array of Word-order image coordinates.
+            for index in sorted(set(indices)):
+                if recovered and recovered[-1][1] == index:
+                    recovered[-1] = recovered[-1][0], index + 1
+                else:
+                    recovered.append((index, index + 1))
+        if recovered:
+            matches[element_id] = {**match, "ranges": recovered}
+            occupied.update(index for start, end in recovered for index in range(start, end))
+
+
 def _match_tokens(match: dict, tokens: list[dict]) -> list[dict]:
     return [
         tokens[token_index]
@@ -1042,6 +1090,7 @@ def _extract_pdf_structure(
     geometry: dict[str, list[dict]] = {
         "tables": [],
         "horizontal_lines": [],
+        "visual_tokens": [],
     }
     needs_empty_form_geometry = any(
         block["element_type"] in {"table_paragraph", "paragraph"}
@@ -1087,15 +1136,21 @@ def _extract_pdf_structure(
                     ),
                 }
             )
-            words = page.get_text("words", sort=True)
-            line_token_counts: dict[tuple[int, int], int] = {}
+            # Word emits each table cell in reading order. Sorting by visual rows
+            # interleaves words belonging to adjacent cells.
+            word_order_start = len(tokens)
+            text_page = page.get_textpage()
+            words = page.get_text("words", sort=False, textpage=text_page)
+            line_tokens: dict[tuple[int, int], list[str]] = {}
             for word in words:
-                if len(word) < 8:
-                    continue
-                line_key = (int(word[5]), int(word[6]))
-                line_token_counts[line_key] = line_token_counts.get(
-                    line_key, 0
-                ) + len(_normalise_tokens(str(word[4])))
+                if len(word) >= 8:
+                    line_key = int(word[5]), int(word[6])
+                    line_tokens.setdefault(line_key, []).extend(_normalise_tokens(str(word[4])))
+            page_number_lines = {
+                key for key, values in line_tokens.items()
+                if values and all(value.isdecimal() for value in values)
+                and "".join(values) == str(page_number)
+            }
             for word in words:
                 if len(word) < 8:
                     continue
@@ -1103,18 +1158,10 @@ def _extract_pdf_structure(
                 if not all(math.isfinite(float(value)) for value in (x0, y0, x1, y1)):
                     continue
                 values = _normalise_tokens(str(raw_text))
-                is_automatic_page_number = bool(
-                    values == (str(page_number),)
-                    and line_token_counts.get(
-                        (int(block_number), int(line_number))
-                    )
-                    == 1
-                    and (
-                        (float(y0) + float(y1)) / 2 / height < 0.055
-                        or (float(y0) + float(y1)) / 2 / height > 0.945
-                    )
-                )
-                if is_automatic_page_number:
+                y = (float(y0) + float(y1)) / 2 / height
+                if (int(block_number), int(line_number)) in page_number_lines and (
+                    y < 0.055 or y > 0.945
+                ):
                     continue
                 for value in values:
                     tokens.append(
@@ -1132,6 +1179,13 @@ def _extract_pdf_structure(
                             "word_number": int(word_number),
                         }
                     )
+            word_tokens: dict[tuple[int, int, int], list[dict]] = {}
+            for token in tokens[word_order_start:]:
+                key = token["block_number"], token["line_number"], token["word_number"]
+                word_tokens.setdefault(key, []).append(token)
+            for word in page.get_text("words", sort=True, textpage=text_page):
+                if len(word) >= 8:
+                    geometry["visual_tokens"].extend(word_tokens.get(tuple(word[5:8]), ()))
             if needs_empty_form_geometry:
                 try:
                     found_tables = page.find_tables().tables
@@ -1229,14 +1283,16 @@ def _render_pdf_page(
             pixmap = page.get_pixmap(matrix=matrix, alpha=False)
             image_bytes = pixmap.tobytes("png")
         page_directory.mkdir(parents=True, exist_ok=True)
-        temporary_image = image_path.with_name(
-            f"{image_path.name}.{uuid4().hex}.tmp"
-        )
+        # Keep the temporary name short for deeply nested Windows account workspaces.
+        temporary_image = None
         try:
-            temporary_image.write_bytes(image_bytes)
+            with NamedTemporaryFile(dir=page_directory, suffix=".tmp", delete=False) as image:
+                temporary_image = Path(image.name)
+                image.write(image_bytes)
             temporary_image.replace(image_path)
         finally:
-            temporary_image.unlink(missing_ok=True)
+            if temporary_image is not None:
+                temporary_image.unlink(missing_ok=True)
         logger.info(
             "docsync.render_page_timing version_id=%s render_id=%s page=%s "
             "cache_hit=false duration_ms=%.2f",
@@ -1314,6 +1370,7 @@ def _generate_render_map(context: _RenderContext, key: str) -> None:
 
         stage_started = perf_counter()
         matches, unmapped = _match_blocks(context.blocks, tokens)
+        _match_visual_fallback(context.blocks, tokens, geometry["visual_tokens"], matches)
         _match_empty_table_blocks(
             context.blocks,
             matches,
@@ -1456,6 +1513,13 @@ def render_page_path(
     try:
         path = _render_pdf_page(context, render_id, page_number)
     except (OSError, ValueError) as exc:
+        logger.warning(
+            "docsync.render_page.failed version_id=%s render_id=%s page=%s",
+            version_id,
+            render_id,
+            page_number,
+            exc_info=True,
+        )
         raise HTTPException(
             status_code=404,
             detail="The preview page is unavailable.",

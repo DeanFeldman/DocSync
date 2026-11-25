@@ -8,6 +8,7 @@ network, Supabase, Electron, or UI dependency so a later provider can reuse it.
 
 from __future__ import annotations
 
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import hashlib
@@ -77,7 +78,7 @@ def _write_state(account_dir: Path, result: SnapshotResult) -> None:
 
 def _database_schema_version(database: Path) -> int:
     try:
-        with sqlite3.connect(f"file:{database.as_posix()}?mode=ro", uri=True) as connection:
+        with closing(sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
             value = connection.execute("SELECT MAX(version) FROM docsync_schema_migrations").fetchone()[0]
             return int(value or 0)
     except sqlite3.Error as error:
@@ -89,9 +90,9 @@ def _backup_database(source: Path, destination: Path) -> int:
         raise SnapshotError("snapshot_database_backup_failed", "The workspace database is missing.")
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
-        with sqlite3.connect(source) as live, sqlite3.connect(destination) as backup:
+        with closing(sqlite3.connect(source.resolve().as_uri() + "?mode=ro", uri=True)) as live, closing(sqlite3.connect(destination)) as backup:
             live.backup(backup)
-        with sqlite3.connect(f"file:{destination.as_posix()}?mode=ro", uri=True) as check:
+        with closing(sqlite3.connect(destination.resolve().as_uri() + "?mode=ro", uri=True)) as check:
             if check.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                 raise SnapshotError("snapshot_database_backup_failed", "The database backup failed integrity validation.")
         return _database_schema_version(destination)
@@ -171,7 +172,7 @@ def _validate_manifest(manifest: object, user_id: str) -> dict[str, object]:
 def _validate_restored_workspace(workspace: Path, manifest: dict[str, object]) -> None:
     database = workspace / DATABASE_NAME
     try:
-        with sqlite3.connect(f"file:{database.as_posix()}?mode=ro", uri=True) as connection:
+        with closing(sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
             if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                 raise SnapshotError("restore_database_invalid", "The restored database did not pass integrity validation.")
             if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='document_sets'").fetchone() is None:

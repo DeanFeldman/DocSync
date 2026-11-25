@@ -14,6 +14,11 @@ function loadQuill() {
   return quillModulePromise;
 }
 
+/** Start loading Quill while structured document content is becoming visible. */
+export function preloadInlineLayoutEditor(): void {
+  void loadQuill();
+}
+
 export type InlineEditorCommand =
   | { id: number; action: "bold" | "italic" | "underline" }
   | { id: number; action: "heading"; value: number | false }
@@ -27,10 +32,13 @@ interface InlineLayoutEditorProps {
   value: QuillDelta;
   resetToken: number;
   caretFraction: number;
+  caretIndex?: number;
   command: InlineEditorCommand | null;
   disabled?: boolean;
   onChange: (draft: QuillDraft) => void;
   onExit: () => void;
+  onNavigate?: (direction: "previous" | "next") => void;
+  onReady?: () => void;
 }
 
 function plainText(delta: QuillDelta): string {
@@ -47,15 +55,20 @@ export default function InlineLayoutEditor({
   value,
   resetToken,
   caretFraction,
+  caretIndex,
   command,
   disabled = false,
   onChange,
   onExit,
+  onNavigate,
+  onReady,
 }: InlineLayoutEditorProps) {
   const hostRef = useRef<HTMLDivElement>(null);
   const quillRef = useRef<Quill | null>(null);
   const onChangeRef = useRef(onChange);
   const onExitRef = useRef(onExit);
+  const onNavigateRef = useRef(onNavigate);
+  const onReadyRef = useRef(onReady);
   const lastRangeRef = useRef({ index: 0, length: 0 });
   const handledCommandRef = useRef(0);
   const disabledRef = useRef(disabled);
@@ -65,6 +78,8 @@ export default function InlineLayoutEditor({
 
   onChangeRef.current = onChange;
   onExitRef.current = onExit;
+  onNavigateRef.current = onNavigate;
+  onReadyRef.current = onReady;
   disabledRef.current = disabled;
 
   useEffect(() => {
@@ -83,6 +98,7 @@ export default function InlineLayoutEditor({
     ) => void = () => undefined;
     let handlePaste: (event: ClipboardEvent) => void = () => undefined;
     let handleKeyDown: (event: KeyboardEvent) => void = () => undefined;
+    let firstUserChange = true;
     const importStarted = performance.now();
     setEditorStatus("loading");
 
@@ -137,7 +153,17 @@ export default function InlineLayoutEditor({
       }
 
       handleTextChange = (_delta, _oldDelta, source) => {
-        if (source === "user") publish();
+        if (source !== "user") return;
+        if (firstUserChange) {
+          firstUserChange = false;
+          console.info("docsync.editor_first_input_timing", {
+            element_id: block.element_id,
+            duration_ms: Number(
+              (performance.now() - initializationStarted).toFixed(2),
+            ),
+          });
+        }
+        publish();
       };
 
       handleSelectionChange = (range) => {
@@ -157,10 +183,30 @@ export default function InlineLayoutEditor({
       };
 
       handleKeyDown = (event) => {
-      if (event.key !== "Escape") return;
-      event.preventDefault();
-      event.stopPropagation();
-      onExitRef.current();
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        onExitRef.current();
+        return;
+      }
+      if (
+        !quill ||
+        !onNavigateRef.current ||
+        event.shiftKey || event.altKey || event.ctrlKey || event.metaKey ||
+        !["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key)
+      ) {
+        return;
+      }
+      const range = quill.getSelection() ?? lastRangeRef.current;
+      if (range.length !== 0) return;
+      const atStart = range.index === 0;
+      const atEnd = range.index >= Math.max(0, quill.getLength() - 1);
+      const movingBack = event.key === "ArrowUp" || event.key === "ArrowLeft";
+      if (movingBack ? atStart : atEnd) {
+        event.preventDefault();
+        event.stopPropagation();
+        onNavigateRef.current(movingBack ? "previous" : "next");
+      }
       };
 
       quill.on("text-change", handleTextChange);
@@ -169,15 +215,14 @@ export default function InlineLayoutEditor({
       quill.root.addEventListener("keydown", handleKeyDown, true);
 
       frame = window.requestAnimationFrame(() => {
-      if (quillRef.current !== quill || disabledRef.current || !quill) return;
-      const textLength = Math.max(0, quill.getLength() - 1);
-      const index = Math.min(
-        textLength,
-        Math.max(0, Math.round(textLength * Math.min(1, Math.max(0, caretFraction)))),
-      );
-      lastRangeRef.current = { index, length: 0 };
-      quill.focus();
-      quill.setSelection(index, 0, "silent");
+        if (quillRef.current !== quill || disabledRef.current || !quill) return;
+        const textLength = Math.max(0, quill.getLength() - 1);
+        const requestedIndex = caretIndex ?? Math.round(textLength * caretFraction);
+        const index = Math.min(textLength, Math.max(0, requestedIndex));
+        lastRangeRef.current = { index, length: 0 };
+        quill.focus();
+        quill.setSelection(index, 0, "silent");
+        if (quill.hasFocus()) onReadyRef.current?.();
       });
       setEditorStatus("ready");
       console.info("docsync.editor_initialization_timing", {

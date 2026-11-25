@@ -36,7 +36,7 @@ test("header and footer blocks are button-selectable in the Word preview", () =>
   assert.match(overlay, /element_type === "footer_paragraph"/);
   assert.match(overlay, /data-element-id=\{region\.element_id\}/);
   assert.match(overlay, /onClick=\{\(event\) => pointerIntent\(region, event\)\}/);
-  assert.match(experience, /setWorkspaceMode\("layout"\)/);
+  assert.match(experience, /id="workspace-panel-layout"/);
   assert.doesNotMatch(experience, /setWorkspaceMode\("edit"\)/);
   assert.doesNotMatch(experience, /groupStructuredBlocks|LayoutFallbackBlock/);
   assert.doesNotMatch(styles, /structured-block-group|layout-fallback/);

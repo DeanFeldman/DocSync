@@ -29,6 +29,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session, selectinload
 
 from .config import settings
+from .document_service import body_tables, unwrap_smart_tags
 from .models import (
     DocumentBlockRevision,
     DocumentElement,
@@ -576,7 +577,7 @@ def _paragraph_for_element(
             return body_paragraphs[index], None
         return None, None
     try:
-        document_tables = tables if tables is not None else document.tables
+        document_tables = tables if tables is not None else body_tables(document)
         cell = (
             document_tables[int(location["table_index"])]
             .rows[int(location["row_index"])]
@@ -983,9 +984,12 @@ def _revision_values(
     }
 
 
-def _load_docx(path: Path) -> DocxDocument:
+def _load_docx(path: Path, *, normalize_smart_tags: bool = True) -> DocxDocument:
     try:
-        return Document(path)
+        document = Document(path)
+        if normalize_smart_tags:
+            unwrap_smart_tags(document)
+        return document
     except Exception as exc:
         raise HTTPException(
             status_code=422,
@@ -1001,7 +1005,7 @@ def _create_revisions_for_existing_elements(
 ) -> list[DocumentBlockRevision]:
     docx = _load_docx(source_path)
     paragraphs = list(docx.paragraphs)
-    tables = list(docx.tables)
+    tables = body_tables(docx)
     header_footer_parts = _header_footer_part_map(docx)
     style_name_cache: dict[str | None, str | None] = {}
     elements = list(
@@ -1038,7 +1042,7 @@ def initialise_original_version(
 ) -> DocumentVersion:
     if parsed_document is not None and elements is not None:
         paragraphs = list(parsed_document.paragraphs)
-        tables = list(parsed_document.tables)
+        tables = body_tables(parsed_document)
         style_name_cache: dict[str | None, str | None] = {}
         header_footer_parts = _header_footer_part_map(parsed_document)
         version = DocumentVersion(
@@ -1129,7 +1133,7 @@ def prepare_original_version_rows(
     """Prepare immutable initial-version mappings without ORM identity tracking."""
 
     paragraphs = list(parsed_document.paragraphs)
-    tables = list(parsed_document.tables)
+    tables = body_tables(parsed_document)
     style_name_cache: dict[str | None, str | None] = {}
     header_footer_parts = _header_footer_part_map(parsed_document)
     created_at = document_row["created_at"]
@@ -2382,7 +2386,7 @@ def _apply_target_to_docx(
     elif location.get("kind") in {"table_cell", "table_paragraph"}:
         try:
             cell = (
-                (tables or list(document.tables))[int(location["table_index"])]
+                (tables or body_tables(document))[int(location["table_index"])]
                 .rows[int(location["row_index"])]
                 .cells[int(location["column_index"])]
             )
@@ -2475,7 +2479,7 @@ def _apply_document_targets(
     document = _load_docx(source_path)
     source_read_ms = (perf_counter() - stage_started) * 1000
     paragraphs = list(document.paragraphs)
-    tables = list(document.tables)
+    tables = body_tables(document)
     header_footer_parts = _header_footer_part_map(document)
     style_names = {style.name for style in document.styles}
     stage_started = perf_counter()
@@ -2656,7 +2660,7 @@ def _replace_current_elements_and_create_revisions(
     docx = prepared_docx or _load_docx(source_path)
     extracted = _extract_paragraphs(docx)
     paragraphs = list(docx.paragraphs)
-    tables = list(docx.tables)
+    tables = body_tables(docx)
     header_footer_parts = _header_footer_part_map(docx)
     style_name_cache: dict[str | None, str | None] = {}
     previous_revisions = _revisions_by_location(session, base_version_id)

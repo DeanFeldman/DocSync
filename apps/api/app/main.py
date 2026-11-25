@@ -4,6 +4,8 @@ from contextlib import asynccontextmanager
 import logging
 import secrets
 from pathlib import Path
+from tempfile import TemporaryDirectory, mkdtemp
+import shutil
 from time import perf_counter
 
 from fastapi import (
@@ -20,6 +22,7 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
 
 from .config import settings
@@ -79,7 +82,7 @@ from .schemas import (
     TextSearchRequest,
     VersionRestoreRequest,
 )
-from .find_replace_service import search_document_text_inventory
+from .find_replace_service import editable_block_text_ranges, search_document_text_inventory
 from .batch_service import (
     add_edit_batch_operation,
     clear_edit_batch,
@@ -108,8 +111,11 @@ from .audit_logger import AuditLogger
 from .backup_service import DocumentBackupService
 from .error_mapper import DocuSyncError, ErrorMapper
 from .storage_service import DocumentStorageService
-from .snapshot_service import SnapshotError, create_snapshot, restore_snapshot
-from uuid import UUID
+from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
+
+from .device_transfer import APPEARANCES, export_device_workspace, stage_device_import
+from .snapshot_service import SnapshotError, _database_schema_version
 
 logger = logging.getLogger(__name__)
 
@@ -173,7 +179,7 @@ async def secure_local_application(request: Request, call_next):
         if not any(token in request.url.path for token in ("/preview", "/render", "/search", "/pages")):
             response.headers["X-DocSync-Workspace-Mutated"] = "1"
     response.headers["Cache-Control"] = "no-store"
-    connect_src = "connect-src 'self'" + (f" {settings.supabase_origin}" if settings.supabase_origin else "")
+    connect_src = "connect-src 'self'"
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
         f"{connect_src}; frame-src 'self'; object-src 'self'; base-uri 'none'; "
@@ -213,48 +219,57 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-def _cloud_snapshot_path(snapshot_id: str) -> Path:
+def local_workspace_database() -> Path:
+    database = make_url(settings.database_url)
+    if database.get_backend_name() != "sqlite" or not database.database or database.database == ":memory:":
+        raise HTTPException(status_code=422, detail="Portable backups require a local SQLite workspace.")
+    return Path(database.database).resolve()
+
+
+@app.get("/api/local-workspace/export")
+def download_workspace_backup(appearance: str = "system") -> FileResponse:
+    if appearance not in APPEARANCES:
+        raise HTTPException(status_code=422, detail="Invalid appearance preference.")
+    database = local_workspace_database()
+    directory = Path(mkdtemp(prefix="docsync-export-", dir=settings.data_dir.parent))
+    archive = directory / "DocSync-workspace.zip"
     try:
-        value = str(UUID(snapshot_id))
-    except ValueError as error:
-        raise HTTPException(status_code=404, detail="Snapshot not found.") from error
-    target = settings.data_dir.parent / "snapshots" / f"{value}.zip"
-    if not target.is_file():
-        raise HTTPException(status_code=404, detail="Snapshot not found.")
-    return target
+        export_device_workspace(
+            settings.data_dir, archive, appearance=appearance, max_bytes=settings.max_snapshot_bytes,
+            database_path=database,
+        )
+    except (SnapshotError, OSError) as error:
+        shutil.rmtree(directory, ignore_errors=True)
+        detail = str(error) if isinstance(error, SnapshotError) else "DocSync could not write the backup."
+        raise HTTPException(status_code=422, detail=detail) from error
+    return FileResponse(
+        archive, filename=archive.name, media_type="application/zip",
+        background=BackgroundTask(shutil.rmtree, directory, ignore_errors=True),
+    )
 
 
-@app.post("/api/cloud-snapshots", status_code=201)
-def create_local_cloud_snapshot() -> dict:
-    if not settings.account_user_id or not settings.device_id:
-        raise HTTPException(status_code=409, detail="An account workspace is not active.")
-    try:
-        result = create_snapshot(workspace=settings.data_dir, account_dir=settings.data_dir.parent, user_id=settings.account_user_id, device_id=settings.device_id, docsync_version=app.version, max_bytes=settings.max_snapshot_bytes)
-    except SnapshotError as error:
-        raise HTTPException(status_code=422, detail=error.code) from error
-    return {"snapshot_id": result.snapshot_id, "sha256": result.sha256, "archive_size_bytes": result.archive_size_bytes, "workspace_revision": result.workspace_revision}
-
-
-@app.get("/api/cloud-snapshots/{snapshot_id}/archive")
-def download_local_cloud_snapshot(snapshot_id: str) -> FileResponse:
-    return FileResponse(_cloud_snapshot_path(snapshot_id), media_type="application/zip", filename=f"{snapshot_id}.zip", headers={"Cache-Control": "no-store"})
-
-
-@app.post("/api/cloud-restores")
-async def stage_cloud_restore(archive: UploadFile = File(...), sha256: str = Form(...)) -> dict:
-    if not settings.account_user_id:
-        raise HTTPException(status_code=409, detail="An account workspace is not active.")
-    download = settings.data_dir.parent / "cloud-download-temp" / "restore.zip"
-    download.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with download.open("wb") as target:
-            while chunk := await archive.read(1024 * 1024): target.write(chunk)
-        staged = restore_snapshot(archive_path=download, expected_sha256=sha256, account_dir=settings.data_dir.parent, user_id=settings.account_user_id, max_bytes=settings.max_snapshot_bytes)
-        return {"snapshot_id": staged.name, "staged": True}
-    except SnapshotError as error:
-        raise HTTPException(status_code=422, detail=error.code) from error
-    finally:
-        download.unlink(missing_ok=True)
+@app.post("/api/local-workspace/imports")
+async def inspect_workspace_backup(archive: UploadFile = File(...)) -> dict:
+    with TemporaryDirectory(prefix="docsync-import-", dir=settings.data_dir.parent) as directory:
+        temporary_zip = Path(directory) / "workspace.zip"
+        size = 0
+        try:
+            with temporary_zip.open("wb") as output:
+                while chunk := await archive.read(1024 * 1024):
+                    size += len(chunk)
+                    if size > settings.max_snapshot_bytes:
+                        raise HTTPException(status_code=413, detail="The backup exceeds the import size limit.")
+                    output.write(chunk)
+            schema = _database_schema_version(local_workspace_database())
+            return await run_in_threadpool(
+                stage_device_import, temporary_zip, settings.data_dir.parent / "device-restore",
+                schema_version=schema, max_bytes=settings.max_snapshot_bytes,
+            )
+        except (SnapshotError, OSError) as error:
+            detail = str(error) if isinstance(error, SnapshotError) else "DocSync could not stage the backup."
+            raise HTTPException(status_code=422, detail=detail) from error
+        finally:
+            await archive.close()
 
 
 @app.get("/api/document-sets")
@@ -358,6 +373,15 @@ def search_find_replace_occurrences(
     session: Session = Depends(get_session),
 ) -> dict:
     return search_document_text_inventory(session, document_set_id, request)
+
+
+@app.get("/api/document-versions/{version_id}/blocks/{element_id}/text-ranges")
+def read_editable_block_text_ranges(
+    version_id: str,
+    element_id: str,
+    session: Session = Depends(get_session),
+) -> dict:
+    return {"ranges": editable_block_text_ranges(session, version_id, element_id)}
 
 
 @app.post("/api/document-sets/{document_set_id}/edit-batches", status_code=201)
@@ -569,11 +593,37 @@ def read_document_render_page(
     page_number: int,
     session: Session = Depends(get_session),
 ) -> FileResponse:
-    return FileResponse(
-        render_page_path(session, version_id, render_id, page_number),
+    logger.info(
+        "docsync.render_page.request version_id=%s render_id=%s page=%s",
+        version_id,
+        render_id,
+        page_number,
+    )
+    try:
+        image_path = render_page_path(session, version_id, render_id, page_number)
+    except HTTPException as exc:
+        logger.warning(
+            "docsync.render_page.response version_id=%s render_id=%s page=%s status=%s",
+            version_id,
+            render_id,
+            page_number,
+            exc.status_code,
+        )
+        raise
+    response = FileResponse(
+        image_path,
         media_type="image/png",
         headers={"Cache-Control": "no-store"},
     )
+    logger.info(
+        "docsync.render_page.response version_id=%s render_id=%s page=%s status=%s path=%s",
+        version_id,
+        render_id,
+        page_number,
+        response.status_code,
+        image_path,
+    )
+    return response
 
 
 @app.get("/api/documents/{document_id}/download")

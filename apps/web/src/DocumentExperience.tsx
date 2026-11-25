@@ -32,18 +32,20 @@ import {
 } from "./api";
 import {
   editorResourceKey,
+  clearWorkspaceDraft,
   exactMatchesResourceKey,
+  getWorkspaceDraft,
   getWorkspaceResource,
   getWorkspaceViewState,
   loadWorkspaceResource,
   nearMatchesResourceKey,
   refreshWorkspaceResource,
   setWorkspaceResource,
+  setWorkspaceDraft,
   setWorkspaceViewState,
   versionHistoryResourceKey,
   wordPreviewResourceKey,
   workspaceViewStateKey,
-  type WorkspaceMode,
 } from "./workspaceResources";
 import {
   candidateArrays,
@@ -52,12 +54,18 @@ import {
   normaliseMatch,
   wordDifferenceSpans,
 } from "./editorUtils";
+import { useConfirmation } from "./ConfirmationDialog";
+import { useDismissibleMenu } from "./useDismissibleMenu";
 import WordPreviewOverlay, {
   type LayoutSelectionIntent,
   type PendingLayoutOverride,
 } from "./WordPreviewOverlay";
-import type { InlineEditorCommand } from "./InlineLayoutEditor";
+import InlineLayoutEditor, {
+  preloadInlineLayoutEditor,
+  type InlineEditorCommand,
+} from "./InlineLayoutEditor";
 import { BATCH_UPDATED_EVENT } from "./FindReplacePanel";
+import WordTextRanges from "./WordTextRanges";
 import type {
   DifferenceSpan,
   DocumentSearchTarget,
@@ -269,7 +277,7 @@ function findLayoutElement(elementId: string): HTMLElement | null {
   return (
     Array.from(
       window.document.querySelectorAll<HTMLElement>(
-        "[data-element-id]",
+        "[data-render-region-id][data-element-id]",
       ),
     ).find((element) => element.dataset.elementId === elementId) ?? null
   );
@@ -421,6 +429,7 @@ function PreviewDialog({
     closeRef.current?.focus();
 
     function handleKeyDown(event: KeyboardEvent) {
+      if (event.defaultPrevented) return;
       if (event.key === "Escape") {
         event.preventDefault();
         onClose();
@@ -455,7 +464,7 @@ function PreviewDialog({
     <div
       className="modal-backdrop"
       role="presentation"
-      onMouseDown={(event) => {
+      onPointerDown={(event) => {
         if (event.currentTarget === event.target) onClose();
       }}
     >
@@ -575,6 +584,7 @@ export default function DocumentExperience({
   onGenerationQueued,
   onDirtyChange,
 }: DocumentExperienceProps) {
+  const confirm = useConfirmation();
   const activeVersionId =
     document?.current_version_id ?? document?.version_id ?? "";
   const versionScope = useMemo(
@@ -592,7 +602,6 @@ export default function DocumentExperience({
     document && activeVersionId
       ? workspaceViewStateKey(documentSet.id, document.id, activeVersionId)
       : "";
-  const [mode, setMode] = useState<WorkspaceMode>("layout");
   const [editorContent, setEditorContent] =
     useState<EditorContentResponse | null>(null);
   const [contentStatus, setContentStatus] =
@@ -645,9 +654,8 @@ export default function DocumentExperience({
     useState<EditorGenerationResponse | null>(null);
   const [pendingGenerationId, setPendingGenerationId] = useState("");
   const previewButtonRef = useRef<HTMLButtonElement>(null);
-  const versionHistoryRef = useRef<HTMLDetailsElement>(null);
+  const versionHistoryRef = useDismissibleMenu();
   const modeScrollRef = useRef<HTMLDivElement>(null);
-  const modeRef = useRef<WorkspaceMode>(mode);
   const mountedRef = useRef(false);
   const activeDocumentIdRef = useRef(document?.id ?? "");
   const documentContextRef = useRef({
@@ -832,12 +840,18 @@ export default function DocumentExperience({
 
   useEffect(() => {
     if (!selectedBlock || !pendingDraft || draftTouchedRef.current) return;
+    const localDraft = getWorkspaceDraft(activeViewStateKey, selectedBlock.element_id);
+    if (localDraft) {
+      draftTouchedRef.current = true;
+      setDraft(localDraft);
+      return;
+    }
     setDraft(pendingDraft);
     setStagingStatus(pendingEditorOperation ? "saved" : "idle");
-  }, [pendingDraft, pendingEditorOperation, selectedBlock]);
+  }, [activeViewStateKey, pendingDraft, pendingEditorOperation, selectedBlock]);
 
   useEffect(() => {
-    onDirtyChange(false);
+    onDirtyChange(dirty || perDocumentDirty);
     return () => onDirtyChange(false);
   }, [dirty, onDirtyChange, perDocumentDirty]);
 
@@ -854,11 +868,9 @@ export default function DocumentExperience({
     const savedState = activeViewStateKey
       ? getWorkspaceViewState(activeViewStateKey)
       : undefined;
-    const nextMode: WorkspaceMode = "layout";
-    setMode(nextMode);
-    modeRef.current = nextMode;
     setSelectedElementId(savedState?.selectedElementId ?? "");
     setDraft(savedState?.draft ?? null);
+    draftTouchedRef.current = false;
     setInlineSelection(null);
     setInlineCommand(null);
     setPreviewJob(null);
@@ -947,9 +959,22 @@ export default function DocumentExperience({
             (block) => block.element_id === savedState.selectedElementId,
           )
             ? savedState.selectedElementId
-            : "";
+            : response.blocks.find(
+                  (block) => block.supported && !block.read_only,
+                )?.element_id ?? "";
+        const restoredBlock = response.blocks.find(
+          (block) => block.element_id === restoredElementId,
+        );
+        const localDraft = restoredBlock
+          ? getWorkspaceDraft(activeViewStateKey, restoredBlock.element_id)
+          : undefined;
+        draftTouchedRef.current = Boolean(localDraft);
         setSelectedElementId(restoredElementId);
-        setDraft(restoredElementId ? savedState?.draft ?? null : null);
+        setDraft(
+          restoredBlock
+            ? localDraft ?? pendingDraftForBlock(restoredBlock, pendingBatch)
+            : null,
+        );
         loaded = true;
       } catch (error) {
         if (requestId !== contentRequestRef.current) return;
@@ -999,6 +1024,13 @@ export default function DocumentExperience({
   }, [editorContent?.version_id]);
 
   useEffect(() => {
+    if (!editorContent?.blocks.some((block) => block.supported && !block.read_only)) {
+      return;
+    }
+    preloadInlineLayoutEditor();
+  }, [editorContent?.version_id]);
+
+  useEffect(() => {
     if (
       !searchTarget ||
       !document ||
@@ -1012,7 +1044,6 @@ export default function DocumentExperience({
     selectElementById(searchTarget.element_id, {
       skipDiscardConfirmation: true,
       sourceLabel: "search result",
-      remainInLayout: true,
     });
   }, [
     contentStatus,
@@ -1024,8 +1055,7 @@ export default function DocumentExperience({
   useLayoutEffect(() => {
     if (
       !searchTarget ||
-      searchTarget.element_id !== selectedElementId ||
-      mode !== "layout"
+      searchTarget.element_id !== selectedElementId
     ) {
       return;
     }
@@ -1045,7 +1075,6 @@ export default function DocumentExperience({
     return () => window.cancelAnimationFrame(frame);
   }, [
     editorContent?.version_id,
-    mode,
     searchTarget?.request_id,
     selectedElementId,
   ]);
@@ -1059,7 +1088,7 @@ export default function DocumentExperience({
     }
     const existing = getWorkspaceViewState(activeViewStateKey);
     setWorkspaceViewState(activeViewStateKey, {
-      mode,
+      mode: "layout",
       selectedElementId,
       draft,
       scrollTop: existing?.scrollTop ?? {
@@ -1073,7 +1102,6 @@ export default function DocumentExperience({
     activeViewStateKey,
     draft,
     editorContent?.version_id,
-    mode,
     selectedElementId,
   ]);
 
@@ -1083,11 +1111,11 @@ export default function DocumentExperience({
     const frame = window.requestAnimationFrame(() => {
       if (modeScrollRef.current) {
         modeScrollRef.current.scrollTop =
-          savedState?.scrollTop[mode] ?? 0;
+          savedState?.scrollTop.layout ?? 0;
       }
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [activeViewStateKey, contentStatus, mode]);
+  }, [activeViewStateKey, contentStatus]);
 
   useEffect(() => {
     if (!document || !historyRequested) {
@@ -1459,7 +1487,6 @@ export default function DocumentExperience({
   }, [
     document?.name,
     documentSet.id,
-    mode,
     pendingBatch,
     selectedBlock?.element_id,
     versionScope,
@@ -1605,7 +1632,6 @@ export default function DocumentExperience({
 
   useEffect(() => {
     if (
-      mode !== "layout" ||
       !document ||
       !activeVersionId ||
       previewVersionStartedRef.current === activeVersionId
@@ -1614,66 +1640,22 @@ export default function DocumentExperience({
     }
     previewVersionStartedRef.current = activeVersionId;
     void loadWordPreview();
-  }, [activeVersionId, document?.id, mode]);
-
-  function setWorkspaceMode(nextMode: WorkspaceMode) {
-    const currentMode = modeRef.current;
-    if (activeViewStateKey) {
-      const existing = getWorkspaceViewState(activeViewStateKey);
-      setWorkspaceViewState(activeViewStateKey, {
-        mode: nextMode,
-        selectedElementId,
-        draft,
-        scrollTop: {
-          layout:
-            currentMode === "layout"
-              ? modeScrollRef.current?.scrollTop ?? 0
-              : existing?.scrollTop.layout ?? 0,
-          edit:
-            currentMode === "edit"
-              ? modeScrollRef.current?.scrollTop ?? 0
-              : existing?.scrollTop.edit ?? 0,
-          compare:
-            currentMode === "compare"
-              ? modeScrollRef.current?.scrollTop ?? 0
-              : existing?.scrollTop.compare ?? 0,
-        },
-      });
-    }
-    modeRef.current = nextMode;
-    setMode(nextMode);
-    window.requestAnimationFrame(() => {
-      const savedState = activeViewStateKey
-        ? getWorkspaceViewState(activeViewStateKey)
-        : undefined;
-      if (modeScrollRef.current) {
-        modeScrollRef.current.scrollTop =
-          savedState?.scrollTop[nextMode] ?? 0;
-      }
-    });
-  }
-
-
+  }, [activeVersionId, document?.id]);
 
   function handleModeScroll(event: ReactUIEvent<HTMLDivElement>) {
-    if (activeViewStateKey) {
-      const existing = getWorkspaceViewState(activeViewStateKey);
-      setWorkspaceViewState(activeViewStateKey, {
-        mode,
-        selectedElementId,
-        draft,
-        scrollTop: {
-          layout: existing?.scrollTop.layout ?? 0,
-          edit: existing?.scrollTop.edit ?? 0,
-          compare: existing?.scrollTop.compare ?? 0,
-          [mode]: event.currentTarget.scrollTop,
-        },
-      });
-    }
-
+    if (!activeViewStateKey) return;
+    const saved = getWorkspaceViewState(activeViewStateKey);
+    setWorkspaceViewState(activeViewStateKey, {
+      mode: "layout",
+      selectedElementId,
+      draft,
+      scrollTop: {
+        edit: saved?.scrollTop.edit ?? 0,
+        compare: saved?.scrollTop.compare ?? 0,
+        layout: event.currentTarget.scrollTop,
+      },
+    });
   }
-
-
 
   function selectElementById(
     elementId: string,
@@ -1681,7 +1663,6 @@ export default function DocumentExperience({
       sourceVersionId?: string;
       sourceLabel?: string;
       skipDiscardConfirmation?: boolean;
-      remainInLayout?: boolean;
       inlineSelection?: LayoutSelectionIntent | null;
     } = {},
   ) {
@@ -1724,30 +1705,18 @@ export default function DocumentExperience({
       return;
     }
 
-    if (!block.supported || block.read_only) {
-      setLocalError(
-        `${document.name} · ${locationLabel(block)}: ${
-          block.unsupported_reason ??
-          "This Word element is preserved as read-only and cannot be edited in Layout."
-        }`,
-      );
-      return;
-    }
-
-    selectBlock(
-      block,
-      options.skipDiscardConfirmation ?? false,
-      options.remainInLayout ?? false,
-      options.inlineSelection ?? null,
-    );
+    const selection = block.supported && !block.read_only && !options.inlineSelection?.textRanges
+      ? options.inlineSelection ?? null
+      : null;
+    selectBlock(block, options.skipDiscardConfirmation ?? false, selection);
   }
 
   function activateSelectedBlock(
     block: EditorBlock,
-    remainInLayout = false,
     selection: LayoutSelectionIntent | null = null,
   ) {
-    draftTouchedRef.current = false;
+    const localDraft = getWorkspaceDraft(activeViewStateKey, block.element_id);
+    draftTouchedRef.current = Boolean(localDraft);
     const pendingOperation = pendingEditorOperationForBlock(
       pendingBatch,
       block.element_id,
@@ -1759,7 +1728,7 @@ export default function DocumentExperience({
     editorActionAbortRef.current = null;
 
     setSelectedElementId(block.element_id);
-    setDraft(pendingDraftForBlock(block, pendingBatch));
+    setDraft(localDraft ?? pendingDraftForBlock(block, pendingBatch));
     setMatches([]);
     setMatchStatus("idle");
     setNearMatchStatus("idle");
@@ -1779,17 +1748,12 @@ export default function DocumentExperience({
     setAction(null);
     setStagingStatus(pendingOperation ? "saved" : "idle");
     setEditorResetToken((current) => current + 1);
-    setInlineSelection(remainInLayout ? selection : null);
-
-    if (block.supported && !block.read_only) {
-      setWorkspaceMode("layout");
-    }
+    setInlineSelection(selection);
   }
 
   function selectBlock(
     block: EditorBlock,
     skipDiscardConfirmation = false,
-    remainInLayout = false,
     selection: LayoutSelectionIntent | null = null,
   ) {
     const changingBlock = block.element_id !== selectedElementId;
@@ -1797,8 +1761,7 @@ export default function DocumentExperience({
     if (!changingBlock) {
       if (block.supported && !block.read_only) {
         setEditorResetToken((current) => current + 1);
-        setInlineSelection(remainInLayout ? selection : null);
-        setWorkspaceMode("layout");
+        setInlineSelection(selection);
       }
       return;
     }
@@ -1806,7 +1769,7 @@ export default function DocumentExperience({
     if (!skipDiscardConfirmation && (dirty || perDocumentDirty)) {
       void stageCurrentEdit();
     }
-    activateSelectedBlock(block, remainInLayout, selection);
+    activateSelectedBlock(block, selection);
   }
 
   function exitInlineEditing(regionId: string) {
@@ -1831,6 +1794,9 @@ export default function DocumentExperience({
   function handleDraftChange(nextDraft: QuillDraft) {
     draftTouchedRef.current = true;
     setDraft(nextDraft);
+    if (activeViewStateKey && selectedElementId) {
+      setWorkspaceDraft(activeViewStateKey, selectedElementId, nextDraft);
+    }
     setStagingStatus("editing");
     setTargetReplacements((current) => ({
       ...current,
@@ -1849,6 +1815,9 @@ export default function DocumentExperience({
       delta: selectedBlock.delta,
       text: selectedBlock.text,
     });
+    if (activeViewStateKey) {
+      clearWorkspaceDraft(activeViewStateKey, selectedBlock.element_id);
+    }
     setTargetReplacements(
       Object.fromEntries(
         matches.map((match) => [match.element_id, match.text]),
@@ -2454,9 +2423,11 @@ export default function DocumentExperience({
       dirty || perDocumentDirty
         ? "\n\nYour uncommitted draft will be discarded."
         : "";
-    const confirmed = window.confirm(
-      `Restore Version ${version.version_number}?\n\nDocSync will create Version ${nextVersionNumber} from it. The current version remains in history.${draftWarning}`,
-    );
+    const confirmed = await confirm({
+      title: `Restore Version ${version.version_number}?`,
+      message: `DocSync will create Version ${nextVersionNumber} from it. The current version remains in history.${draftWarning}`,
+      action: "Restore version",
+    });
     if (!confirmed) return;
 
     setAction("restore");
@@ -2518,7 +2489,6 @@ export default function DocumentExperience({
       setEditorResetToken((current) => current + 1);
       setLayoutView(null);
       setLayoutStatus("idle");
-      setWorkspaceMode("layout");
       setRestoreNotice(
         `Version ${result.version.version_number} was created from Version ${result.restored_from_version_number}.`,
       );
@@ -2651,7 +2621,6 @@ export default function DocumentExperience({
           </div>
         </header>
 
-
         {restoreNotice && (
           <div className="editor-restore-notice" role="status">
             <strong>Version restored</strong>
@@ -2727,13 +2696,12 @@ export default function DocumentExperience({
                     selectElementById(intent.elementId, {
                       sourceVersionId: intent.versionId,
                       sourceLabel: "Word preview region",
-                      remainInLayout: true,
                       inlineSelection: intent,
                     })
                   }
                   onDraftChange={handleDraftChange}
                   onExitInline={exitInlineEditing}
-                  onRetryPreview={() => void loadWordPreview(true)}
+                  onRetryPreview={() => loadWordPreview(true)}
                 />
               </div>
             )}
@@ -2751,44 +2719,37 @@ export default function DocumentExperience({
             <div className="sidebar-heading">
               <div>
                 <span className="eyebrow">Inline editing</span>
-                <h2 id="editor-operation-title">Select text in Layout</h2>
+                <h2 id="editor-operation-title">Select text to edit</h2>
               </div>
             </div>
             <div className="sidebar-empty">
               <span aria-hidden="true">W</span>
               <h3>Click supported Word text</h3>
-              <p>
-                A restricted editor will appear over the selected paragraph.
-                Uncertain mappings and complex Word structures stay read-only.
-              </p>
+              <p>Click a paragraph on the page, or use document search to open its text here.</p>
             </div>
           </>
         ) : !selectedBlock.supported || selectedBlock.read_only ? (
           <>
             <div className="sidebar-heading">
               <div>
-                <span className="eyebrow">Safe degradation</span>
-                <h2 id="editor-operation-title">Read-only block</h2>
+                <h2 id="editor-operation-title">Edit paragraph text</h2>
               </div>
             </div>
-            <div className="read-only-sidebar">
-              <strong>{locationLabel(selectedBlock)}</strong>
-              <p>
-                {selectedBlock.unsupported_reason ??
-                  "This Word structure cannot be edited safely in the first release."}
-              </p>
-              <span>
-                It remains in the original DOCX and will not be silently
-                removed or rewritten.
-              </span>
-            </div>
+            <WordTextRanges
+              key={selectedBlock.version_id + ":" + selectedBlock.element_id}
+              block={selectedBlock}
+              documentSetId={documentSet.id}
+              pendingBatch={pendingBatch}
+            />
           </>
         ) : (
           <>
             <div className="sidebar-heading">
               <div>
                 <span className="eyebrow">Controlled edit</span>
-                <h2 id="editor-operation-title">Layout editing</h2>
+                <h2 id="editor-operation-title">
+                  Layout editing
+                </h2>
               </div>
               <span className={`draft-status ${stagingStatus === "error" ? "dirty" : ""}`} role="status">
                 {stagingStatus === "editing"
@@ -2803,66 +2764,71 @@ export default function DocumentExperience({
               </span>
             </div>
             <div className="operation-sidebar-scroll">
-              {mode === "layout" && (
-                <>
-                  {draftMayOverflow && (
-                    <div className="inline-overflow-warning" role="status">
-                      <strong>This draft may wrap differently in the final Word document.</strong>
-                      <span>Generate a new version to view the accurate layout.</span>
-                    </div>
-                  )}
-                  {!inlineSelection && (
-                    <p className="inline-editor-paused">
-                      Inline typing is paused. Select a highlighted area in the
-                      Word preview to place the cursor in that block.
-                    </p>
-                  )}
-                  <div
-                    className="inline-formatting-toolbar"
-                    role="toolbar"
-                    aria-label="Inline text and paragraph formatting"
-                  >
-                    <button type="button" onClick={() => issueInlineCommand({ action: "bold" })}>Bold</button>
-                    <button type="button" onClick={() => issueInlineCommand({ action: "italic" })}>Italic</button>
-                    <button type="button" onClick={() => issueInlineCommand({ action: "underline" })}>Underline</button>
-                    <select
-                      aria-label="Heading level"
-                      defaultValue=""
-                      disabled={["table_paragraph", "header_paragraph", "footer_paragraph"].includes(selectedBlock.element_type)}
-                      onChange={(event) => {
-                        const value = event.target.value;
-                        issueInlineCommand({ action: "heading", value: value ? Number(value) : false });
-                      }}
-                    >
-                      <option value="">Normal</option>
-                      <option value="1">Heading 1</option>
-                      <option value="2">Heading 2</option>
-                      <option value="3">Heading 3</option>
-                    </select>
-                    <button type="button" onClick={() => issueInlineCommand({ action: "list", value: "ordered" })}>Numbered</button>
-                    <button type="button" onClick={() => issueInlineCommand({ action: "list", value: "bullet" })}>Bullets</button>
-                    <button type="button" onClick={() => issueInlineCommand({ action: "indent", value: -1 })}>Outdent</button>
-                    <button type="button" onClick={() => issueInlineCommand({ action: "indent", value: 1 })}>Indent</button>
-                    <select
-                      aria-label="Paragraph alignment"
-                      defaultValue=""
-                      onChange={(event) =>
-                        issueInlineCommand({
-                          action: "align",
-                          value: event.target.value as "" | "center" | "right" | "justify",
-                        })
-                      }
-                    >
-                      <option value="">Left</option>
-                      <option value="center">Centre</option>
-                      <option value="right">Right</option>
-                      <option value="justify">Justify</option>
-                    </select>
-                    <button type="button" onClick={() => issueInlineCommand({ action: "undo" })}>Undo</button>
-                    <button type="button" onClick={() => issueInlineCommand({ action: "redo" })}>Redo</button>
-                  </div>
-                </>
+              {draftMayOverflow && (
+                <div className="inline-overflow-warning" role="status">
+                  <strong>This draft may wrap differently in the final Word document.</strong>
+                  <span>Generate a new version to view the accurate layout.</span>
+                </div>
               )}
+              {!inlineSelection && draft && (
+                <div className="structured-active-editor">
+                  <InlineLayoutEditor
+                    key={selectedBlock.element_id + ":" + editorResetToken}
+                    block={selectedBlock}
+                    value={draft.delta}
+                    resetToken={editorResetToken}
+                    caretFraction={0}
+                    command={inlineCommand}
+                    disabled={action === "generate"}
+                    onChange={handleDraftChange}
+                    onExit={() => findLayoutElement(selectedBlock.element_id)?.focus()}
+                  />
+                </div>
+              )}
+              <div
+                className="inline-formatting-toolbar"
+                role="toolbar"
+                aria-label="Inline text and paragraph formatting"
+              >
+                <button type="button" onClick={() => issueInlineCommand({ action: "bold" })}>Bold</button>
+                <button type="button" onClick={() => issueInlineCommand({ action: "italic" })}>Italic</button>
+                <button type="button" onClick={() => issueInlineCommand({ action: "underline" })}>Underline</button>
+                <select
+                  aria-label="Heading level"
+                  defaultValue=""
+                  disabled={["table_paragraph", "header_paragraph", "footer_paragraph"].includes(selectedBlock.element_type)}
+                  onChange={(event) => {
+                    const value = event.target.value;
+                    issueInlineCommand({ action: "heading", value: value ? Number(value) : false });
+                  }}
+                >
+                  <option value="">Normal</option>
+                  <option value="1">Heading 1</option>
+                  <option value="2">Heading 2</option>
+                  <option value="3">Heading 3</option>
+                </select>
+                <button type="button" onClick={() => issueInlineCommand({ action: "list", value: "ordered" })}>Numbered</button>
+                <button type="button" onClick={() => issueInlineCommand({ action: "list", value: "bullet" })}>Bullets</button>
+                <button type="button" onClick={() => issueInlineCommand({ action: "indent", value: -1 })}>Outdent</button>
+                <button type="button" onClick={() => issueInlineCommand({ action: "indent", value: 1 })}>Indent</button>
+                <select
+                  aria-label="Paragraph alignment"
+                  defaultValue=""
+                  onChange={(event) =>
+                    issueInlineCommand({
+                      action: "align",
+                      value: event.target.value as "" | "center" | "right" | "justify",
+                    })
+                  }
+                >
+                  <option value="">Left</option>
+                  <option value="center">Centre</option>
+                  <option value="right">Right</option>
+                  <option value="justify">Justify</option>
+                </select>
+                <button type="button" onClick={() => issueInlineCommand({ action: "undo" })}>Undo</button>
+                <button type="button" onClick={() => issueInlineCommand({ action: "redo" })}>Redo</button>
+              </div>
 
               <fieldset className="edit-mode-options">
                 <legend>Update mode</legend>
@@ -2877,7 +2843,7 @@ export default function DocumentExperience({
                   <span>
                     <strong>Shared wording</strong>
                     <small>
-                      Apply the Layout draft to checked exact matches. Near
+                      Apply this draft to checked exact matches. Near
                       matches stay protected.
                     </small>
                   </span>
@@ -2973,8 +2939,7 @@ export default function DocumentExperience({
                 )}
               </section>
 
-              {mode === "layout" &&
-                matches.some((match) => match.match_type === "near") && (
+              {matches.some((match) => match.match_type === "near") && (
                   <section className="layout-near-matches" aria-labelledby="layout-near-title">
                     <h3 id="layout-near-title">Near matches</h3>
                     <p>Review word-level differences and explicitly include or exclude each candidate.</p>

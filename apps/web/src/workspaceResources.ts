@@ -156,6 +156,7 @@ class WorkspaceResourceStore {
 
 const resources = new WorkspaceResourceStore();
 const viewStates = new BoundedLruCache<WorkspaceViewState>(24);
+const draftsByViewState = new BoundedLruCache<Record<string, QuillDraft>>(24);
 
 function key(...parts: string[]): string {
   return parts.join("|");
@@ -258,6 +259,32 @@ export function setWorkspaceViewState(
   viewStates.set(stateKey, state);
 }
 
+export function getWorkspaceDraft(
+  stateKey: string,
+  elementId: string,
+): QuillDraft | undefined {
+  return draftsByViewState.get(stateKey)?.[elementId];
+}
+
+export function setWorkspaceDraft(
+  stateKey: string,
+  elementId: string,
+  draft: QuillDraft,
+): void {
+  const current = draftsByViewState.get(stateKey) ?? {};
+  draftsByViewState.set(stateKey, { ...current, [elementId]: draft });
+}
+
+export function clearWorkspaceDraft(
+  stateKey: string,
+  elementId: string,
+): void {
+  const current = draftsByViewState.get(stateKey);
+  if (!current || !(elementId in current)) return;
+  const { [elementId]: _discarded, ...remaining } = current;
+  draftsByViewState.set(stateKey, remaining);
+}
+
 export function clearWorkspaceResourcesForDocument(
   documentSetId: string,
   documentId: string,
@@ -265,20 +292,14 @@ export function clearWorkspaceResourcesForDocument(
   const resourcePrefix = `|${documentSetId}|${documentId}|`;
   resources.deleteWhere((resourceKey) => resourceKey.includes(resourcePrefix));
   viewStates.deleteWhere((stateKey) => stateKey.includes(resourcePrefix));
-}
-
-export function clearWorkspaceViewStateForDocument(
-  documentSetId: string,
-  documentId: string,
-): void {
-  const resourcePrefix = `|${documentSetId}|${documentId}|`;
-  viewStates.deleteWhere((stateKey) => stateKey.includes(resourcePrefix));
+  draftsByViewState.deleteWhere((stateKey) => stateKey.includes(resourcePrefix));
 }
 
 export function clearWorkspaceResourcesForSet(documentSetId: string): void {
   const setPrefix = `|${documentSetId}|`;
   resources.deleteWhere((resourceKey) => resourceKey.includes(setPrefix));
   viewStates.deleteWhere((stateKey) => stateKey.includes(setPrefix));
+  draftsByViewState.deleteWhere((stateKey) => stateKey.includes(setPrefix));
 }
 
 export function invalidateDocumentHeadResources(
@@ -292,4 +313,5 @@ export function invalidateDocumentHeadResources(
 export function clearAllWorkspaceResources(): void {
   resources.clear();
   viewStates.clear();
+  draftsByViewState.clear();
 }

@@ -37,20 +37,13 @@
     "productName": "DocSync",
     "asar": true,
     "artifactName": "${productName}-Setup-${version}.${ext}",
-    "protocols": [
-      {
-        "name": "DocSync",
-        "schemes": ["za.co.docsync"]
-      }
-    ],
     "directories": {
       "output": "release/v1"
     },
     "files": [
       "apps/desktop/main.cjs",
       "apps/desktop/preload.cjs",
-      "apps/desktop/account-workspace.cjs",
-      "apps/desktop/legacy-workspace-migration.cjs",
+      "apps/desktop/device-workspaces.cjs",
       "apps/desktop/startup-supervision.cjs",
       "package.json"
     ],

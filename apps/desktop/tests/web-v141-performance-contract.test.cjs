@@ -52,7 +52,7 @@ test("Word preview auto-loads while near matching and version history remain laz
   const wordPreviewHandler = between(
     experience,
     "async function loadWordPreview",
-    "function setWorkspaceMode",
+    "function handleModeScroll",
   );
 
   assert.match(wordPreviewHandler, /createPreviewJob\(activeVersionId/);
@@ -67,7 +67,7 @@ test("Word preview auto-loads while near matching and version history remain laz
   assert.doesNotMatch(experience, /Load Word Preview/);
   assert.match(
     experience,
-    /onRetryPreview=\{\(\) => void loadWordPreview\(true\)\}/,
+    /onRetryPreview=\{\(\) => loadWordPreview\(true\)\}/,
   );
   assert.match(experience, /"Updating preview/);
   assert.match(experience, /"Opening document/);
@@ -90,7 +90,7 @@ test("Word preview auto-loads while near matching and version history remain laz
   );
 });
 
-test("Layout uses controlled Word regions without a structure fallback", () => {
+test("Layout keeps controlled Word regions in a single document view", () => {
   const experience = read("apps/web/src/DocumentExperience.tsx");
   const overlay = read("apps/web/src/WordPreviewOverlay.tsx");
 
@@ -101,7 +101,8 @@ test("Layout uses controlled Word regions without a structure fallback", () => {
     /LayoutFallbackBlock|groupStructuredBlocks|showLayoutStructure/,
   );
   assert.doesNotMatch(experience, /const BlockCard = memo/);
-  assert.doesNotMatch(experience, /INITIAL_VISIBLE_BLOCKS/);
+  assert.match(experience, /id="workspace-panel-layout"/);
+  assert.doesNotMatch(experience, /workspace-panel-edit|workspace-mode-tabs/);
 });
 
 test("generation is accepted immediately and reconciled by the application shell", () => {

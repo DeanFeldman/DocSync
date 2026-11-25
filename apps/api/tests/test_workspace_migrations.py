@@ -261,7 +261,7 @@ def test_repeated_real_startup_does_not_duplicate_version_foundation(
             for table in baseline
         }
     assert after == baseline
-    assert detect_schema_version(database_path) == 9
+    assert detect_schema_version(database_path) == 10
     backups = list((data_directory / "migration-backups").glob("*.db"))
     assert len(backups) == 1
 
@@ -382,7 +382,7 @@ def test_v15_migration_regenerates_legacy_table_cells_after_verified_backup(
     database.init_db()
 
     assert cached_revision_calls > 0
-    assert detect_schema_version(database_path) == 9
+    assert detect_schema_version(database_path) == 10
     backups = list((data_directory / "migration-backups").glob("*.db"))
     assert len(backups) == 1
     assert backups[0].stat().st_size > 0
@@ -478,7 +478,7 @@ def test_schema_9_migration_backfills_blank_table_fields_from_immutable_docx(
     )
     database.init_db()
 
-    assert detect_schema_version(database_path) == 9
+    assert detect_schema_version(database_path) == 10
     with TestClient(main.app) as client:
         content = client.get(
             f"/api/document-versions/{document['version_id']}/editor-content"
@@ -573,7 +573,7 @@ def test_v17_migration_backfills_linked_headers_from_immutable_docx(
 
     database.init_db()
 
-    assert detect_schema_version(database_path) == 9
+    assert detect_schema_version(database_path) == 10
     backups = list((data_directory / "migration-backups").glob("*.db"))
     assert len(backups) == 1
     with TestClient(main.app) as client:

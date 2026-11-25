@@ -9,7 +9,7 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
-from .editor_service import document_version_path
+from .editor_service import document_version_path, get_version_or_404
 from .models import (
     DocumentBlockRevision,
     DocumentHead,
@@ -197,6 +197,47 @@ def _serialize_occurrence(
         "read_only_reason": reason,
         "protected_ranges": segment.protected_ranges,
     }
+
+
+def editable_block_text_ranges(
+    session: Session, version_id: str, element_id: str
+) -> list[dict]:
+    version = get_version_or_404(session, version_id)
+    document = version.document
+    head = session.get(DocumentHead, document.id)
+    if head is None or head.current_version_id != version.id:
+        raise HTTPException(status_code=409, detail="Open the current Word version to edit this text.")
+    inventory = build_text_inventory(
+        document_version_path(version), document_id=document.id, version_id=version.id
+    )
+    bind_inventory_to_revisions(session, inventory)
+    ranges = []
+    for segment in inventory.segments:
+        if segment.element_id != element_id or not segment.searchable_by_default:
+            continue
+        for span in segment.spans:
+            start = span.logical_start
+            while start < span.logical_end:
+                end = min(start + 500, span.logical_end)
+                if end < span.logical_end:
+                    boundary = segment.text.rfind(" ", start, end)
+                    if boundary > start:
+                        end = boundary + 1
+                chunk = segment.text[start:end]
+                left = start + len(chunk) - len(chunk.lstrip())
+                right = start + len(chunk.rstrip())
+                if left < right:
+                    item = _serialize_occurrence(segment, document, left, right, len(ranges) + 1)
+                    # The batch API authenticates ranges with the original search and offsets.
+                    if item["editable"] and (left, right) not in find_occurrence_ranges(
+                        segment.text, item["matched_text"], match_case=True
+                    ):
+                        item["editable"] = False
+                        item["read_only"] = True
+                        item["read_only_reason"] = "Use Find & Replace to select more context for this text."
+                    ranges.append(item)
+                start = end
+    return ranges
 
 
 def search_document_text_inventory(

@@ -17,6 +17,7 @@ from uuid import uuid4
 from docx import Document
 from docx.document import Document as DocxDocument
 from docx.oxml.ns import qn
+from docx.table import Table
 from docx.text.paragraph import Paragraph
 from fastapi import HTTPException, UploadFile, status
 from sqlalchemy import column, delete, func, insert, select, table, text
@@ -385,9 +386,53 @@ def _is_safe_empty_body_form_field(paragraph: Paragraph) -> bool:
     return False
 
 
+def unwrap_smart_tags(document: DocxDocument) -> bool:
+    """Expose labeled runs as ordinary text while retaining their Word styles."""
+    changed = False
+    for part in document.part.package.parts:
+        root = getattr(part, "element", None)
+        if root is None:
+            continue
+        for tag in list(root.iter(qn("w:smartTag"))):
+            parent = tag.getparent()
+            index = parent.index(tag)
+            content = [child for child in tag if child.tag != qn("w:smartTagPr")]
+            parent[index:index + 1] = content
+            changed = True
+    return changed
+
+
+def body_tables(document: DocxDocument) -> list[Table]:
+    """Keep existing indexes for top-level tables and append nested tables."""
+    top_level = list(document.tables)
+    nested = [
+        Table(node, document)
+        for table in top_level
+        for node in table._tbl.iterdescendants(qn("w:tbl"))
+        if node.getparent().tag == qn("w:tc")
+    ]
+    return top_level + nested
+
+
+def _cell_paragraphs(table: Table):
+    seen_cells = set()
+    for row_index, row in enumerate(table.rows):
+        for column_index, cell in enumerate(row.cells):
+            if cell._tc in seen_cells:
+                continue
+            seen_cells.add(cell._tc)
+            paragraphs = list(cell.paragraphs)
+            has_text = any(paragraph.text.strip() for paragraph in paragraphs)
+            for paragraph_index, paragraph in enumerate(paragraphs):
+                text = paragraph.text.strip()
+                if text or (not has_text and paragraph_index == 0):
+                    yield row_index, column_index, paragraph_index, text
+
+
 def _extract_paragraphs(
     document: DocxDocument,
 ) -> list[tuple[int, str, str | None]]:
+    unwrap_smart_tags(document)
     body_elements: list[tuple[int, str, str | None]] = []
     body_paragraph_index = 0
     table_index = 0
@@ -405,10 +450,8 @@ def _extract_paragraphs(
         paragraph._p: paragraph
         for paragraph in paragraphs
     }
-    table_lookup = {
-        table._tbl: table
-        for table in tables
-    }
+    table_lookup = {table._tbl: table for table in tables}
+    table_orders = {}
 
     for child in document.element.body.iterchildren():
         paragraph = paragraph_lookup.get(child)
@@ -442,34 +485,15 @@ def _extract_paragraphs(
         if table is None:
             continue
 
-        seen_cells: set[object] = set()
-        for row_index, row in enumerate(table.rows):
-            for column_index, cell in enumerate(row.cells):
-                cell_key = cell._tc
-                if cell_key in seen_cells:
-                    continue
-                seen_cells.add(cell_key)
-
-                cell_paragraphs = list(cell.paragraphs)
-                cell_has_text = any(
-                    paragraph.text.strip() for paragraph in cell_paragraphs
-                )
-                for paragraph_index, paragraph in enumerate(cell_paragraphs):
-                    text = paragraph.text.strip()
-                    if not text and (cell_has_text or paragraph_index > 0):
-                        continue
-                    body_elements.append(
-                        (
-                            block_order,
-                            text,
-                            (
-                                f"table_paragraph_order:{block_order}:"
-                                f"{document_order}:{table_index}:{row_index}:"
-                                f"{column_index}:{paragraph_index}"
-                            ),
-                        )
-                    )
-                    block_order += 1
+        table_orders[table._tbl] = document_order
+        for row_index, column_index, paragraph_index, text in _cell_paragraphs(table):
+            body_elements.append((
+                block_order,
+                text,
+                f"table_paragraph_order:{block_order}:{document_order}:{table_index}:"
+                f"{row_index}:{column_index}:{paragraph_index}",
+            ))
+            block_order += 1
 
         table_index += 1
         document_order += 1
@@ -615,6 +639,21 @@ def _extract_paragraphs(
         )
         footer_document_order += 1
 
+    # Preserve the stored indexes of existing paragraphs. The separate Word
+    # document order lets the renderer place these targets beside the outer table.
+    for index, table in enumerate(body_tables(document)[len(tables):], start=len(tables)):
+        outer = next(node for node in table._tbl.iterancestors() if node in table_orders)
+        for row, column, paragraph, text in _cell_paragraphs(table):
+            if not text:
+                continue
+            order = len(elements)
+            elements.append((
+                order,
+                text,
+                f"table_paragraph_order:{order}:{table_orders[outer]}:{index}:"
+                f"{row}:{column}:{paragraph}",
+            ))
+
     return elements
 
 
@@ -631,6 +670,59 @@ def _unique_set_filename(existing_names: set[str], filename: str) -> str:
         if candidate.casefold() not in existing_names:
             return candidate
         counter += 1
+
+
+def _prepare_imported_versions(
+    record: dict,
+    parsed_document: DocxDocument,
+    elements: list[dict],
+    original_path: Path,
+    generated_paths: list[Path],
+) -> tuple[list[dict], dict, list[dict], list[dict]]:
+    from .plain_working_copy import create_plain_working_copy
+    from .editor_service import prepare_original_version_rows
+
+    original, head, revisions = prepare_original_version_rows(record, parsed_document, elements)
+    payload = original_path.read_bytes()
+    converted = create_plain_working_copy(payload)
+    if converted is payload:
+        return [original], head, revisions, elements
+
+    working_document = DocumentValidationService.parse_file(
+        converted, filename=record["original_name"]
+    )
+    version_id = new_id()
+    previous_ids = {element["paragraph_index"]: element["id"] for element in elements}
+    working_elements = [
+        {
+            "id": previous_ids.get(index) or new_id(),
+            "document_id": record["id"],
+            "paragraph_index": index,
+            "text": text,
+            "normalized_text": normalise_text(text),
+            "style_name": style,
+        }
+        for index, text, style in _extract_paragraphs(working_document)
+    ]
+    working, _, working_revisions = prepare_original_version_rows(
+        record, working_document, working_elements
+    )
+    storage_name = f"{record['document_set_id']}/{version_id}.docx"
+    path = settings.data_dir / "generated" / storage_name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    generated_paths.append(path)
+    path.write_bytes(converted)
+    working.update(
+        id=version_id, parent_version_id=original["id"], version_number=2,
+        storage_area="generated", storage_name=storage_name,
+        checksum_sha256=hashlib.sha256(converted).hexdigest(),
+    )
+    head.update(current_version_id=version_id, revision=2)
+    for revision in working_revisions:
+        revision["version_id"] = version_id
+    working_ids = {element["id"] for element in working_elements}
+    historical_only = [element for element in elements if element["id"] not in working_ids]
+    return [original, working], head, revisions + working_revisions, working_elements + historical_only
 
 
 async def create_document_set(
@@ -669,6 +761,7 @@ async def create_document_set(
             list[tuple[int, str, str | None]],
         ]
     ] = []
+    generated_paths: list[Path] = []
     try:
         for upload in files:
             raw_name = upload.filename or "document.docx"
@@ -704,7 +797,6 @@ async def create_document_set(
         version_rows: list[dict] = []
         head_rows: list[dict] = []
         revision_rows: list[dict] = []
-        from .editor_service import prepare_original_version_rows
 
         for original_name, payload, parsed_document, extracted in prepared:
             document_id = new_id()
@@ -730,16 +822,14 @@ async def create_document_set(
                 }
                 for paragraph_index, text, style_name in extracted
             ]
-            version_row, head_row, current_revision_rows = (
-                prepare_original_version_rows(
-                    document_row,
-                    parsed_document,
-                    current_element_rows,
+            imported_versions, head_row, current_revision_rows, current_element_rows = (
+                _prepare_imported_versions(
+                    document_row, parsed_document, current_element_rows, target, generated_paths
                 )
             )
             document_rows.append(document_row)
             element_rows.extend(current_element_rows)
-            version_rows.append(version_row)
+            version_rows.extend(imported_versions)
             head_rows.append(head_row)
             revision_rows.extend(current_revision_rows)
 
@@ -775,6 +865,8 @@ async def create_document_set(
     except Exception:
         session.rollback()
         shutil.rmtree(original_dir, ignore_errors=True)
+        for path in generated_paths:
+            path.unlink(missing_ok=True)
         raise
 
     timings["service_total_ms"] = (perf_counter() - started_at) * 1000
@@ -857,7 +949,6 @@ async def add_documents_to_set(
             ]
             prepared_records.append((record, parsed_document, elements))
 
-        from .editor_service import prepare_original_version_rows
 
         document_rows: list[dict] = []
         element_rows: list[dict] = []
@@ -865,14 +956,15 @@ async def add_documents_to_set(
         head_rows: list[dict] = []
         revision_rows: list[dict] = []
         for record_row, parsed_document, current_element_rows in prepared_records:
-            version_row, head_row, current_revision_rows = prepare_original_version_rows(
-                record_row,
-                parsed_document,
-                current_element_rows,
+            imported_versions, head_row, current_revision_rows, current_element_rows = (
+                _prepare_imported_versions(
+                    record_row, parsed_document, current_element_rows,
+                    settings.data_dir / "originals" / record_row["stored_name"], created_paths,
+                )
             )
             document_rows.append(record_row)
             element_rows.extend(current_element_rows)
-            version_rows.append(version_row)
+            version_rows.extend(imported_versions)
             head_rows.append(head_row)
             revision_rows.extend(current_revision_rows)
         session.execute(insert(DocumentRecord.__table__), document_rows)
@@ -2038,7 +2130,7 @@ def generate_versions(
                         paragraph_index,
                     ) = table_location
                     try:
-                        cell = docx.tables[table_index].rows[row_index].cells[column_index]
+                        cell = body_tables(docx)[table_index].rows[row_index].cells[column_index]
                         paragraph = cell.paragraphs[paragraph_index]
                     except (IndexError, TypeError) as exc:
                         raise HTTPException(

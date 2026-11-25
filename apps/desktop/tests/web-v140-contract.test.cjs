@@ -50,10 +50,10 @@ test("controlled Word selection uses the central version-safe inline editor path
   );
   assert.match(experience, /selectBlock\(\s*block,/);
   assert.match(overlay, /region\.element_id === selectedElementId/);
-  assert.match(experience, /setWorkspaceMode\("layout"\)/);
+  assert.match(experience, /id="workspace-panel-layout"/);
   assert.match(
     experience,
-    /setInlineSelection\(remainInLayout \? selection : null\)/,
+    /setInlineSelection\(selection\)/,
   );
   assert.doesNotMatch(experience, /setWorkspaceMode\("edit"\)/);
   assert.match(types, /layout_regions\?: LayoutElementRegion\[\]/);

@@ -105,6 +105,11 @@ def init_db() -> None:
                 name="empty_table_paragraph_targets",
                 apply=_migrate_empty_table_paragraph_targets,
             ),
+            WorkspaceMigration(
+                version=10,
+                name="nested_table_paragraph_targets",
+                apply=_migrate_nested_table_paragraph_targets,
+            ),
         ),
         report_stage=report_stage,
     )
@@ -639,7 +644,7 @@ def _migrate_table_paragraph_foundation(session: Session) -> None:
     schema marker.
     """
 
-    from .document_service import _extract_paragraphs, _rebuild_exact_link_groups
+    from .document_service import _extract_paragraphs, _rebuild_exact_link_groups, body_tables
     from .editor_service import (
         _header_footer_part_map,
         _load_docx,
@@ -691,7 +696,7 @@ def _migrate_table_paragraph_foundation(session: Session) -> None:
             # complete document tree for every block and can exceed desktop's
             # startup supervision window.
             paragraphs = list(parsed.paragraphs)
-            tables = list(parsed.tables)
+            tables = body_tables(parsed)
             style_name_cache: dict[str | None, str | None] = {}
             header_footer_parts = _header_footer_part_map(parsed)
             previous_revisions = list(
@@ -966,7 +971,19 @@ def _migrate_empty_table_paragraph_targets(session: Session) -> None:
     existing element or revision identity.
     """
 
-    from .document_service import _extract_paragraphs
+    _backfill_table_paragraph_targets(session, nested=False)
+
+
+def _migrate_nested_table_paragraph_targets(session: Session) -> None:
+    """Add targets for text in nested tables to each current immutable version."""
+    _backfill_table_paragraph_targets(session, nested=True)
+
+
+def _backfill_table_paragraph_targets(session: Session, *, nested: bool) -> None:
+    from .document_service import (
+        _extract_paragraphs, body_tables, normalise_text, table_paragraph_location,
+        unwrap_smart_tags,
+    )
     from .editor_service import (
         _element_location,
         _header_footer_part_map,
@@ -995,15 +1012,21 @@ def _migrate_empty_table_paragraph_targets(session: Session) -> None:
                 "blank-field migration."
             )
 
-        parsed = _load_docx(document_version_path(version))
-        empty_fields = [
-            (paragraph_index, style_name)
-            for paragraph_index, text_value, style_name in _extract_paragraphs(parsed)
-            if not text_value
-            and style_name is not None
-            and _ORDERED_TABLE_PARAGRAPH_STYLE.fullmatch(style_name)
-        ]
-        if not empty_fields:
+        parsed = _load_docx(document_version_path(version), normalize_smart_tags=False)
+        repaired_smart_tags = nested and unwrap_smart_tags(parsed)
+        tables = body_tables(parsed)
+        top_level_count = len(parsed.tables)
+        if nested and len(tables) == top_level_count and not repaired_smart_tags:
+            continue
+        targets = []
+        for paragraph_index, text_value, style_name in _extract_paragraphs(parsed):
+            address = table_paragraph_location(style_name)
+            is_nested_table = address is not None and address[0] >= top_level_count
+            if repaired_smart_tags or (is_nested_table and nested and text_value) or (
+                not nested and address is not None and not is_nested_table and not text_value
+            ):
+                targets.append((paragraph_index, text_value, style_name))
+        if not targets:
             continue
 
         existing_revisions = list(
@@ -1014,7 +1037,7 @@ def _migrate_empty_table_paragraph_targets(session: Session) -> None:
             )
         )
         existing_locations = {
-            _location_key(revision.location_json)
+            _location_key(revision.location_json): revision
             for revision in existing_revisions
         }
         next_paragraph_index = (
@@ -1029,28 +1052,44 @@ def _migrate_empty_table_paragraph_targets(session: Session) -> None:
             + 1
         )
         paragraphs = list(parsed.paragraphs)
-        tables = list(parsed.tables)
         style_name_cache: dict[str | None, str | None] = {}
         header_footer_parts = _header_footer_part_map(parsed)
 
-        for extracted_index, style_name in empty_fields:
+        target_type = "nested" if nested else "empty"
+        for extracted_index, text_value, style_name in targets:
             candidate_id = str(
                 uuid5(
                     NAMESPACE_URL,
-                    f"docsync:v1.9-empty:{version.id}:{extracted_index}:{style_name}",
+                    f"docsync:v1.9-{target_type}:{version.id}:{extracted_index}:{style_name}",
                 )
             )
             candidate = DocumentElement(
                 id=candidate_id,
                 document_id=version.document_id,
                 paragraph_index=next_paragraph_index,
-                text="",
-                normalized_text="",
+                text=text_value,
+                normalized_text=normalise_text(text_value),
                 style_name=style_name,
             )
             _ordinal, location = _element_location(candidate)
             location_key = _location_key(location)
-            if location_key in existing_locations:
+            existing = existing_locations.get(location_key)
+            if existing is not None:
+                if repaired_smart_tags and existing.text != text_value:
+                    element = session.get(DocumentElement, existing.element_id)
+                    if element is None:
+                        raise RuntimeError("The current editor target has no document element.")
+                    element.text = text_value
+                    element.normalized_text = normalise_text(text_value)
+                    values = _revision_values(
+                        parsed, element, shared_state=existing.shared_state,
+                        paragraphs=paragraphs, tables=tables,
+                        style_name_cache=style_name_cache,
+                        header_footer_parts=header_footer_parts,
+                    )
+                    for field, value in values.items():
+                        if field not in {"id", "ordinal"}:
+                            setattr(existing, field, value)
                 continue
 
             session.add(candidate)
@@ -1063,10 +1102,9 @@ def _migrate_empty_table_paragraph_targets(session: Session) -> None:
                 style_name_cache=style_name_cache,
                 header_footer_parts=header_footer_parts,
             )
-            session.add(
-                DocumentBlockRevision(version_id=version.id, **values)
-            )
-            existing_locations.add(location_key)
+            revision = DocumentBlockRevision(version_id=version.id, **values)
+            session.add(revision)
+            existing_locations[location_key] = revision
             next_paragraph_index += 1
 
         if head_index % 10 == 0:

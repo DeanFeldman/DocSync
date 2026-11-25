@@ -2,7 +2,7 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App";
 import AppErrorBoundary from "./AppErrorBoundary";
-import AuthGate from "./AuthGate";
+import { ConfirmationProvider } from "./ConfirmationDialog";
 import "./styles.css";
 
 const root = document.getElementById("root");
@@ -13,7 +13,9 @@ if (!root) {
 createRoot(root).render(
   <StrictMode>
     <AppErrorBoundary>
-      <AuthGate><App /></AuthGate>
+      <ConfirmationProvider>
+        <App />
+      </ConfirmationProvider>
     </AppErrorBoundary>
   </StrictMode>,
 );
