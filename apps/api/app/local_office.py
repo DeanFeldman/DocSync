@@ -297,10 +297,12 @@ def office_callback(version_id: str, key: str, request: Request, body: dict, ses
             if original != content:
                 DocumentValidationService.validate_package(content, filename="draft.docx")
                 DocumentValidationService.parse_file(content, filename="draft.docx")
-                related = {}
+                related, skipped = {}, []
                 if _save_scope(version_id) == "shared":
-                    related = sync_related_paragraphs(session, current, original, content)
-                save_office_document_versions(session, current.document_id, current.id, version_id, content, related)
+                    related, skipped = sync_related_paragraphs(session, current, original, content)
+                save_office_document_versions(
+                    session, current.document_id, current.id, version_id, content, related, skipped,
+                )
         except HTTPException as exc:
             failure = str(exc.detail)
             raise
@@ -339,5 +341,6 @@ def office_save_status(
     if operation is None or operation.id == after_operation:
         return {"save": None}
     result = serialize_editor_generation_status(session, operation.id)
+    result["skipped_documents"] = (operation.preview_json or {}).get("office_skipped", [])
     result["document_set"] = serialize_document_set(get_document_set_or_404(session, current.document.document_set_id))
     return {"save": result}

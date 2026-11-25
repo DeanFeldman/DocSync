@@ -60,8 +60,9 @@ edited file and update unambiguous paragraph matches in the set. Matching
 compares wording while ignoring spacing differences. Deleting a shared
 paragraph clears its wording in the other files and preserves their layout.
 **This file only** saves the current file. The toolbar shows the files
-updated by each save. New paragraphs sync as text when matching surrounding
-paragraphs identify the same insertion point. Formatting-only changes stay
+updated by each save. New paragraphs sync as text at a matching insertion
+point. A uniquely matching preceding paragraph can identify the spot before
+a file-specific paragraph. Formatting-only changes stay
 in the file you edited.
 
 ## Local workspaces and manual transfers

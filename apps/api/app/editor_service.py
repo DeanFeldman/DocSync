@@ -3723,6 +3723,7 @@ def save_office_document_versions(
     editor_version_id: str,
     content: bytes,
     related: dict[str, tuple[str, bytes]],
+    skipped: list[dict],
 ) -> None:
     _save_document_copy(
         session,
@@ -3731,6 +3732,7 @@ def save_office_document_versions(
         edited_content=content,
         office_session_version_id=editor_version_id,
         related=related,
+        office_skipped=skipped,
     )
 
 
@@ -3743,6 +3745,7 @@ def _save_document_copy(
     edited_content: bytes | None = None,
     office_session_version_id: str | None = None,
     related: dict[str, tuple[str, bytes]] | None = None,
+    office_skipped: list[dict] | None = None,
 ) -> dict:
     with EDITOR_GENERATION_LOCK:
         committed = False
@@ -3909,6 +3912,7 @@ def _save_document_copy(
                     "expected_current_version_id": expected_version_id,
                     **({
                         "office_session_version_id": office_session_version_id,
+                        "office_skipped": office_skipped or [],
                         "affected_document_ids": [item.id for item, _, _ in copies],
                         "affected_document_names": [item.original_name for item, _, _ in copies],
                     } if office_session_version_id else {}),

@@ -55,8 +55,14 @@ def _changed_span(before: str, after: str) -> tuple[int, int, str] | None:
         suffix += 1
     end = len(before) - suffix
     after_end = len(after) - suffix
-    # Anchor pure insertions to a neighboring character so the existing range
-    # writer can make the edit while preserving text outside that range.
+    # Use just one adjacent non-whitespace character for insertions. Including
+    # a neighboring tab or line break makes an otherwise valid edit protected.
+    if start == end:
+        if start < len(before) and not before[start].isspace():
+            end += 1
+            after_end += 1
+        elif start > 0 and not before[start - 1].isspace():
+            start -= 1
     while start > 0 and not before[start:end].strip():
         start -= 1
     while end < len(before) and not before[start:end].strip():
@@ -101,12 +107,13 @@ def _paragraph_changes(
     before: list[DocumentTextSegment],
     after: list[DocumentTextSegment],
     detached: set[str],
-) -> dict[tuple[tuple, str], tuple[int, int, str]]:
+) -> tuple[dict[tuple[tuple, str], tuple[int, int, str]], dict[tuple[tuple, str], str]]:
     old = [_wording_key(segment) for segment in before]
     new = [_wording_key(segment) for segment in after]
     original_counts = Counter(old)
     remaining = set(new)
     changes = {}
+    blocked = {}
     matcher = SequenceMatcher(a=old, b=new, autojunk=False)
     for tag, old_start, old_end, new_start, new_end in matcher.get_opcodes():
         if tag == "replace" and old_end - old_start == new_end - new_start:
@@ -120,7 +127,7 @@ def _paragraph_changes(
             continue
         for previous, updated in pairs:
             key = _wording_key(previous)
-            if previous.revision_id in detached or original_counts[key] != 1 or key in remaining:
+            if original_counts[key] != 1 or key in remaining:
                 continue
             if updated is not None and _container(previous) != _container(updated):
                 continue
@@ -128,9 +135,13 @@ def _paragraph_changes(
             if span is None:
                 continue
             start, end = _actual_span(previous.text, *span[:2])
-            if previous.editability_for_range(start, end, allow_whitespace_deletion=not span[2])[0]:
+            if previous.revision_id in detached:
+                blocked[key] = "source_detached"
+            elif previous.editability_for_range(start, end, allow_whitespace_deletion=not span[2])[0]:
                 changes[key] = span
-    return changes
+            else:
+                blocked[key] = "source_protected"
+    return changes, blocked
 
 
 @dataclass(frozen=True)
@@ -164,16 +175,24 @@ def _paragraph_additions(
             continue
         old = [_wording(paragraph) for paragraph in original]
         new = [_wording(paragraph) for paragraph in paragraphs]
-        matcher = SequenceMatcher(a=old, b=new, autojunk=False)
-        for tag, start, end, new_start, new_end in matcher.get_opcodes():
-            if tag == "insert":
-                blank_count = 0
-            elif tag == "replace" and end - start == new_end - new_start and not any(old[start:end]):
-                blank_count = end - start
-            else:
+        # Blank paragraphs are content within a gap, not anchors. Aligning
+        # them as anchors can move a blank from one gap to a different one.
+        old_text = [(index, wording) for index, wording in enumerate(old) if wording]
+        new_text = [(index, wording) for index, wording in enumerate(new) if wording]
+        matcher = SequenceMatcher(
+            a=[item[1] for item in old_text], b=[item[1] for item in new_text], autojunk=False,
+        )
+        anchors = [(-1, -1)]
+        for left, right, count in matcher.get_matching_blocks():
+            anchors.extend((old_text[left + i][0], new_text[right + i][0]) for i in range(count))
+        anchors.append((len(old), len(new)))
+
+        for (old_previous, new_previous), (end, new_end) in zip(anchors, anchors[1:]):
+            start, new_start = old_previous + 1, new_previous + 1
+            old_gap, new_gap = old[start:end], new[new_start:new_end]
+            if not new_gap or old_gap == new_gap or any(old_gap) or len(old_gap) > len(new_gap):
                 continue
-            if not any(new[new_start:new_end]):
-                continue
+            blank_count = len(old_gap)
             block = paragraphs[new_start:new_end]
             if any(
                 span.role != "ordinary" or span.node_kind not in {"text", "tab", "line_break"}
@@ -189,10 +208,6 @@ def _paragraph_additions(
                 not _wording(anchor) or counts[_wording_key(anchor)] != 1 or anchor.revision_id in detached
                 for anchor in (previous, following) if anchor is not None
             ):
-                continue
-            if previous is not None and (not new_start or new[new_start - 1] != old[start - 1]):
-                continue
-            if following is not None and (new_end == len(new) or new[new_end] != old[end]):
                 continue
             additions.append(ParagraphAddition(
                 _wording_key(previous) if previous else None,
@@ -217,20 +232,34 @@ def _target_insertions(
     for addition in additions:
         before = by_wording.get(addition.previous, [])
         after = by_wording.get(addition.following, [])
-        if (addition.previous is not None and len(before) != 1) or (
-            addition.following is not None and len(after) != 1
-        ):
+        if (addition.previous is not None and len(before) != 1) or len(after) > 1:
             continue
         previous = before[0] if before else None
         following = after[0] if after else None
-        container = _container(previous or following)
-        if container[1] != addition.kind or any(
-            _container(anchor) != container or anchor.revision_id in detached
-            for anchor in (previous, following) if anchor is not None
-        ):
+        anchor = previous or following
+        if anchor is None:
+            continue
+        container = _container(anchor)
+        if container[1] != addition.kind:
             continue
         group = groups[container]
         start = group.index(previous) + 1 if previous is not None else 0
+        if addition.following is not None and following is None:
+            # An insertion immediately after a unique preceding match can
+            # keep the target's next, file-specific paragraph.
+            next_index = start + addition.blank_count
+            if previous is None or next_index >= len(group):
+                continue
+            following = group[next_index]
+            existing = tuple(_wording(item) for item in group[start:start + len(addition.texts)])
+            inserted = tuple(" ".join(text.split()) for text in addition.texts)
+            if not _wording(following) or existing == inserted:
+                continue
+        if any(
+            _container(item) != container or item.revision_id in detached
+            for item in (previous, following) if item is not None
+        ):
+            continue
         end = group.index(following) if following is not None else len(group)
         if end - start != addition.blank_count or any(_wording(item) for item in group[start:end]):
             continue
@@ -245,7 +274,7 @@ def _target_insertions(
 
 def sync_related_paragraphs(
     session: Session, version: DocumentVersion, original: bytes, edited: bytes,
-) -> dict[str, tuple[str, bytes]]:
+) -> tuple[dict[str, tuple[str, bytes]], list[dict]]:
     inventory_options = {
         "document_id": version.document_id, "version_id": version.id, "include_empty_paragraphs": True,
     }
@@ -253,10 +282,10 @@ def sync_related_paragraphs(
     detached = _detached_revisions(session, original_inventory)
     before = _paragraphs(original_inventory)
     after = _paragraphs(build_text_inventory(edited, **inventory_options))
-    changes = _paragraph_changes(before, after, detached)
+    changes, blocked = _paragraph_changes(before, after, detached)
     additions = _paragraph_additions(before, after, detached)
-    if not changes and not additions:
-        return {}
+    if not changes and not additions and not blocked:
+        return {}, []
 
     candidates = session.scalars(
         select(DocumentVersion)
@@ -266,6 +295,7 @@ def sync_related_paragraphs(
                DocumentRecord.id != version.document_id)
     )
     synced = {}
+    skipped = []
     for candidate in candidates:
         content = document_version_path(candidate).read_bytes()
         inventory = build_text_inventory(
@@ -276,21 +306,28 @@ def sync_related_paragraphs(
         matches = defaultdict(list)
         for segment in paragraphs:
             key = _wording_key(segment)
-            if key in changes:
+            if key in changes or key in blocked:
                 matches[key].append(segment)
         if not matches and not additions:
             continue
         detached = _detached_revisions(session, inventory)
         patches = []
+        reasons = set()
         for key, segments in matches.items():
+            if key in blocked:
+                reasons.add(blocked[key])
+                continue
             if len(segments) != 1:
+                reasons.add("ambiguous")
                 continue
             segment = segments[0]
             start, end, replacement = changes[key]
             start, end = _actual_span(segment.text, start, end)
-            if segment.revision_id in detached or not segment.editability_for_range(
-                start, end, allow_whitespace_deletion=not replacement,
-            )[0]:
+            if segment.revision_id in detached:
+                reasons.add("detached")
+                continue
+            if not segment.editability_for_range(start, end, allow_whitespace_deletion=not replacement)[0]:
+                reasons.add("protected")
                 continue
             patches.append(TextReplacementPatch(
                 occurrence_id=occurrence_id(segment, start, end),
@@ -307,4 +344,10 @@ def sync_related_paragraphs(
             updated = apply_text_replacements(content, inventory, patches, insertions=insertions)
             if updated != content:
                 synced[candidate.document_id] = (candidate.id, updated)
-    return synced
+        if reasons:
+            skipped.append({
+                "document_id": candidate.document_id,
+                "document_name": candidate.document.original_name,
+                "reasons": sorted(reasons),
+            })
+    return synced, sorted(skipped, key=lambda file: file["document_name"].casefold())

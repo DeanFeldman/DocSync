@@ -165,6 +165,11 @@ def test_local_office_saves_and_syncs_only_changed_shared_paragraphs(tmp_path, m
             return result["operation_id"], current_ids
 
         operation_id, first_ids = verify_saved_versions("Changed cell", changed)
+        skipped = client.get(editor_api + "/save-status").json()["save"]["skipped_documents"]
+        assert {row["document_name"]: row["reasons"] for row in skipped} == {
+            "Detached.docx": ["detached"],
+            "Duplicate.docx": ["ambiguous"],
+        }
         stale_token = office._sign({**claims, "key": second_key})
         assert client.post(second_callback, json={"token": stale_token}).status_code == 409
         assert client.get(service + "/source").content == changed
@@ -227,16 +232,20 @@ def test_local_office_syncs_new_paragraphs_only_at_shared_locations(tmp_path, mo
 
     shared_body = ("Opening terms", "Existing charges", "", "Closing terms")
     shared_table = ("Payment terms", "Bank details")
+    matching_table = ("Payment terms", "Target bank details")
     originals = {
         "Source.docx": document((*shared_body, "Source account"), shared_table),
-        "Matching.docx": document((*shared_body, "Target account"), shared_table),
+        "Matching.docx": document((*shared_body, "Target account"), matching_table),
         "Different.docx": document(("Unique opening", "Existing charges", "Existing local text",
-                                    "Closing terms", "Different account"), ("Other terms", "Bank details")),
+                                    "Different closing terms", "Different account"), ("Other terms", "Bank details")),
     }
-    edited_body = ("Opening terms", "New standalone clause", "Existing charges",
-                   "New text in a blank paragraph", "Closing terms")
-    edited_table = ("Payment terms", "New payment requirement", "Bank details")
+    edited_body = ("", "Opening terms", "New standalone clause", "Existing charges",
+                   "New text in a blank paragraph", "Closing terms", "")
+    edited_table = ("Payment terms", "New payment requirement", "", "Bank details")
     edited = document((*edited_body, "Source account"), edited_table)
+    originals["Already added.docx"] = document(
+        ("Unrelated file details",), (*edited_table[:-1], "A third bank account"),
+    )
     with TestClient(app, base_url="http://127.0.0.1:8765") as client:
         upload = client.post("/api/document-sets", data={"name": "Shared additions"}, files=[
             ("files", (name, data, office.MIME)) for name, data in originals.items()
@@ -259,12 +268,58 @@ def test_local_office_syncs_new_paragraphs_only_at_shared_locations(tmp_path, mo
         saved = client.get(editor_api + "/save-status").json()["save"]
         updated = {row["name"]: row for row in saved["document_set"]["documents"]}
         assert updated["Different.docx"]["version_id"] == docs["Different.docx"]["version_id"]
+        assert updated["Already added.docx"]["version_id"] == docs["Already added.docx"]["version_id"]
         matching = client.get(updated["Matching.docx"]["download_url"])
         version = Document(BytesIO(matching.content))
         assert tuple(p.text for p in version.paragraphs) == (*edited_body, "Target account")
-        assert tuple(p.text for p in version.tables[0].cell(0, 0).paragraphs) == edited_table
+        assert tuple(p.text for p in version.tables[0].cell(0, 0).paragraphs) == (
+            *edited_table[:-1], "Target bank details",
+        )
 
         assert client.post(callback, json={"token": token}).json() == {"error": 0}
         assert client.get(editor_api + "/save-status", params={
             "after_operation": saved["operation_id"],
         }).json() == {"save": None}
+
+
+def test_local_office_repeated_insertions_beside_a_word_line_break(tmp_path, monkeypatch):
+    app = _load_test_app(tmp_path, monkeypatch)
+    office = importlib.import_module("app.local_office")
+    monkeypatch.setenv("DOCSYNC_ONLYOFFICE_URL", "http://127.0.0.1:8080")
+    monkeypatch.setenv("DOCSYNC_ONLYOFFICE_SECRET", "local-document-server-test-secret")
+    originals = {
+        "Source.docx": _docx("Shared opening\nTerms follow", "Source details"),
+        "Line break.docx": _docx("Shared opening\nTerms follow", "Target details"),
+        "Spaces.docx": _docx("Shared opening   Terms follow", "Different target details"),
+    }
+    with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+        upload = client.post("/api/document-sets", data={"name": "Insertion beside a line break"}, files=[
+            ("files", (name, data, office.MIME)) for name, data in originals.items()
+        ])
+        assert upload.status_code == 201, upload.text
+        documents = {row["name"]: row for row in upload.json()["documents"]}
+        source = documents["Source.docx"]
+        editor = client.post(f"/api/documents/{source['id']}/onlyoffice/open").json()
+        service = urlsplit(editor["embed_url"]).path.replace("onlyoffice-bridge", "onlyoffice-service")
+        token = office._sign({
+            "operation": "callback", "status": 6, "key": service.rsplit("/", 1)[-1],
+            "url": "http://127.0.0.1:8080/edited.docx",
+        })
+        previous_versions = {name: row["version_id"] for name, row in documents.items()}
+        for words in ("New condition. ", "Another condition. New condition. "):
+            draft = _docx("Shared opening\n" + words + "Terms follow", "Source details")
+            monkeypatch.setattr(office, "_download_draft", lambda *_: draft)
+            result = client.post(service + "/callback", json={"token": token})
+            assert result.json() == {"error": 0}, result.text
+            saved = client.get(f"/api/onlyoffice/{editor['version_id']}/save-status").json()["save"]
+            assert {row["name"] for row in saved["affected_documents"]} == set(documents)
+            assert saved["skipped_documents"] == []
+            for row in saved["document_set"]["documents"]:
+                name = row["name"]
+                assert row["version_id"] != previous_versions[name]
+                previous_versions[name] = row["version_id"]
+                cell = Document(BytesIO(client.get(row["download_url"]).content)).tables[0].cell(0, 0)
+                gap = "   " if name == "Spaces.docx" else "\n"
+                expected_details = Document(BytesIO(originals[name])).tables[0].cell(0, 0).paragraphs[1].text
+                assert cell.paragraphs[0].text == "Shared opening" + gap + words + "Terms follow"
+                assert cell.paragraphs[1].text == expected_details

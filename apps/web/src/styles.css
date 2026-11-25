@@ -4593,3 +4593,33 @@ textarea:focus-visible {
     justify-content: flex-start;
   }
 }
+
+.sync-skip-button {
+  min-height: 28px;
+  padding: 4px 8px;
+  font: inherit;
+}
+
+.sync-skip-list {
+  width: min(340px, calc(100vw - 20px));
+  max-height: min(50vh, 300px);
+  overflow-y: auto;
+  padding: 8px 12px;
+}
+
+.sync-skip-list ul {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.sync-skip-list span {
+  display: block;
+  color: var(--muted);
+}
+
+.sync-skip-list li {
+  overflow-wrap: anywhere;
+}

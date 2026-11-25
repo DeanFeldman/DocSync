@@ -27,7 +27,6 @@ a = Analysis(
         "PIL",
         "_tkinter",
         "dateutil",
-        "httpx",
         "ipykernel",
         "jedi",
         "jupyter_client",

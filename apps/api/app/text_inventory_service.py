@@ -1278,17 +1278,18 @@ def apply_text_replacements(
     for (part_path, anchor, insert_after, slots), texts in prepared_insertions:
         changed_parts.add(part_path)
         if slots:
-            for paragraph, text in zip(slots, texts, strict=True):
+            for paragraph, text in zip(slots, texts[:len(slots)], strict=True):
                 _write_inserted_paragraph(paragraph, text)
-        else:
-            for text in texts:
-                paragraph = etree.Element(W_P)
-                _write_inserted_paragraph(paragraph, text)
-                if insert_after:
-                    anchor.addnext(paragraph)
-                    anchor = paragraph
-                else:
-                    anchor.addprevious(paragraph)
+            anchor = slots[-1]
+            insert_after = True
+        for text in texts[len(slots):]:
+            paragraph = etree.Element(W_P)
+            _write_inserted_paragraph(paragraph, text)
+            if insert_after:
+                anchor.addnext(paragraph)
+                anchor = paragraph
+            else:
+                anchor.addprevious(paragraph)
 
     if not changed_parts:
         return payload

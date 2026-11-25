@@ -14,6 +14,20 @@ async function read<T>(path: string, options?: RequestInit): Promise<T> {
 
 type SaveScope = "shared" | "document";
 
+const skipReasons = {
+  ambiguous: "The same wording appears more than once.",
+  detached: "This paragraph is excluded from shared edits.",
+  protected: "The edit crosses protected Word content.",
+  source_detached: "The source paragraph is excluded from shared edits.",
+  source_protected: "The source edit crosses protected Word content.",
+};
+
+interface SkippedDocument {
+  document_id: string;
+  document_name: string;
+  reasons: (keyof typeof skipReasons)[];
+}
+
 interface Props {
   documentId: string;
   toolbarTarget: HTMLElement | null;
@@ -25,6 +39,7 @@ export default function LocalOfficeEditor({ documentId, toolbarTarget, onGenerat
   const [scope, setScope] = useState<SaveScope>("shared");
   const [saveMessage, setSaveMessage] = useState("");
   const [saveOperation, setSaveOperation] = useState("");
+  const [skipped, setSkipped] = useState<SkippedDocument[]>([]);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
   const [scopeBusy, setScopeBusy] = useState(false);
@@ -58,7 +73,7 @@ export default function LocalOfficeEditor({ documentId, toolbarTarget, onGenerat
       try {
         const params = new URLSearchParams({ after_operation: lastOperation });
         const progress = await read<{
-          save: EditorGenerationResponse | null;
+          save: (EditorGenerationResponse & { skipped_documents?: SkippedDocument[] }) | null;
           saving?: boolean;
           save_error?: string;
         }>(
@@ -71,6 +86,7 @@ export default function LocalOfficeEditor({ documentId, toolbarTarget, onGenerat
         if (!save) return;
         lastOperation = save.generation_id;
         setSaveOperation(save.generation_id);
+        setSkipped(save.skipped_documents ?? []);
         const related = (save.affected_documents ?? []).filter((document) => document.id !== documentId);
         setSaveMessage(related.length
           ? `Saved. Shared paragraphs updated in ${related.map((document) => document.name).join(", ")}.`
@@ -105,6 +121,7 @@ export default function LocalOfficeEditor({ documentId, toolbarTarget, onGenerat
       });
       setScope(result.save_scope);
       setSaveMessage("");
+      setSkipped([]);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
@@ -142,6 +159,20 @@ export default function LocalOfficeEditor({ documentId, toolbarTarget, onGenerat
           ? "Save to sync matching files."
           : "Save in ONLYOFFICE to update this file."}
       </span>
+      {!saving && !saveError && skipped.length > 0 && <>
+        <button type="button" className="quiet-button sync-skip-button"
+          popoverTarget={`sync-skips-${documentId}`}>
+          Skipped matches ({skipped.length})
+        </button>
+        <div id={`sync-skips-${documentId}`} className="file-actions-popover sync-skip-list" popover="auto">
+          <ul>
+            {skipped.map((file) => <li key={file.document_id}>
+              <strong>{file.document_name}</strong>
+              <span>{file.reasons.map((reason) => skipReasons[reason]).join(" ")}</span>
+            </li>)}
+          </ul>
+        </div>
+      </>}
     </div>, toolbarTarget)}
     {(saveError || error) && <p className="local-office-error" role="alert">{saveError || error}</p>}
     <iframe
