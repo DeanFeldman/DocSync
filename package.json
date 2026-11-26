@@ -29,7 +29,7 @@
     "smoke:api:win": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-packaged-backend.ps1"
   },
   "devDependencies": {
-    "electron": "43.1.1",
+    "electron": "43.8.13",
     "electron-builder": "26.15.3"
   },
   "build": {
@@ -51,7 +51,9 @@
       {
         "from": "apps/api/dist/docsync-api",
         "to": "phase2-api",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       },
       {
         "from": "apps/api/scripts/render_docx_to_pdf.ps1",
@@ -64,11 +66,23 @@
       {
         "from": "apps/web/dist",
         "to": "web",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "scripts/start-installed-onlyoffice.ps1",
+        "to": "onlyoffice/start-installed-onlyoffice.ps1"
+      },
+      {
+        "from": "scripts/onlyoffice-wsl-relay.cjs",
+        "to": "onlyoffice/onlyoffice-wsl-relay.cjs"
       }
     ],
-   "win": {
-      "target": ["nsis"],
+    "win": {
+      "target": [
+        "nsis"
+      ],
       "icon": "build/icon.ico"
     },
     "nsis": {

@@ -36,12 +36,10 @@ SHA256SUMS.txt
 
 ## Local ONLYOFFICE editor
 
-Selecting a file opens the embedded editor. Use the desktop launcher with
-the built web bundle. DocSync requires a trusted local
-ONLYOFFICE Docs service that can reach DocSync on `127.0.0.1`. Configure the
-document service to allow connections to that loopback address and enable its
-browser and callback JWT signatures with the same secret. Set these environment
-variables before launching the desktop app:
+Selecting a file opens the embedded editor. The installer requires a separate
+trusted local ONLYOFFICE Docs service. See the [Windows setup guide](docs/local-onlyoffice-windows.md)
+for configuring the service and opening the installed app. To launch a built
+source checkout with a service already configured, run:
 
 ```powershell
 $env:DOCSYNC_ONLYOFFICE_URL = 'http://127.0.0.1:8080'
@@ -58,12 +56,12 @@ with that property. The standard installer does not bundle this dependency.
 With **Matching files** selected, click **Save** in ONLYOFFICE to save the
 edited file and update unambiguous paragraph matches in the set. Matching
 compares wording while ignoring spacing differences. Deleting a shared
-paragraph clears its wording in the other files and preserves their layout.
-**This file only** saves the current file. The toolbar shows the files
-updated by each save. New paragraphs sync as text at a matching insertion
-point. A uniquely matching preceding paragraph can identify the spot before
-a file-specific paragraph. Formatting-only changes stay
-in the file you edited.
+paragraph removes it from matching locations where DocSync can safely do so.
+New paragraphs and list items sync at matching insertion points, and each
+matching list continues its own numbering. **Review table deletions** lets you
+choose whether to remove corresponding tables that contain file-specific text.
+**This file only** saves the current file. The toolbar shows updated files and
+identifiable skipped matches. Formatting-only changes stay in the file you edited.
 
 ## Local workspaces and manual transfers
 

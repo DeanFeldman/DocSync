@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -36,9 +37,10 @@ jobs:
         run: python -m pip install -r apps/api/requirements-build.txt
 
       - name: Set version from Git tag
+        if: github.event_name == 'push'
         shell: pwsh
         run: |
-          $version = "${{ github.ref_name }}".TrimStart("v")
+          $version = $env:GITHUB_REF_NAME.TrimStart("v")
 
           if (-not $version) {
             throw "Could not determine the version from the Git tag."
@@ -57,16 +59,7 @@ jobs:
         run: npm test
 
       - name: Build the web app and frozen Windows backend
-        shell: pwsh
-        env:
-          VITE_SUPABASE_URL: ${{ vars.VITE_SUPABASE_URL }}
-          VITE_SUPABASE_PUBLISHABLE_KEY: ${{ vars.VITE_SUPABASE_PUBLISHABLE_KEY }}
-          DOCUMENTSYNC_SUPABASE_URL: ${{ vars.VITE_SUPABASE_URL }}
-        run: |
-          if (-not $env:VITE_SUPABASE_URL -or -not $env:VITE_SUPABASE_PUBLISHABLE_KEY) {
-            throw "VITE_SUPABASE_URL and VITE_SUPABASE_PUBLISHABLE_KEY repository variables are required for a release build."
-          }
-          npm run build:desktop
+        run: npm run build:desktop
 
       - name: Smoke test the exact frozen backend
         run: npm run smoke:api:win
@@ -115,12 +108,23 @@ jobs:
           Write-Host "Versioned installer: $($installer.Name)"
           Write-Host "Latest installer: DocSync-Setup-latest.exe"
 
+      - name: Upload release candidate
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: DocSync-Windows-release-candidate
+          path: |
+            release/v1/DocSync-Setup-*.exe
+            release/v1/SHA256SUMS.txt
+          if-no-files-found: error
+
       - name: Publish GitHub release
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = "${{ github.ref_name }}"
+          $tag = $env:GITHUB_REF_NAME
           $version = $tag.TrimStart("v")
           $releaseDirectory = "release/v1"
           $releaseNotes = "docs/v$version-release-notes.md"
