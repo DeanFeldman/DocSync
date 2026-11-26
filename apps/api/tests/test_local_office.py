@@ -580,7 +580,8 @@ def test_local_office_deletes_only_complete_matching_tables(tmp_path, monkeypatc
 
 
 def test_local_office_asks_before_deleting_table_with_file_specific_text(tmp_path, monkeypatch):
-    app = _load_test_app(tmp_path, monkeypatch)
+    workspace = tmp_path / ("nested-release-workspace-" + "x" * 65)
+    app = _load_test_app(workspace, monkeypatch)
     office = importlib.import_module("app.local_office")
     monkeypatch.setenv("DOCSYNC_ONLYOFFICE_URL", "http://127.0.0.1:8080")
     monkeypatch.setenv("DOCSYNC_ONLYOFFICE_SECRET", "local-document-server-test-secret")
@@ -653,6 +654,7 @@ def test_local_office_asks_before_deleting_table_with_file_specific_text(tmp_pat
         assert [version["document_id"] for version in result["versions"]] == [docs["Approved.docx"]["id"]]
         new = {row["name"]: row for row in result["document_set"]["documents"]}
         assert not read_doc(new["Approved.docx"]).tables
+        assert client.get(result["download_url"]).status_code == 200
         assert new["Kept.docx"]["version_id"] == current["Kept.docx"]["version_id"]
         assert new["Source.docx"]["version_id"] == current["Source.docx"]["version_id"]
         assert client.get(history_url).json() == []

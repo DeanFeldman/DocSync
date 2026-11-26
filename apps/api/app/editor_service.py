@@ -30,6 +30,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from .config import settings
 from .document_service import body_tables, unwrap_smart_tags
+from .filesystem import disk_path
 from .models import (
     DocumentBlockRevision,
     DocumentElement,
@@ -201,8 +202,8 @@ def _canonical_hash(value: object) -> str:
 def _safe_storage_path(storage_area: str, storage_name: str) -> Path:
     if storage_area not in {"originals", "generated"}:
         raise HTTPException(status_code=500, detail="Document version storage is invalid.")
-    root = (settings.data_dir / storage_area).resolve()
-    path = (root / storage_name).resolve()
+    root = disk_path(settings.data_dir / storage_area).resolve()
+    path = disk_path(root / storage_name).resolve()
     if path != root and root not in path.parents:
         raise HTTPException(status_code=500, detail="Document version storage is invalid.")
     return path
@@ -3829,9 +3830,7 @@ def _save_document_copy(
                 copies.append((related_document, related_head, content))
 
             operation_id = new_id()
-            generated_root = (
-                settings.data_dir / "generated" / document.document_set_id
-            )
+            generated_root = disk_path(settings.data_dir / "generated" / document.document_set_id)
             generated_root.mkdir(parents=True, exist_ok=True)
             candidate_staging_directory = (
                 generated_root / f".{operation_id}.staging"
@@ -3981,7 +3980,7 @@ def _save_document_copy(
             _rebuild_exact_link_groups(session, document.document_set_id)
             session.flush()
             for copy_document, _, _ in copies:
-                rendered_pdf_path(copy_document).unlink(missing_ok=True)
+                disk_path(rendered_pdf_path(copy_document)).unlink(missing_ok=True)
             if office_session_version_id is None:
                 refreshed = serialize_document_set(
                     get_document_set_or_404(session, document.document_set_id)
@@ -4046,12 +4045,8 @@ def editor_operation_download_path(
     operation = session.get(EditorOperation, operation_id)
     if operation is None or operation.status != "completed":
         raise HTTPException(status_code=404, detail="Editor generation not found.")
-    path = (
-        settings.data_dir
-        / "generated"
-        / operation.document_set_id
-        / operation.id
-        / "current-documents.zip"
+    path = _safe_storage_path(
+        "generated", f"{operation.document_set_id}/{operation.id}/current-documents.zip",
     )
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Generated ZIP file is missing.")

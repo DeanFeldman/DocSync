@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session, selectinload
 from datetime import datetime, timezone
 
 from .config import settings
+from .filesystem import disk_path
 from .audit_logger import AuditLogger
 from .backup_service import DocumentBackupService
 from .error_mapper import ErrorMapper, DocuSyncError
@@ -708,7 +709,7 @@ def _prepare_imported_versions(
         record, working_document, working_elements
     )
     storage_name = f"{record['document_set_id']}/{version_id}.docx"
-    path = settings.data_dir / "generated" / storage_name
+    path = disk_path(settings.data_dir / "generated" / storage_name)
     path.parent.mkdir(parents=True, exist_ok=True)
     generated_paths.append(path)
     path.write_bytes(converted)
@@ -751,7 +752,7 @@ async def create_document_set(
     }
     document_set_id = new_id()
     created_at = datetime.now(timezone.utc)
-    original_dir = settings.data_dir / "originals" / document_set_id
+    original_dir = disk_path(settings.data_dir / "originals" / document_set_id)
     seen_names: set[str] = set()
     prepared: list[
         tuple[
@@ -801,7 +802,7 @@ async def create_document_set(
         for original_name, payload, parsed_document, extracted in prepared:
             document_id = new_id()
             stored_name = f"{document_set_id}/{document_id}.docx"
-            target = settings.data_dir / "originals" / stored_name
+            target = original_dir / f"{document_id}.docx"
             target.write_bytes(payload)
             document_row = {
                 "id": document_id,
@@ -923,7 +924,7 @@ async def add_documents_to_set(
 
             document_id = new_id()
             stored_name = f"{document_set.id}/{document_id}.docx"
-            target = settings.data_dir / "originals" / stored_name
+            target = disk_path(settings.data_dir / "originals" / stored_name)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(payload)
             created_paths.append(target)
@@ -959,7 +960,7 @@ async def add_documents_to_set(
             imported_versions, head_row, current_revision_rows, current_element_rows = (
                 _prepare_imported_versions(
                     record_row, parsed_document, current_element_rows,
-                    settings.data_dir / "originals" / record_row["stored_name"], created_paths,
+                    disk_path(settings.data_dir / "originals" / record_row["stored_name"]), created_paths,
                 )
             )
             document_rows.append(record_row)

@@ -5,7 +5,6 @@ from __future__ import annotations
 from contextlib import closing
 import hashlib
 import json
-import os
 from pathlib import Path
 import re
 import shutil
@@ -14,6 +13,7 @@ from tempfile import TemporaryDirectory
 from uuid import uuid4
 import zipfile
 
+from .filesystem import disk_path as _disk_path
 from .snapshot_service import (
     DATABASE_NAME,
     INCLUDED_DIRECTORIES,
@@ -84,16 +84,6 @@ def _inspect_workspace(
             }
     except sqlite3.Error as error:
         raise SnapshotError("invalid_database", "The backup is missing required workspace records.") from error
-
-
-def _disk_path(path: Path) -> Path:
-    absolute = path.absolute()
-    if os.name != "nt":
-        return absolute
-    value = str(absolute)
-    if value.startswith("\\\\?\\"):
-        return absolute
-    return Path("\\\\?\\UNC\\" + value[2:] if value.startswith("\\\\") else "\\\\?\\" + value)
 
 
 def _write_file(archive: zipfile.ZipFile, name: str, source: Path, limit: int) -> dict:

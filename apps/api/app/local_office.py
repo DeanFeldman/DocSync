@@ -31,6 +31,7 @@ from .editor_service import (
     save_reviewed_office_tables,
     serialize_editor_generation_status,
 )
+from .filesystem import disk_path
 from .models import DocumentRecord, EditorOperation
 from .office_related import sync_related_paragraphs
 from .text_inventory_service import apply_text_replacements, build_text_inventory
@@ -98,7 +99,7 @@ def _callback_claims(token: str) -> dict:
 
 
 def _directory(version_id: str) -> Path:
-    return settings.data_dir / "onlyoffice-drafts" / hashlib.sha256(version_id.encode()).hexdigest()
+    return disk_path(settings.data_dir / "onlyoffice-drafts" / hashlib.sha256(version_id.encode()).hexdigest())
 
 
 def _read_key(version_id: str, supplied: str | None = None) -> str:
