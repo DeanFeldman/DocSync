@@ -3712,7 +3712,58 @@ def restore_document_version(
     request: VersionRestoreRequest,
 ) -> dict:
     """Copy a historical immutable version into a new current version."""
+    return _save_document_copy(session, document_id, request.expected_current_version_id,
+                               target_version_id=target_version_id)
 
+
+def save_office_document_versions(
+    session: Session,
+    document_id: str,
+    expected_version_id: str,
+    editor_version_id: str,
+    content: bytes,
+    related: dict[str, tuple[str, bytes]],
+    skipped: list[dict],
+    table_review: list[dict],
+) -> None:
+    _save_document_copy(
+        session,
+        document_id,
+        expected_version_id,
+        edited_content=content,
+        office_session_version_id=editor_version_id,
+        related=related,
+        office_skipped=skipped,
+        office_table_review=table_review,
+    )
+
+
+
+def save_reviewed_office_tables(session: Session, changes: dict[str, tuple[str, bytes]]) -> dict:
+    document_id, (version_id, content) = next(iter(changes.items()))
+    related = {key: value for key, value in changes.items() if key != document_id}
+    result = _save_document_copy(
+        session, document_id, version_id, edited_content=content, related=related, queue_preview=False,
+    )
+    return {
+        **serialize_editor_generation_status(session, result["operation_id"]),
+        "document_set": result["document_set"],
+    }
+
+
+def _save_document_copy(
+    session: Session,
+    document_id: str,
+    expected_version_id: str,
+    *,
+    target_version_id: str | None = None,
+    edited_content: bytes | None = None,
+    office_session_version_id: str | None = None,
+    related: dict[str, tuple[str, bytes]] | None = None,
+    office_skipped: list[dict] | None = None,
+    office_table_review: list[dict] | None = None,
+    queue_preview: bool = True,
+) -> dict:
     with EDITOR_GENERATION_LOCK:
         committed = False
         staging_directory: Path | None = None
@@ -3722,8 +3773,8 @@ def restore_document_version(
             if document is None:
                 raise HTTPException(status_code=404, detail="Document not found.")
 
-            target_version = get_version_or_404(session, target_version_id)
-            if target_version.document_id != document.id:
+            target_version = get_version_or_404(session, target_version_id) if target_version_id else None
+            if target_version is not None and target_version.document_id != document.id:
                 raise HTTPException(
                     status_code=422,
                     detail="The version to restore does not belong to this document.",
@@ -3736,21 +3787,47 @@ def restore_document_version(
                     status_code=500,
                     detail="Document version head is missing.",
                 )
-            if head.current_version_id != request.expected_current_version_id:
+            if head.current_version_id != expected_version_id:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail=(
                         f"{document.original_name} changed after version history was "
                         "opened. Reload the current version and try again."
+                        if target_version else
+                        "The current version changed. Reopen the latest version before applying the saved copy."
                     ),
                 )
-            if target_version.id == current_version.id:
+            if target_version is not None and target_version.id == current_version.id:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail="The selected version is already current.",
                 )
 
-            source_path = document_version_path(target_version)
+            if target_version is None:
+                if edited_content is None:
+                    raise ValueError("A document version or a saved copy is required.")
+                source_content = edited_content
+                restoration = {}
+            else:
+                source_content = document_version_path(target_version).read_bytes()
+                restoration = {
+                    "restored_from_version_id": target_version.id,
+                    "restored_from_version_number": target_version.version_number,
+                }
+
+            copies = [(document, head, source_content)]
+            for related_id, (base_id, content) in (related or {}).items():
+                related_head = session.get(DocumentHead, related_id)
+                related_document = session.get(DocumentRecord, related_id)
+                if (
+                    related_head is None
+                    or related_head.current_version_id != base_id
+                    or related_document is None
+                    or related_document.document_set_id != document.document_set_id
+                ):
+                    raise HTTPException(409, "A matching document changed. Save again to check the latest version.")
+                copies.append((related_document, related_head, content))
+
             operation_id = new_id()
             generated_root = (
                 settings.data_dir / "generated" / document.document_set_id
@@ -3771,26 +3848,39 @@ def restore_document_version(
             candidate_staging_directory.mkdir(parents=False, exist_ok=False)
             staging_directory = candidate_staging_directory
 
-            highest_version_number = int(
-                session.scalar(
-                    select(func.max(DocumentVersion.version_number)).where(
-                        DocumentVersion.document_id == document.id
-                    )
-                )
-                or 0
-            )
-            next_version_number = highest_version_number + 1
-
             from .document_service import safe_download_name
 
-            output_name = safe_download_name(
-                f"{Path(document.original_name).stem}-v{next_version_number}.docx"
-            )
-            staging_path = staging_directory / output_name
-            shutil.copyfile(source_path, staging_path)
-            _load_docx(staging_path)
-            checksum = _sha256(staging_path.read_bytes())
-            result_version_id = new_id()
+            staged_paths = {}
+            prepared_documents = {}
+            versions = {}
+            for copy_document, copy_head, payload in copies:
+                highest_version_number = session.scalar(
+                    select(func.max(DocumentVersion.version_number)).where(
+                        DocumentVersion.document_id == copy_document.id
+                    )
+                ) or 0
+                next_version_number = highest_version_number + 1
+                download_name = safe_download_name(
+                    f"{Path(copy_document.original_name).stem}-v{next_version_number}.docx"
+                )
+                version_id = new_id()
+                output_name = download_name if copy_document.id == document.id else f"{version_id}.docx"
+                staging_path = staging_directory / output_name
+                staging_path.write_bytes(payload)
+                prepared_documents[copy_document.id] = _load_docx(staging_path)
+                staged_paths[copy_document.id] = staging_path
+                versions[copy_document.id] = DocumentVersion(
+                    id=version_id,
+                    document_id=copy_document.id,
+                    parent_version_id=copy_head.current_version_id,
+                    generation_id=None,
+                    editor_operation_id=operation_id,
+                    version_number=next_version_number,
+                    storage_area="generated",
+                    storage_name=f"{document.document_set_id}/{operation_id}/{output_name}",
+                    download_name=download_name,
+                    checksum_sha256=_sha256(payload),
+                )
 
             zip_path = staging_directory / "current-documents.zip"
             with zipfile.ZipFile(
@@ -3809,13 +3899,11 @@ def restore_document_version(
                     )
                 )
                 for current_document in documents:
-                    archive_path = (
-                        staging_path
-                        if current_document.id == document.id
-                        else document_version_path(
+                    archive_path = staged_paths.get(current_document.id)
+                    if archive_path is None:
+                        archive_path = document_version_path(
                             current_version_for_document(session, current_document)
                         )
-                    )
                     archive.write(
                         archive_path,
                         arcname=safe_download_name(current_document.original_name),
@@ -3828,18 +3916,31 @@ def restore_document_version(
             operation = EditorOperation(
                 id=operation_id,
                 document_set_id=document.document_set_id,
-                operation_type="version_restore",
+                operation_type="version_restore" if target_version else "external_edit",
                 status="completed",
                 stage="completed",
                 expected_head_revision=head.revision,
                 preview_json={
                     "document_id": document.id,
                     "document_name": document.original_name,
-                    "restored_from_version_id": target_version.id,
-                    "restored_from_version_number": target_version.version_number,
+                    **restoration,
                     "previous_current_version_id": current_version.id,
-                    "result_version_id": result_version_id,
-                    "expected_current_version_id": request.expected_current_version_id,
+                    "result_version_id": versions[document.id].id,
+                    "expected_current_version_id": expected_version_id,
+                    **({
+                        "office_session_version_id": office_session_version_id,
+                        "office_skipped": office_skipped or [],
+                        "office_table_review": [
+                            {
+                                **file,
+                                "version_id": versions[file["document_id"]].id
+                                if file["document_id"] in versions else file["version_id"],
+                            }
+                            for file in office_table_review or []
+                        ],
+                    } if office_session_version_id else {}),
+                    "affected_document_ids": [item.id for item, _, _ in copies],
+                    "affected_document_names": [item.original_name for item, _, _ in copies],
                     "writes_performed": True,
                     "status": "completed",
                 },
@@ -3848,34 +3949,26 @@ def restore_document_version(
             session.add(operation)
             session.flush()
 
-            version = DocumentVersion(
-                id=result_version_id,
-                document_id=document.id,
-                parent_version_id=current_version.id,
-                generation_id=None,
-                editor_operation_id=operation.id,
-                version_number=next_version_number,
-                storage_area="generated",
-                storage_name=(
-                    f"{document.document_set_id}/{operation.id}/{output_name}"
-                ),
-                download_name=output_name,
-                checksum_sha256=checksum,
-            )
-            session.add(version)
+            session.add_all(versions.values())
             session.flush()
-
-            location_to_element = _replace_current_elements_and_create_revisions(
-                session,
-                document=document,
-                version=version,
-                source_path=final_directory / output_name,
-                base_version_id=target_version.id,
-            )
-
-            head.current_version_id = version.id
-            head.revision += 1
-            head.updated_at = utc_now()
+            location_to_element = {}
+            for copy_document, copy_head, _ in copies:
+                copy_version = versions[copy_document.id]
+                locations = _replace_current_elements_and_create_revisions(
+                    session,
+                    document=copy_document,
+                    version=copy_version,
+                    source_path=final_directory / staged_paths[copy_document.id].name,
+                    prepared_docx=prepared_documents[copy_document.id],
+                    base_version_id=(
+                        target_version.id if target_version is not None else copy_version.parent_version_id
+                    ),
+                )
+                if copy_document.id == document.id:
+                    location_to_element = locations
+                copy_head.current_version_id = copy_version.id
+                copy_head.revision += 1
+                copy_head.updated_at = utc_now()
             session.flush()
 
             from .document_service import (
@@ -3887,14 +3980,19 @@ def restore_document_version(
 
             _rebuild_exact_link_groups(session, document.document_set_id)
             session.flush()
-            refreshed = serialize_document_set(
-                get_document_set_or_404(session, document.document_set_id)
-            )
-            rendered_pdf_path(document).unlink(missing_ok=True)
+            for copy_document, _, _ in copies:
+                rendered_pdf_path(copy_document).unlink(missing_ok=True)
+            if office_session_version_id is None:
+                refreshed = serialize_document_set(
+                    get_document_set_or_404(session, document.document_set_id)
+                )
             session.commit()
             committed = True
 
-            preview_jobs = _queue_previews_safely(session, [version.id])
+            if office_session_version_id is not None:
+                return {}
+            version = versions[document.id]
+            preview_jobs = _queue_previews_safely(session, [version.id]) if queue_preview else []
 
             return {
                 "operation_id": operation.id,
@@ -3903,8 +4001,7 @@ def restore_document_version(
                 "status": operation.status,
                 "document_id": document.id,
                 "document_name": document.original_name,
-                "restored_from_version_id": target_version.id,
-                "restored_from_version_number": target_version.version_number,
+                **restoration,
                 "previous_current_version_id": current_version.id,
                 "version": {
                     "id": version.id,
@@ -3913,8 +4010,7 @@ def restore_document_version(
                     "version_id": version.id,
                     "version_number": version.version_number,
                     "parent_version_id": version.parent_version_id,
-                    "restored_from_version_id": target_version.id,
-                    "restored_from_version_number": target_version.version_number,
+                    **restoration,
                     "checksum_sha256": version.checksum_sha256,
                     "created_at": utc_isoformat(version.created_at),
                     "status": "completed",

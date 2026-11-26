@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from io import BytesIO
 import hashlib
+import re
 from pathlib import Path
 import posixpath
 import unicodedata
@@ -96,6 +97,14 @@ class TextNodeSpan:
     role: str = "ordinary"
 
 
+@dataclass(frozen=True)
+class ParagraphNumbering:
+    num_id: str
+    level: str
+    is_bullet: bool
+    style_id: str | None
+
+
 @dataclass
 class DocumentTextSegment:
     segment_id: str
@@ -111,6 +120,7 @@ class DocumentTextSegment:
     searchable_by_default: bool = True
     element_id: str | None = None
     revision_id: str | None = None
+    numbering: ParagraphNumbering | None = None
 
     @property
     def editable(self) -> bool:
@@ -129,7 +139,10 @@ class DocumentTextSegment:
             if not span.editable and span.logical_end > span.logical_start
         ]
 
-    def editability_for_range(self, start: int, end: int) -> tuple[bool, str | None]:
+    def editability_for_range(
+        self, start: int, end: int, *,
+        allow_whitespace_deletion: bool = False, allow_soft_breaks: bool = False,
+    ) -> tuple[bool, str | None]:
         if start < 0 or end <= start or end > len(self.text):
             return False, "The selected occurrence is outside its logical text segment."
         intersecting = [
@@ -137,9 +150,16 @@ class DocumentTextSegment:
             for span in self.spans
             if span.logical_start < end and span.logical_end > start
         ]
-        if not intersecting:
+        if not intersecting or (allow_soft_breaks and not any(span.editable for span in intersecting)):
             return False, "The selected occurrence cannot be mapped back to OOXML text nodes."
-        protected = next((span for span in intersecting if not span.editable), None)
+        protected = next((
+            span for span in intersecting if not span.editable
+            and not (
+                (allow_whitespace_deletion or allow_soft_breaks)
+                and span.role == "ordinary"
+                and span.node_kind in {"tab", "line_break"}
+            )
+        ), None)
         if protected is not None:
             return False, protected.read_only_reason or (
                 "This text is inside a structure that DocSync can detect but cannot "
@@ -216,6 +236,17 @@ class TextReplacementPatch:
     match_end: int
     expected_text: str
     replacement_text: str
+    allow_whitespace_deletion: bool = False
+    allow_soft_breaks: bool = False
+
+
+@dataclass(frozen=True)
+class ParagraphInsertion:
+    previous_id: str | None
+    next_id: str | None
+    empty_ids: tuple[str, ...]
+    texts: tuple[str, ...]
+    numbering: tuple[ParagraphNumbering | None, ...]
 
 
 @dataclass
@@ -228,6 +259,17 @@ class CompiledTextReplacementPlan:
         tuple[str, tuple[int, ...]],
         list[tuple[int, int, str, str]],
     ]
+    node_removals: set[tuple[str, tuple[int, ...]]]
+    soft_break_nodes: set[tuple[str, tuple[int, ...]]]
+
+
+@dataclass(frozen=True)
+class DocumentTable:
+    node_path: tuple[int, ...]
+    index: int
+    signature: tuple
+    wording: frozenset[str]
+    removable: bool
 
 
 @dataclass
@@ -236,6 +278,7 @@ class DocumentTextInventory:
     version_id: str
     package_sha256: str
     segments: list[DocumentTextSegment] = field(default_factory=list)
+    body_tables: list[DocumentTable] = field(default_factory=list)
 
     @property
     def by_id(self) -> dict[str, DocumentTextSegment]:
@@ -634,7 +677,10 @@ def _visible_atom_value(node: etree._Element) -> tuple[str, str, bool, str | Non
     if node.tag == W_TAB:
         return "\t", "tab", False, PROTECTED_SPECIAL_CHARACTER
     if node.tag in {W_BR, W_CR}:
-        return "\n", "line_break", False, PROTECTED_SPECIAL_CHARACTER
+        kind = "line_break"
+        if node.tag == W_BR and node.get(_qname(WORD_NS, "type"), "textWrapping") != "textWrapping":
+            kind = "layout_break"
+        return "\n", kind, False, PROTECTED_SPECIAL_CHARACTER
     if node.tag == W_NO_BREAK_HYPHEN:
         return "\u2011", "no_break_hyphen", False, PROTECTED_SPECIAL_CHARACTER
     if node.tag == W_SOFT_HYPHEN:
@@ -656,6 +702,7 @@ def _paragraph_segments(
     *,
     document_id: str,
     version_id: str,
+    include_empty_paragraphs: bool,
 ) -> list[DocumentTextSegment]:
     structure_type, location = _paragraph_location(part, paragraph, paragraph_number)
     visible_values: list[str] = []
@@ -770,7 +817,7 @@ def _paragraph_segments(
         suffix: str,
     ) -> None:
         text_value = "".join(values)
-        if not text_value:
+        if not text_value and not (include_empty_paragraphs and suffix == "visible"):
             return
         identity = (
             f"docsync:text-segment:{version_id}:{part.path}:"
@@ -875,11 +922,124 @@ def _drawing_segments(
     return segments
 
 
+class _ParagraphLists:
+    def __init__(self, files: dict[str, bytes]) -> None:
+        self.nums = {}
+        self.abstracts = {}
+        self.styles = {}
+        for name, tag, id_name, index in (
+            ("numbering", "num", "numId", self.nums),
+            ("numbering", "abstractNum", "abstractNumId", self.abstracts),
+            ("styles", "style", "styleId", self.styles),
+        ):
+            path = f"word/{name}.xml"
+            if path in files:
+                root = _parse_xml(files[path], path)
+                index.update({
+                    node.get(_qname(WORD_NS, id_name)): node
+                    for node in root.findall(_qname(WORD_NS, tag))
+                })
+
+    def numbering(self, paragraph: etree._Element) -> ParagraphNumbering | None:
+        style_id = next(iter(paragraph.xpath("./w:pPr/w:pStyle/@w:val", namespaces=NS)), None)
+        num_ids = paragraph.xpath("./w:pPr/w:numPr/w:numId/@w:val", namespaces=NS)
+        levels = paragraph.xpath("./w:pPr/w:numPr/w:ilvl/@w:val", namespaces=NS)
+        style_key = style_id
+        seen = set()
+        while not num_ids and style_key in self.styles and style_key not in seen:
+            seen.add(style_key)
+            style = self.styles[style_key]
+            num_ids = style.xpath("./w:pPr/w:numPr/w:numId/@w:val", namespaces=NS)
+            levels = levels or style.xpath("./w:pPr/w:numPr/w:ilvl/@w:val", namespaces=NS)
+            style_key = next(iter(style.xpath("./w:basedOn/@w:val", namespaces=NS)), None)
+        if not num_ids or num_ids[0] == "0":
+            return None
+        num_id = num_ids[0]
+        num = self.nums.get(num_id)
+        if num is None:
+            return None
+        abstract_id = next(iter(num.xpath("./w:abstractNumId/@w:val", namespaces=NS)), None)
+        abstract = self.abstracts.get(abstract_id)
+        if abstract is None:
+            return None
+        if not levels and style_id:
+            levels = abstract.xpath("./w:lvl[w:pStyle/@w:val = $style]/@w:ilvl", namespaces=NS, style=style_id)
+        level = levels[0] if levels else "0"
+        formats = num.xpath(
+            "./w:lvlOverride[@w:ilvl = $level]/w:lvl/w:numFmt/@w:val", namespaces=NS, level=level,
+        ) or abstract.xpath("./w:lvl[@w:ilvl = $level]/w:numFmt/@w:val", namespaces=NS, level=level)
+        if not formats or formats[0] == "none":
+            return None
+        return ParagraphNumbering(num_id, level, formats[0] == "bullet", style_id)
+
+
+def _table_signature(table: etree._Element) -> tuple:
+    def cell_signature(cell: etree._Element) -> tuple:
+        merge = tuple(
+            (etree.QName(node).localname, node.get(_qname(WORD_NS, "val"), "continue"))
+            for node in cell.xpath("./w:tcPr/*[self::w:gridSpan or self::w:vMerge or self::w:hMerge]", namespaces=NS)
+        )
+        blocks = []
+        for block in cell:
+            if block.tag == W_P:
+                blocks.append(_table_paragraph_wording(block))
+            elif block.tag == W_TBL:
+                blocks.append(_table_signature(block))
+        return merge, tuple(blocks)
+
+    return tuple(
+        tuple(cell_signature(cell) for cell in row.findall(W_TC))
+        for row in table.findall(W_TR)
+    )
+
+
+def _table_paragraph_wording(paragraph: etree._Element) -> str:
+    return " ".join("".join(
+        node.text or "" if node.tag == W_T else " "
+        for node in paragraph.iter(W_T, W_BR, W_CR, W_TAB)
+    ).split())
+
+
+def _body_tables(part: _ParsedPart) -> list[DocumentTable]:
+    body = part.root.find(W_BODY)
+    if body is None:
+        return []
+    tables = []
+    linked_bookmarks = set(part.root.xpath(".//w:hyperlink/@w:anchor", namespaces=NS))
+    for index, table in enumerate(body.findall(W_TBL)):
+        paragraphs = list(table.iter(W_P))
+        # Restrict shared removal to ordinary tables. Fields, tracked changes,
+        # drawings, bookmarks and wrapped rows or cells can carry local data.
+        starts = table.xpath(".//w:bookmarkStart", namespaces=NS)
+        start_ids = [node.get(_qname(WORD_NS, "id")) for node in starts]
+        end_ids = table.xpath(".//w:bookmarkEnd/@w:id", namespaces=NS)
+        local_bookmarks = (
+            None not in start_ids
+            and sorted(start_ids) == sorted(end_ids)
+            and not any(node.get(_qname(WORD_NS, "name")) in linked_bookmarks for node in starts)
+        )
+        removable = local_bookmarks and not table.xpath(
+            "./*[not(self::w:tblPr or self::w:tblGrid or self::w:tr)] | "
+            ".//w:tbl/*[not(self::w:tblPr or self::w:tblGrid or self::w:tr)] | "
+            ".//w:tr/*[not(self::w:trPr or self::w:tblPrEx or self::w:tc)] | "
+            ".//w:tc/*[not(self::w:tcPr or self::w:p or self::w:tbl)]",
+            namespaces=NS,
+        ) and all(_removable_paragraph(paragraph, inside_table_removal=True) for paragraph in paragraphs)
+        tables.append(DocumentTable(
+            _node_path(part.root, table), index, _table_signature(table),
+            frozenset(filter(None, map(_table_paragraph_wording, paragraphs))), removable,
+        ))
+    return tables
+
+
 def build_text_inventory(
     source: Path | bytes,
     *,
     document_id: str,
     version_id: str,
+    include_empty_paragraphs: bool = False,
+    include_paragraph_lists: bool = False,
+    include_body_tables: bool = False,
 ) -> DocumentTextInventory:
     payload = _read_source(source)
     try:
@@ -899,17 +1059,20 @@ def build_text_inventory(
         version_id=version_id,
         package_sha256=hashlib.sha256(payload).hexdigest(),
     )
+    lists = _ParagraphLists(files) if include_paragraph_lists else None
     for part in _inventory_parts(files):
+        if include_body_tables and part.path == 'word/document.xml':
+            inventory.body_tables = _body_tables(part)
         for paragraph_number, paragraph in enumerate(part.root.iter(W_P)):
-            inventory.segments.extend(
-                _paragraph_segments(
-                    part,
-                    paragraph,
-                    paragraph_number,
-                    document_id=document_id,
-                    version_id=version_id,
-                )
+            segments = _paragraph_segments(
+                part, paragraph, paragraph_number, document_id=document_id, version_id=version_id,
+                include_empty_paragraphs=include_empty_paragraphs,
             )
+            if segments and lists is not None and segments[0].structure_type not in {
+                "field_instruction", "tracked_delete",
+            }:
+                segments[0].numbering = lists.numbering(paragraph)
+            inventory.segments.extend(segments)
         inventory.segments.extend(
             _drawing_segments(
                 part,
@@ -1053,6 +1216,8 @@ def compile_text_replacement_plan(
 ) -> CompiledTextReplacementPlan:
     by_segment = inventory.by_id
     node_edits: dict[tuple[str, tuple[int, ...]], list[tuple[int, int, str, str]]] = {}
+    node_removals: set[tuple[str, tuple[int, ...]]] = set()
+    soft_break_nodes: set[tuple[str, tuple[int, ...]]] = set()
     logical_ranges: dict[str, list[tuple[int, int, str]]] = {}
 
     for patch in patches:
@@ -1073,6 +1238,8 @@ def compile_text_replacement_plan(
         editable, reason = segment.editability_for_range(
             patch.match_start,
             patch.match_end,
+            allow_whitespace_deletion=patch.allow_whitespace_deletion and not patch.replacement_text,
+            allow_soft_breaks=patch.allow_soft_breaks,
         )
         if not editable:
             raise HTTPException(status_code=422, detail=reason)
@@ -1100,25 +1267,139 @@ def compile_text_replacement_plan(
             if span.logical_start < patch.match_end
             and span.logical_end > patch.match_start
         ]
-        for index, span in enumerate(intersecting):
+        replacement = patch.replacement_text
+        for span in intersecting:
+            if not span.editable:
+                node_removals.add((segment.part_path, span.node_path))
+                continue
             local_start = max(patch.match_start, span.logical_start) - span.logical_start
             local_end = min(patch.match_end, span.logical_end) - span.logical_start
-            replacement = patch.replacement_text if index == 0 else ""
-            node_edits.setdefault((segment.part_path, span.node_path), []).append(
-                (local_start, local_end, replacement, patch.occurrence_id)
-            )
+            node_key = (segment.part_path, span.node_path)
+            node_edits.setdefault(node_key, []).append((local_start, local_end, replacement, patch.occurrence_id))
+            if patch.allow_soft_breaks and ("\n" in replacement or "\t" in replacement):
+                soft_break_nodes.add(node_key)
+            replacement = ""
 
     return CompiledTextReplacementPlan(
         patch_count=len(patches),
         segment_count=len(logical_ranges),
         node_edits=node_edits,
+        node_removals=node_removals,
+        soft_break_nodes=soft_break_nodes,
     )
+
+
+def _paragraph_insertion_nodes(roots, by_segment, insertion: ParagraphInsertion):
+    previous = by_segment[insertion.previous_id] if insertion.previous_id else None
+    following = by_segment[insertion.next_id] if insertion.next_id else None
+    anchor = previous or following
+    slots = [by_segment[item] for item in insertion.empty_ids]
+    segments = [item for item in (previous, *slots, following) if item is not None]
+    if not anchor or any(item.part_path != anchor.part_path for item in segments):
+        return None
+
+    root = roots[anchor.part_path]
+    nodes = [_resolve_node(root, item.node_path) for item in segments]
+    parent = nodes[0].getparent()
+    if parent.tag not in {_qname(WORD_NS, "body"), W_TC, _qname(WORD_NS, "hdr"), _qname(WORD_NS, "ftr")}:
+        return None
+    if any(node.tag != W_P or node.getparent() is not parent for node in nodes):
+        return None
+    if any(left.getnext() is not right for left, right in zip(nodes, nodes[1:])):
+        return None
+
+    if previous is None:
+        sibling = nodes[0].getprevious()
+        if sibling is not None and sibling.tag != _qname(WORD_NS, "tcPr"):
+            return None
+    if following is None:
+        sibling = nodes[-1].getnext()
+        if sibling is not None and sibling.tag != _qname(WORD_NS, "sectPr"):
+            return None
+
+    slot_nodes = nodes[int(previous is not None):int(previous is not None) + len(slots)]
+    if any(node.xpath(
+        "./*[not(self::w:pPr or self::w:r)] | ./w:pPr/w:sectPr | "
+        "./w:r/*[not(self::w:rPr or self::w:t)] | ./w:r/w:t[normalize-space(.) != '']",
+        namespaces=NS,
+    ) for node in slot_nodes):
+        return None
+    return anchor.part_path, nodes[0] if previous is not None else nodes[-1], previous is not None, slot_nodes
+
+
+def _removable_paragraph(node: etree._Element, *, inside_table_removal: bool = False) -> bool:
+    parent = node.getparent()
+    bookmarks = " or self::w:bookmarkStart or self::w:bookmarkEnd" if inside_table_removal else ""
+    hyphens = " or self::w:softHyphen or self::w:noBreakHyphen" if inside_table_removal else ""
+    return node.tag == W_P and parent.tag in {
+        _qname(WORD_NS, "body"), W_TC, _qname(WORD_NS, "hdr"), _qname(WORD_NS, "ftr"),
+    } and not node.xpath(
+        f"./*[not(self::w:pPr or self::w:r{bookmarks})] | ./w:pPr/w:sectPr | "
+        f"./w:r/*[not(self::w:rPr or self::w:t or self::w:tab or self::w:cr{hyphens} or "
+        "self::w:br[not(@w:type) or @w:type = 'textWrapping'])]",
+        namespaces=NS,
+    )
+
+
+def _append_word_text(run: etree._Element, text: str, index: int) -> None:
+    for part in re.split(r"([\t\n])", text):
+        if not part:
+            continue
+        if part in {"\t", "\n"}:
+            node = etree.Element(W_TAB if part == "\t" else W_BR)
+        else:
+            node = etree.Element(W_T)
+            node.set(_qname(XML_NS, "space"), "preserve")
+            node.text = part
+        run.insert(index, node)
+        index += 1
+
+
+def _write_inserted_paragraph(
+    paragraph: etree._Element, text: str, numbering: ParagraphNumbering | None,
+) -> None:
+    if numbering is not None:
+        # Apply the target document's numbering instance and level. A source
+        # numId can point to an entirely different list in another DOCX.
+        properties_tag = _qname(WORD_NS, "pPr")
+        properties = paragraph.find(properties_tag)
+        if properties is None:
+            properties = etree.Element(properties_tag)
+            paragraph.insert(0, properties)
+        style = properties.find(_qname(WORD_NS, "pStyle"))
+        if style is None and numbering.style_id:
+            style = etree.Element(_qname(WORD_NS, "pStyle"))
+            style.set(_qname(WORD_NS, "val"), numbering.style_id)
+            properties.insert(0, style)
+        # This is the position of numPr in CT_PPrBase, after widowControl.
+        preceding = {"pStyle", "keepNext", "keepLines", "pageBreakBefore", "framePr", "widowControl"}
+        num_properties = properties.find(_qname(WORD_NS, "numPr"))
+        if num_properties is None:
+            num_properties = etree.Element(_qname(WORD_NS, "numPr"))
+            index = next(
+                (i for i, child in enumerate(properties) if etree.QName(child).localname not in preceding),
+                len(properties),
+            )
+            properties.insert(index, num_properties)
+        else:
+            num_properties.clear()
+        for tag, value in (("ilvl", numbering.level), ("numId", numbering.num_id)):
+            etree.SubElement(num_properties, _qname(WORD_NS, tag)).set(_qname(WORD_NS, "val"), value)
+    if not text:
+        return
+    run = etree.SubElement(paragraph, _qname(WORD_NS, "r"))
+    _append_word_text(run, text, 0)
 
 
 def apply_text_replacements(
     source: Path | bytes,
     inventory: DocumentTextInventory,
     patches: list[TextReplacementPatch],
+    *,
+    insertions: tuple[ParagraphInsertion, ...] = (),
+    paragraph_removals: tuple[str, ...] = (),
+    table_removals: tuple[DocumentTable, ...] = (),
+    skipped_structures: list[str] | None = None,
 ) -> bytes:
     payload = _read_source(source)
     if hashlib.sha256(payload).hexdigest() != inventory.package_sha256:
@@ -1141,16 +1422,43 @@ def apply_text_replacements(
         raise HTTPException(status_code=422, detail="The immutable DOCX package is invalid.") from exc
 
     roots: dict[str, etree._Element] = {}
-    for part_path, _node_path_value in node_edits:
-        if part_path not in roots:
-            part_payload = files.get(part_path)
-            if part_payload is None:
-                raise HTTPException(
-                    status_code=409,
-                    detail="A target Word XML part is no longer present. Re-scan required.",
-                )
-            roots[part_path] = _parse_xml(part_payload, part_path)
+    changed_parts = {part for part, _ in node_edits.keys() | plan.node_removals}
+    by_segment = inventory.by_id
+    insertion_parts = {by_segment[item.previous_id or item.next_id].part_path for item in insertions}
+    removal_parts = {by_segment[item].part_path for item in paragraph_removals}
+    if table_removals:
+        removal_parts.add("word/document.xml")
+    for part_path in changed_parts | insertion_parts | removal_parts:
+        part_payload = files.get(part_path)
+        if part_payload is None:
+            raise HTTPException(
+                status_code=409,
+                detail="A target Word XML part is no longer present. Re-scan required.",
+            )
+        roots[part_path] = _parse_xml(part_payload, part_path)
 
+    prepared_insertions = []
+    for insertion in insertions:
+        nodes = _paragraph_insertion_nodes(roots, by_segment, insertion)
+        if nodes is not None:
+            prepared_insertions.append((nodes, tuple(zip(insertion.texts, insertion.numbering, strict=True))))
+        elif skipped_structures is not None:
+            skipped_structures.append(insertion.previous_id or insertion.next_id)
+
+    prepared_removals = []
+    for segment_id in paragraph_removals:
+        segment = by_segment[segment_id]
+        node = _resolve_node(roots[segment.part_path], segment.node_path)
+        if _removable_paragraph(node):
+            prepared_removals.append((segment.part_path, node))
+        elif skipped_structures is not None:
+            skipped_structures.append(segment_id)
+
+    removed_tables = [
+        _resolve_node(roots["word/document.xml"], table.node_path) for table in table_removals
+    ]
+
+    soft_break_nodes = []
     for (part_path, node_path_value), edits in node_edits.items():
         node = _resolve_node(roots[part_path], node_path_value)
         original = node.text or ""
@@ -1171,12 +1479,65 @@ def apply_text_replacements(
             current = current[:start] + replacement + current[end:]
             last_start = start
         node.text = current
+        if (part_path, node_path_value) in plan.soft_break_nodes:
+            soft_break_nodes.append(node)
         if node.tag in {W_T, W_DEL_TEXT, W_INSTR_TEXT} and (
             current.startswith(" ") or current.endswith(" ")
         ):
             node.set(_qname(XML_NS, "space"), "preserve")
 
-    modified_files = {path: _serialize_xml(root) for path, root in roots.items()}
+    removed_nodes = [_resolve_node(roots[part], path) for part, path in plan.node_removals]
+    for node in removed_nodes:
+        node.getparent().remove(node)
+
+    for node in soft_break_nodes:
+        run = node.getparent()
+        index = run.index(node)
+        _append_word_text(run, node.text or "", index)
+        run.remove(node)
+
+    for (part_path, anchor, insert_after, slots), items in prepared_insertions:
+        changed_parts.add(part_path)
+        if slots:
+            for paragraph, (text, numbering) in zip(slots, items):
+                _write_inserted_paragraph(paragraph, text, numbering)
+            for paragraph in slots[len(items):]:
+                paragraph.getparent().remove(paragraph)
+            if items:
+                anchor = slots[min(len(slots), len(items)) - 1]
+            insert_after = True
+        for text, numbering in items[len(slots):]:
+            paragraph = etree.Element(W_P)
+            _write_inserted_paragraph(paragraph, text, numbering)
+            if insert_after:
+                anchor.addnext(paragraph)
+                anchor = paragraph
+            else:
+                anchor.addprevious(paragraph)
+
+    for part_path, paragraph in prepared_removals:
+        parent = paragraph.getparent()
+        if parent.tag == W_TC and parent[-1] is paragraph and (
+            len(parent) == 1 or parent[-2].tag != W_P
+        ):
+            # A table cell must end in a paragraph, including after a nested table.
+            for run in paragraph.findall(_qname(WORD_NS, "r")):
+                paragraph.remove(run)
+        else:
+            parent.remove(paragraph)
+        changed_parts.add(part_path)
+
+    for table in removed_tables:
+        table.getparent().remove(table)
+    if removed_tables:
+        changed_parts.add("word/document.xml")
+        body = roots["word/document.xml"].find(W_BODY)
+        if not any(node.tag != _qname(WORD_NS, "sectPr") for node in body):
+            body.insert(0, etree.Element(W_P))
+
+    if not changed_parts:
+        return payload
+    modified_files = {path: _serialize_xml(roots[path]) for path in changed_parts}
     output = BytesIO()
     with zipfile.ZipFile(output, mode="w") as target_archive:
         with zipfile.ZipFile(BytesIO(payload)) as source_archive:

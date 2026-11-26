@@ -112,6 +112,19 @@ export async function addDocumentsToSet(
   return parseResponse<DocumentSetResponse>(response);
 }
 
+export async function renameDocumentInSet(
+  documentSetId: string,
+  documentId: string,
+  name: string,
+): Promise<{ id: string; name: string }> {
+  const response = await fetch(`${API_URL}/document-sets/${documentSetId}/documents/${documentId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
+  return parseResponse<{ id: string; name: string }>(response);
+}
+
 export async function removeDocumentFromSet(
   documentSetId: string,
   documentId: string,

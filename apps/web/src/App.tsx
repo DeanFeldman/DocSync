@@ -1,7 +1,6 @@
 import {
   ChangeEvent,
   FormEvent,
-  KeyboardEvent as ReactKeyboardEvent,
   useEffect,
   useMemo,
   useRef,
@@ -16,22 +15,20 @@ import {
   fetchEditorGeneration,
   fetchEditorGenerationJobs,
   removeDocumentFromSet,
-  searchDocumentSet,
+  renameDocumentInSet,
   uploadDocumentSet,
+  versionDownloadUrl,
 } from "./api";
 import type {
   DocumentSetLibraryItem,
   DocumentSetResponse,
-  DocumentSearchTarget,
   DocumentSummary,
+  DocumentVersionRestoreResponse,
   EditorGenerationResponse,
-  FindReplaceOccurrence,
-  GlobalSearchResponse,
-  GlobalSearchResult,
 } from "./types";
 
-import DocumentExperience from "./DocumentExperience";
-import FindReplacePanel from "./FindReplacePanel";
+import DocumentVersionHistory from "./DocumentVersionHistory";
+import LocalOfficeEditor from "./LocalOfficeEditor";
 import DocSyncData from "./DocSyncData";
 import { useConfirmation } from "./ConfirmationDialog";
 import { useDismissibleMenu } from "./useDismissibleMenu";
@@ -54,6 +51,7 @@ type BusyAction =
   | "open-set"
   | "add-documents"
   | "remove-document"
+  | "rename-document"
   | "delete-set"
   | null;
 
@@ -63,24 +61,10 @@ type CreationStage =
   | "editor-preparation"
   | "workspace"
   | null;
-type WorkspacePanel = "find" | "pending" | null;
-
-type NewerVersionNotice = {
-  document: DocumentSummary;
-  jobId: string;
-};
-
 function readableBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-function elementLabel(elementType: string): string {
-  if (elementType === "list_item") return "List item";
-  if (elementType === "table_cell") return "Table cell";
-  if (elementType === "table_paragraph") return "Table paragraph";
-  return elementType.charAt(0).toUpperCase() + elementType.slice(1);
 }
 
 function mergeGenerationJobs(
@@ -94,35 +78,6 @@ function mergeGenerationJobs(
       (right.submitted_at ?? "").localeCompare(left.submitted_at ?? ""),
     )
     .slice(0, 20);
-}
-
-type ElementLocation = {
-  element_type: string;
-  paragraph_index: number;
-  table_index?: number;
-  row_index?: number;
-  column_index?: number;
-};
-
-function elementLocation(element: ElementLocation): string {
-  if (
-    ["table_cell", "table_paragraph"].includes(element.element_type) &&
-    element.table_index !== undefined &&
-    element.row_index !== undefined &&
-    element.column_index !== undefined
-  ) {
-    return `Table ${element.table_index + 1} · Row ${element.row_index + 1} · Column ${
-      element.column_index + 1
-    }${
-      element.element_type === "table_paragraph"
-        ? ` · Paragraph ${element.paragraph_index + 1}`
-        : ""
-    }`;
-  }
-
-  return `${elementLabel(element.element_type)} · Paragraph ${
-    element.paragraph_index + 1
-  }`;
 }
 
 function readableDate(value: string): string {
@@ -149,43 +104,23 @@ const [setNameTouched, setSetNameTouched] = useState(false);
   const [libraryLoading, setLibraryLoading] = useState(true);
   const [libraryError, setLibraryError] = useState("");
   const [openingSetId, setOpeningSetId] = useState("");
-  const [globalSearchQuery, setGlobalSearchQuery] = useState("");
-  const [globalSearchResults, setGlobalSearchResults] = useState<GlobalSearchResult[]>([]);
-  const [globalSearchSummary, setGlobalSearchSummary] = useState<
-    Pick<GlobalSearchResponse, "result_count" | "document_count" | "truncated">
-  >({
-    result_count: 0,
-    document_count: 0,
-    truncated: false,
-  });
-  const [globalSearchLoading, setGlobalSearchLoading] = useState(false);
-  const [globalSearchRefreshToken, setGlobalSearchRefreshToken] = useState(0);
-  const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
-  const [documentSearchTarget, setDocumentSearchTarget] =
-    useState<DocumentSearchTarget | null>(null);
   const [activeDocumentId, setActiveDocumentId] = useState("");
+  const [historyDocumentId, setHistoryDocumentId] = useState("");
+  const [editorReset, setEditorReset] = useState(0);
+  const [restoreNotice, setRestoreNotice] = useState("");
+  const [filesCollapsed, setFilesCollapsed] = useState(false);
+  const [officeToolbar, setOfficeToolbar] = useState<HTMLDivElement | null>(null);
+  const [renameTarget, setRenameTarget] = useState<DocumentSummary | null>(null);
+  const [renameName, setRenameName] = useState("");
+  const [renameError, setRenameError] = useState("");
+  const renameDialog = useRef<HTMLDialogElement>(null);
+  const renameInput = useRef<HTMLInputElement>(null);
   const [busyAction, setBusyAction] = useState<BusyAction>(null);
   const [creationStage, setCreationStage] = useState<CreationStage>(null);
   const [error, setError] = useState("");
-  const [editorDirty, setEditorDirty] = useState(false);
-  const [workspacePanel, setWorkspacePanel] = useState<WorkspacePanel>(null);
-  const [pendingChangeCount, setPendingChangeCount] = useState(0);
-  const [generationJobs, setGenerationJobs] = useState<
-    EditorGenerationResponse[]
-  >([]);
-  const [newerVersionNotice, setNewerVersionNotice] =
-    useState<NewerVersionNotice | null>(null);
-  const [deferredDocumentUpdates, setDeferredDocumentUpdates] = useState<
-    Record<string, DocumentSummary>
-  >({});
+  const [generationJobs, setGenerationJobs] = useState<EditorGenerationResponse[]>([]);
   const addDocumentsInputRef = useRef<HTMLInputElement>(null);
-  const globalSearchInputRef = useRef<HTMLInputElement>(null);
-  const globalSearchContainerRef = useRef<HTMLDivElement>(null);
-  const documentSearchRequestRef = useRef(0);
-  const activeDocumentIdRef = useRef(activeDocumentId);
   const handledGenerationJobsRef = useRef(new Set<string>());
-
-  activeDocumentIdRef.current = activeDocumentId;
 
   useEffect(() => {
     applyTheme(theme);
@@ -206,16 +141,14 @@ const [setNameTouched, setSetNameTouched] = useState(false);
   }, [documentSet?.id]);
 
   useEffect(() => {
-    if (!globalSearchOpen) return;
-
-    function dismissSearch(event: PointerEvent) {
-      const search = globalSearchContainerRef.current;
-      if (search && !event.composedPath().includes(search)) setGlobalSearchOpen(false);
+    if (!documentSet?.id) return;
+    function dismissFileActions() {
+      document.querySelector<HTMLElement>(".file-actions-popover:popover-open")?.hidePopover();
     }
+    window.addEventListener("blur", dismissFileActions);
+    return () => window.removeEventListener("blur", dismissFileActions);
+  }, [documentSet?.id]);
 
-    document.addEventListener("pointerdown", dismissSearch, true);
-    return () => document.removeEventListener("pointerdown", dismissSearch, true);
-  }, [globalSearchOpen]);
 
   function selectThemePreference(preference: ThemePreference) {
     persistThemePreference(preference);
@@ -235,38 +168,7 @@ const [setNameTouched, setSetNameTouched] = useState(false);
     () => documentSet?.documents.find((document) => document.id === activeDocumentId) ?? null,
     [activeDocumentId, documentSet],
   );
-
-  const globalSearchScopeKey = useMemo(
-    () =>
-      documentSet?.documents
-        .map(
-          (document) =>
-            `${document.id}:${document.current_version_id ?? document.version_id}`,
-        )
-        .join("|") ?? "",
-    [documentSet],
-  );
-
-  const globalSearchGroups = useMemo(() => {
-    const groups = new Map<
-      string,
-      {
-        documentId: string;
-        documentName: string;
-        results: GlobalSearchResult[];
-      }
-    >();
-    for (const result of globalSearchResults) {
-      const group = groups.get(result.document_id) ?? {
-        documentId: result.document_id,
-        documentName: result.document_name,
-        results: [],
-      };
-      group.results.push(result);
-      groups.set(result.document_id, group);
-    }
-    return Array.from(groups.values());
-  }, [globalSearchResults]);
+  const historyDocument = documentSet?.documents.find((file) => file.id === historyDocumentId);
 
   const setNameError =
   setNameTouched && setName.trim() === ""
@@ -372,75 +274,6 @@ const [setNameTouched, setSetNameTouched] = useState(false);
 
 
   useEffect(() => {
-    const query = globalSearchQuery.trim();
-    if (!documentSet || query.length < 2) {
-      setGlobalSearchResults([]);
-      setGlobalSearchSummary({
-        result_count: 0,
-        document_count: 0,
-        truncated: false,
-      });
-      setGlobalSearchLoading(false);
-      setGlobalSearchOpen(false);
-      return;
-    }
-
-    let cancelled = false;
-    const controller = new AbortController();
-    setGlobalSearchResults([]);
-    setGlobalSearchSummary({
-      result_count: 0,
-      document_count: 0,
-      truncated: false,
-    });
-    setGlobalSearchLoading(true);
-    const timeout = window.setTimeout(async () => {
-      try {
-        const response = await searchDocumentSet(
-          documentSet.id,
-          query,
-          controller.signal,
-        );
-        if (!cancelled) {
-          setGlobalSearchResults(response.results);
-          setGlobalSearchSummary({
-            result_count: response.result_count,
-            document_count: response.document_count,
-            truncated: response.truncated,
-          });
-          setGlobalSearchOpen(true);
-        }
-      } catch (caught) {
-        if (controller.signal.aborted) return;
-        if (!cancelled) {
-          setGlobalSearchResults([]);
-          setGlobalSearchSummary({
-            result_count: 0,
-            document_count: 0,
-            truncated: false,
-          });
-          setError(
-            caught instanceof Error ? caught.message : "The document-set search failed.",
-          );
-        }
-      } finally {
-        if (!cancelled) setGlobalSearchLoading(false);
-      }
-    }, 250);
-
-    return () => {
-      cancelled = true;
-      controller.abort();
-      window.clearTimeout(timeout);
-    };
-  }, [
-    documentSet?.id,
-    globalSearchQuery,
-    globalSearchRefreshToken,
-    globalSearchScopeKey,
-  ]);
-
-  useEffect(() => {
     if (!window.history.state?.view) {
       window.history.replaceState({ view: "home" }, "");
     }
@@ -455,11 +288,6 @@ const [setNameTouched, setSetNameTouched] = useState(false);
     return () => window.removeEventListener("popstate", handlePopState);
   }, []);
 
-  function handleGenerationQueued(job: EditorGenerationResponse) {
-    handledGenerationJobsRef.current.delete(job.generation_id);
-    setGenerationJobs((current) => mergeGenerationJobs(current, [job]));
-  }
-
   function handleGenerationJobSettled(job: EditorGenerationResponse) {
     if (job.status !== "completed") {
       return;
@@ -472,29 +300,6 @@ const [setNameTouched, setSetNameTouched] = useState(false);
         job.versions?.map((version) => version.document_id) ??
         [],
     );
-    const updatedActiveDocument = documentUpdates.find(
-      (item) => item.id === activeDocumentIdRef.current && affectedIds.has(item.id),
-    );
-    const currentActiveDocument = documentSet?.documents.find(
-      (item) => item.id === activeDocumentIdRef.current,
-    );
-    if (
-      updatedActiveDocument &&
-      currentActiveDocument &&
-      editorDirty &&
-      (updatedActiveDocument.current_version_id ?? updatedActiveDocument.version_id) !==
-        (currentActiveDocument.current_version_id ?? currentActiveDocument.version_id)
-    ) {
-      setDeferredDocumentUpdates((current) => ({
-        ...current,
-        [updatedActiveDocument.id]: updatedActiveDocument,
-      }));
-      setNewerVersionNotice({
-        document: updatedActiveDocument,
-        jobId: job.generation_id,
-      });
-    }
-
     if (updated || documentUpdates.length) {
       const workspaceId = updated?.id ?? documentSet?.id;
       if (!workspaceId) return;
@@ -508,12 +313,7 @@ const [setNameTouched, setSetNameTouched] = useState(false);
         );
         return {
           ...(updated ?? current),
-          documents: current.documents.map((item) => {
-            const replacement = updatedById.get(item.id) ?? item;
-            return editorDirty && item.id === activeDocumentIdRef.current && affectedIds.has(item.id)
-              ? item
-              : replacement;
-          }),
+          documents: current.documents.map((item) => updatedById.get(item.id) ?? item),
         };
       });
       setSavedSets((current) =>
@@ -529,29 +329,8 @@ const [setNameTouched, setSetNameTouched] = useState(false);
             : item,
         ),
       );
-      setGlobalSearchRefreshToken((current) => current + 1);
     }
 
-  }
-
-  function openNewerVersion(notice: NewerVersionNotice) {
-    setDocumentSet((current) =>
-      current
-        ? {
-            ...current,
-            documents: current.documents.map((item) =>
-              item.id === notice.document.id ? notice.document : item,
-            ),
-          }
-        : current,
-    );
-    setDeferredDocumentUpdates((current) => {
-      const next = { ...current };
-      delete next[notice.document.id];
-      return next;
-    });
-    setNewerVersionNotice(null);
-    setEditorDirty(false);
   }
 
   function resetWorkspace(updateHistory = true) {
@@ -566,19 +345,9 @@ const [setNameTouched, setSetNameTouched] = useState(false);
 
     setDocumentSet(null);
     setActiveDocumentId("");
+    setHistoryDocumentId("");
+    setRestoreNotice("");
     setFiles([]);
-    setGlobalSearchQuery("");
-    setGlobalSearchResults([]);
-    setGlobalSearchSummary({
-      result_count: 0,
-      document_count: 0,
-      truncated: false,
-    });
-    setGlobalSearchOpen(false);
-    setDocumentSearchTarget(null);
-    setEditorDirty(false);
-    setNewerVersionNotice(null);
-    setDeferredDocumentUpdates({});
     setError("");
   }
 
@@ -608,18 +377,6 @@ const [setNameTouched, setSetNameTouched] = useState(false);
 
     setDocumentSet(workspace);
     setActiveDocumentId(firstDocument?.id ?? "");
-    setGlobalSearchQuery("");
-    setGlobalSearchResults([]);
-    setGlobalSearchSummary({
-      result_count: 0,
-      document_count: 0,
-      truncated: false,
-    });
-    setGlobalSearchOpen(false);
-    setDocumentSearchTarget(null);
-    setEditorDirty(false);
-    setNewerVersionNotice(null);
-    setDeferredDocumentUpdates({});
   }
 
 async function handleUpload(event: FormEvent) {
@@ -735,6 +492,37 @@ async function handleUpload(event: FormEvent) {
     }
   }
 
+  useEffect(() => {
+    if (!renameTarget || !renameDialog.current || renameDialog.current.open) return;
+    renameDialog.current.showModal();
+    renameInput.current?.select();
+  }, [renameTarget]);
+
+  function closeRename() {
+    renameDialog.current?.close();
+    setRenameTarget(null);
+  }
+
+  async function handleRename(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!documentSet || !renameTarget || !renameName.trim() || busyAction) return;
+    const setId = documentSet.id;
+    setBusyAction("rename-document");
+    setRenameError("");
+    try {
+      const renamed = await renameDocumentInSet(setId, renameTarget.id, renameName);
+      setDocumentSet((current) => current?.id === setId ? {
+        ...current,
+        documents: current.documents.map((file) => file.id === renamed.id ? { ...file, name: renamed.name } : file),
+      } : current);
+      closeRename();
+    } catch (cause) {
+      setRenameError(cause instanceof Error ? cause.message : "The document could not be renamed.");
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
   async function handleRemoveDocument(document: DocumentSummary) {
     if (!documentSet) return;
     const confirmed = await confirm({
@@ -750,7 +538,6 @@ async function handleUpload(event: FormEvent) {
     try {
       const updated = await removeDocumentFromSet(documentSet.id, document.id);
       setDocumentSet(updated);
-      setDocumentSearchTarget(null);
       setSavedSets((current) =>
         current.map((item) =>
           item.id === updated.id
@@ -771,100 +558,19 @@ async function handleUpload(event: FormEvent) {
     }
   }
 
-  async function openGlobalSearchResult(result: GlobalSearchResult) {
-    if (!documentSet) return;
-    const targetDocument = documentSet.documents.find(
-      (document) => document.id === result.document_id,
-    );
-    if (!targetDocument) return;
-
-    setGlobalSearchOpen(false);
-    await openDocument(targetDocument, result);
-  }
-
-  function handleGlobalSearchResultKeyDown(
-    event: ReactKeyboardEvent<HTMLButtonElement>,
-  ) {
-    if (event.key === "Escape") {
-      event.preventDefault();
-      setGlobalSearchOpen(false);
-      globalSearchInputRef.current?.focus();
-      return;
-    }
-    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
-      return;
-    }
-
-    const buttons = Array.from(
-      globalSearchContainerRef.current?.querySelectorAll<HTMLButtonElement>(
-        ".global-search-result",
-      ) ?? [],
-    );
-    if (buttons.length === 0) return;
-    event.preventDefault();
-    const currentIndex = buttons.indexOf(event.currentTarget);
-    let nextIndex = currentIndex;
-    if (event.key === "ArrowDown") {
-      nextIndex = (currentIndex + 1) % buttons.length;
-    } else if (event.key === "ArrowUp") {
-      nextIndex = (currentIndex - 1 + buttons.length) % buttons.length;
-    } else if (event.key === "Home") {
-      nextIndex = 0;
-    } else if (event.key === "End") {
-      nextIndex = buttons.length - 1;
-    }
-    buttons[nextIndex]?.focus();
-  }
-
-  async function openDocument(
-    document: DocumentSummary,
-    searchResult: GlobalSearchResult | null = null,
-  ) {
-    const deferredDocument = deferredDocumentUpdates[document.id];
-    if (deferredDocument) {
-      setDocumentSet((current) =>
-        current
-          ? {
-              ...current,
-              documents: current.documents.map((item) =>
-                item.id === deferredDocument.id ? deferredDocument : item,
-              ),
-            }
-          : current,
-      );
-      setDeferredDocumentUpdates((current) => {
-        const next = { ...current };
-        delete next[document.id];
-        return next;
-      });
-    }
-
-    setEditorDirty(false);
+  function openDocument(document: DocumentSummary) {
     setError("");
-    setDocumentSearchTarget(
-      searchResult
-        ? {
-            request_id: ++documentSearchRequestRef.current,
-            document_id: searchResult.document_id,
-            element_id: searchResult.element_id,
-            query: globalSearchQuery.trim(),
-            occurrence_index: searchResult.occurrence_index,
-            match_start: searchResult.match_start,
-            match_end: searchResult.match_end,
-          }
-        : null,
-    );
-    setActiveDocumentId((deferredDocument ?? document).id);
+    setRestoreNotice("");
+    setActiveDocumentId(document.id);
   }
 
   function handleEditorGenerated(result: EditorGenerationResponse) {
     const updated = result.document_set;
-    setDocumentSearchTarget(null);
     if (updated) {
       for (const changedVersion of result.versions ?? []) {
         invalidateDocumentHeadResources(updated.id, changedVersion.document_id);
       }
-      setDocumentSet(updated);
+      setDocumentSet((current) => current?.id === updated.id ? updated : current);
       setSavedSets((current) =>
         current.map((item) =>
           item.id === updated.id
@@ -878,27 +584,41 @@ async function handleUpload(event: FormEvent) {
         ),
       );
     }
-    setEditorDirty(false);
   }
 
-const canUpload = files.length >= 2 && !busyAction;
+  function handleVersionRestored(result: DocumentVersionRestoreResponse) {
+    setHistoryDocumentId("");
+    handleEditorGenerated({
+      ...result,
+      generation_id: result.generation_id ?? result.operation_id,
+      versions: [result.version],
+    });
+    if (result.document_id === activeDocumentId) setEditorReset((value) => value + 1);
+    setRestoreNotice(`Restored version ${result.restored_from_version_number} of ${result.document_name} as version ${result.version.version_number}.`);
+  }
+
+  const canUpload = files.length >= 2 && !busyAction;
   return (
     <div className={`app-shell ${documentSet ? "workspace-mode" : ""}`}>
       <header className="topbar">
-        <a className="brand" href="#top" aria-label="DocSync home">
-          <span className="brand-mark" aria-hidden="true">DS</span>
-          <span><strong>DocSync</strong><small>Local-first documents</small></span>
-        </a>
-
-        {/* <p className="hero-text">
-                View uploaded Word documents in the browser, choose an exact shared element,
-                review every target, and create new versions without touching the originals.
-              </p> */}
-{/*
-              <p className="hero-copy">
-                <h1> DocSync</h1>
-
-              </p> */}
+        {documentSet ? (
+          <button type="button" className="danger-button"
+            disabled={Boolean(busyAction)}
+            onClick={() => void handleDeleteDocumentSet({
+              id: documentSet.id,
+              name: documentSet.name,
+              created_at: documentSet.created_at,
+              document_count: documentSet.documents.length,
+              edit_count: savedSets.find((item) => item.id === documentSet.id)?.edit_count ?? 0,
+            })}>
+            Delete set
+          </button>
+        ) : (
+          <a className="brand" href="#top" aria-label="DocSync home">
+            <span className="brand-mark" aria-hidden="true">DS</span>
+            <span><strong>DocSync</strong><small>Local-first documents</small></span>
+          </a>
+        )}
 
         <div className="topbar-actions">
           <span
@@ -926,6 +646,40 @@ const canUpload = files.length >= 2 && !busyAction;
           )}
         </div>
       </header>
+
+      {historyDocument && <DocumentVersionHistory
+        key={historyDocument.id}
+        document={historyDocument}
+        onClose={() => setHistoryDocumentId("")}
+        onRestored={handleVersionRestored}
+      />}
+
+      {renameTarget && <dialog
+        ref={renameDialog}
+        className="workspace-confirmation"
+        aria-labelledby="rename-document-title"
+        onCancel={(event) => {
+          event.preventDefault();
+          if (busyAction !== "rename-document") closeRename();
+        }}
+        onClick={(event) => {
+          if (event.target === event.currentTarget && busyAction !== "rename-document") closeRename();
+        }}
+      >
+        <form className="workspace-confirmation-content rename-file-form" onSubmit={(event) => void handleRename(event)}>
+          <h2 id="rename-document-title">Rename file</h2>
+          <label>
+            File name
+            <input ref={renameInput} autoFocus required value={renameName} maxLength={250}
+              onChange={(event) => setRenameName(event.target.value)} disabled={busyAction === "rename-document"} />
+          </label>
+          {renameError && <p role="alert">{renameError}</p>}
+          <div className="workspace-confirmation-actions">
+            <button type="button" className="quiet-button" onClick={closeRename} disabled={busyAction === "rename-document"}>Cancel</button>
+            <button type="submit" className="primary-button" disabled={!renameName.trim() || busyAction === "rename-document"}>Rename</button>
+          </div>
+        </form>
+      </dialog>}
 
       {!documentSet ? (
         <main id="top">
@@ -1126,161 +880,26 @@ const canUpload = files.length >= 2 && !busyAction;
       ) : (
         <main id="top" className="phase-two-main">
           <section className="workspace-heading" aria-labelledby="workspace-title">
-            <div>
-              <p className="eyebrow">Document set</p>
-              <h1 id="workspace-title">{documentSet.name}</h1>
-            </div>
-
-            <div className="workspace-heading-actions">
-              <div
-                className="global-set-search"
-                role="search"
-                ref={globalSearchContainerRef}
-                onBlur={(event) => {
-                  if (
-                    !event.currentTarget.contains(
-                      event.relatedTarget as Node | null,
-                    )
-                  ) {
-                    setGlobalSearchOpen(false);
-                  }
-                }}
-              >
-                <label htmlFor="global-document-search" className="sr-only">
-                  Search all documents in this set
-                </label>
-                <input
-                  id="global-document-search"
-                  type="search"
-                  ref={globalSearchInputRef}
-                  value={globalSearchQuery}
-                  onChange={(event) => setGlobalSearchQuery(event.target.value)}
-                  onFocus={() => setGlobalSearchOpen(true)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Escape" && globalSearchOpen) {
-                      event.preventDefault();
-                      setGlobalSearchOpen(false);
-                    } else if (event.key === "ArrowDown") {
-                      const firstResult =
-                        globalSearchContainerRef.current?.querySelector<HTMLButtonElement>(
-                          ".global-search-result",
-                        );
-                      if (firstResult) {
-                        event.preventDefault();
-                        firstResult.focus();
-                      }
-                    }
-                  }}
-                  placeholder="Search all documents"
-                  aria-expanded={globalSearchOpen}
-                  aria-controls="global-search-results"
-                />
-                {globalSearchLoading && <span className="global-search-status">Searching…</span>}
-                {globalSearchOpen && globalSearchQuery.trim().length >= 2 && (
-                  <div
-                    id="global-search-results"
-                    className="global-search-results"
-                    aria-live="polite"
-                    aria-label="Search results across all documents"
-                  >
-                    {globalSearchLoading ? (
-                      <div className="global-search-empty">
-                        Searching every current document…
-                      </div>
-                    ) : globalSearchResults.length === 0 ? (
-                      <div className="global-search-empty">
-                        No occurrences in this document set.
-                      </div>
-                    ) : (
-                      <>
-                        <header className="global-search-summary">
-                          <div>
-                            <strong>
-                              {globalSearchSummary.result_count}{" "}
-                              {globalSearchSummary.result_count === 1
-                                ? "occurrence"
-                                : "occurrences"}
-                            </strong>
-                            <span>
-                              across {globalSearchSummary.document_count}{" "}
-                              {globalSearchSummary.document_count === 1
-                                ? "document"
-                                : "documents"}
-                            </span>
-                          </div>
-                          <small>All current versions</small>
-                        </header>
-                        {globalSearchGroups.map((group) => (
-                          <section
-                            className="global-search-document-group"
-                            key={group.documentId}
-                            aria-label={`${group.documentName}: ${group.results.length} occurrences`}
-                          >
-                            <header>
-                              <strong>{group.documentName}</strong>
-                              <span>{group.results.length}</span>
-                            </header>
-                            <div>
-                              {group.results.map((result) => (
-                                <button
-                                  type="button"
-                                  className="global-search-result"
-                                  key={result.result_id}
-                                  onClick={() =>
-                                    void openGlobalSearchResult(result)
-                                  }
-                                  onKeyDown={
-                                    handleGlobalSearchResultKeyDown
-                                  }
-                                  aria-label={`Open occurrence ${result.occurrence_index} in ${result.document_name}, ${elementLocation(result)}`}
-                                >
-                                  <span className="global-search-snippet">
-                                    {result.context_before}
-                                    <mark>{result.matched_text}</mark>
-                                    {result.context_after}
-                                  </span>
-                                  <small>{elementLocation(result)}</small>
-                                </button>
-                              ))}
-                            </div>
-                          </section>
-                        ))}
-                        {globalSearchSummary.truncated && (
-                          <div className="global-search-warning">
-                            Some results were not returned by the document
-                            service. Refine the search to see them.
-                          </div>
-                        )}
-                      </>
-                    )}
-                  </div>
-                )}
-              </div>
-
-              <button type="button" className="toolbar-button" onClick={() => setWorkspacePanel("find")}>Find &amp; Replace</button>
-              <button type="button" className="toolbar-button pending-batch-button" onClick={() => setWorkspacePanel("pending")}>Pending changes <strong>{pendingChangeCount}</strong></button>
-
-              <div className="set-summary">
-                <strong>{documentSet.documents.length}</strong><span>docs ·</span>
-                <strong>{documentSet.link_group_count ?? documentSet.link_groups.length}</strong><span>groups</span>
-              </div>
-
+            <h1 id="workspace-title">
+              <span className="workspace-set-label">Document set:</span>
+              <span className="workspace-set-name" title={documentSet.name}>{documentSet.name}</span>
+            </h1>
+            <div className="workspace-heading-controls">
+              <div className="office-toolbar-slot" ref={setOfficeToolbar} />
               <button
                 type="button"
-                className="danger-button"
-                onClick={() =>
-                  void handleDeleteDocumentSet({
-                    id: documentSet.id,
-                    name: documentSet.name,
-                    created_at: documentSet.created_at,
-                    document_count: documentSet.documents.length,
-                    edit_count:
-                      savedSets.find((item) => item.id === documentSet.id)?.edit_count ?? 0,
-                  })
-                }
-                disabled={Boolean(busyAction)}
+                className="file-rail-toggle"
+                aria-expanded={!filesCollapsed}
+                aria-controls="document-file-list"
+                aria-label={filesCollapsed ? "Expand files" : "Collapse files"}
+                title={filesCollapsed ? "Expand files" : "Collapse files"}
+                onClick={() => {
+                  window.document.querySelector<HTMLElement>(".file-actions-popover:popover-open")?.hidePopover();
+                  setFilesCollapsed((collapsed) => !collapsed);
+                }}
               >
-                Delete set
+                <span className="file-rail-icon" aria-hidden="true" />
+                <span>Files</span>
               </button>
             </div>
           </section>
@@ -1289,94 +908,8 @@ const canUpload = files.length >= 2 && !busyAction;
             <ErrorAlert message={error} onDismiss={() => setError("")} />
           )}
 
-          <FindReplacePanel
-            documentSet={documentSet}
-            activeDocumentId={activeDocumentId}
-            panel={workspacePanel}
-            onPanelChange={setWorkspacePanel}
-            onPendingCountChange={setPendingChangeCount}
-            onGenerationQueued={handleGenerationQueued}
-            onOpenOccurrence={(occurrence: FindReplaceOccurrence) => {
-              const target = documentSet.documents.find(
-                (item) => item.id === occurrence.document_id,
-              );
-              if (!target) return;
-              void openDocument(
-                target,
-                occurrence.revision_id
-                  ? {
-                      result_id: occurrence.result_id,
-                      element_id: occurrence.element_id ?? occurrence.segment_id,
-                      document_id: occurrence.document_id,
-                      document_name: occurrence.document_name,
-                      version_id: occurrence.version_id,
-                      paragraph_index: Number(
-                        occurrence.location.paragraph_index ?? 0,
-                      ),
-                      element_type: occurrence.structure_type as GlobalSearchResult["element_type"],
-                      text: `${occurrence.context_before}${occurrence.matched_text}${occurrence.context_after}`,
-                      occurrence_index: 1,
-                      match_start: occurrence.match_start,
-                      match_end: occurrence.match_end,
-                      context_before: occurrence.context_before,
-                      matched_text: occurrence.matched_text,
-                      context_after: occurrence.context_after,
-                    }
-                  : null,
-              );
-            }}
-          />
-
-          {newerVersionNotice &&
-            newerVersionNotice.document.id === activeDocumentId && (
-              <section className="newer-version-notice" role="status" aria-live="polite">
-                <div>
-                  <strong>A newer version of this document is available.</strong>
-                  <span>Your current view and any draft were left unchanged.</span>
-                </div>
-                <div>
-                  <button
-                    type="button"
-                    className="primary-button"
-                    onClick={() => openNewerVersion(newerVersionNotice)}
-                  >
-                    Open new version
-                  </button>
-                  <button
-                    type="button"
-                    className="quiet-button"
-                    onClick={() => setNewerVersionNotice(null)}
-                  >
-                    Continue viewing current version
-                  </button>
-                </div>
-              </section>
-            )}
-
           <div className="document-workspace">
-            <aside className="file-rail" aria-labelledby="files-title">
-              <div className="rail-heading">
-                <span>Files</span>
-                <div className="rail-heading-actions">
-                  <small>{documentSet.documents.length}</small>
-                  <button
-                    type="button"
-                    className="rail-add-button"
-                    onClick={() => addDocumentsInputRef.current?.click()}
-                    disabled={Boolean(busyAction) || documentSet.documents.length >= 20}
-                  >
-                    + Add
-                  </button>
-                  <input
-                    ref={addDocumentsInputRef}
-                    type="file"
-                    accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                    multiple
-                    onChange={(event) => void handleAddDocuments(event)}
-                    className="sr-only"
-                  />
-                </div>
-              </div>
+            <aside id="document-file-list" className="file-rail" aria-label="Files" hidden={filesCollapsed}>
               <nav aria-labelledby="files-title">
                 <h2 id="files-title" className="sr-only">Documents in this set</h2>
                 {documentSet.documents.map((document) => (
@@ -1384,43 +917,101 @@ const canUpload = files.length >= 2 && !busyAction;
                     <button
                       type="button"
                       className={`file-tab ${document.id === activeDocumentId ? "active" : ""}`}
-                      onClick={() => void openDocument(document)}
+                      title={document.name}
+                      onClick={() => openDocument(document)}
                       aria-current={document.id === activeDocumentId ? "page" : undefined}
                     >
                       <span className="word-icon" aria-hidden="true">W</span>
                       <span>
                         <strong>{document.name}</strong>
-                        <small>{document.element_count} elements</small>
+                        <small>Version {document.version_number ?? 1}</small>
                       </span>
                     </button>
                     <button
                       type="button"
-                      className="file-remove-button"
-                      onClick={() => void handleRemoveDocument(document)}
-                      disabled={Boolean(busyAction) || documentSet.documents.length <= 2}
-                      aria-label={`Remove ${document.name} from this set`}
-                      title={
-                        documentSet.documents.length <= 2
-                          ? "A set must retain at least two documents"
-                          : `Remove ${document.name}`
-                      }
+                      className="file-actions-trigger"
+                      popoverTarget={`file-actions-${document.id}`}
+                      aria-label={`Options for ${document.name}`}
+                      title={`Options for ${document.name}`}
                     >
-                      ×
+                      <span aria-hidden="true">⋯</span>
                     </button>
+                    <div id={`file-actions-${document.id}`} popover="auto" className="file-actions-popover">
+                      <button
+                        type="button"
+                        disabled={Boolean(busyAction)}
+                        onClick={(event) => {
+                          event.currentTarget.closest<HTMLElement>("[popover]")?.hidePopover();
+                          setRenameName(document.name.replace(/\.docx$/i, ""));
+                          setRenameError("");
+                          setRenameTarget(document);
+                        }}
+                      >
+                        Rename…
+                      </button>
+                      <a
+                        href={document.download_url
+                          ? absoluteApiUrl(document.download_url)
+                          : versionDownloadUrl(document.current_version_id ?? document.version_id)}
+                        download
+                        onClick={(event) => event.currentTarget.closest<HTMLElement>("[popover]")?.hidePopover()}
+                      >
+                        Download current
+                      </a>
+                      <button
+                        type="button"
+                        onClick={(event) => {
+                          event.currentTarget.closest<HTMLElement>("[popover]")?.hidePopover();
+                          setHistoryDocumentId(document.id);
+                        }}
+                      >
+                        Version history
+                      </button>
+                      <button
+                        type="button"
+                        className="file-action-remove"
+                        onClick={(event) => {
+                          event.currentTarget.closest<HTMLElement>("[popover]")?.hidePopover();
+                          void handleRemoveDocument(document);
+                        }}
+                        disabled={Boolean(busyAction) || documentSet.documents.length <= 2}
+                        title={documentSet.documents.length <= 2 ? "A set must retain at least two documents" : undefined}
+                      >
+                        Remove from set
+                      </button>
+                    </div>
                   </div>
                 ))}
               </nav>
+              <div className="rail-heading-actions">
+                <button
+                  type="button"
+                  className="rail-add-button"
+                  onClick={() => addDocumentsInputRef.current?.click()}
+                  disabled={Boolean(busyAction) || documentSet.documents.length >= 20}
+                >
+                  + Add
+                </button>
+                <input
+                  ref={addDocumentsInputRef}
+                  type="file"
+                  accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                  multiple
+                  onChange={(event) => void handleAddDocuments(event)}
+                  className="sr-only"
+                />
+              </div>
             </aside>
 
-            <DocumentExperience
-              documentSet={documentSet}
-              document={activeDocument}
-              searchTarget={documentSearchTarget}
-              onGenerated={handleEditorGenerated}
-              generationJobs={generationJobs}
-              onGenerationQueued={handleGenerationQueued}
-              onDirtyChange={setEditorDirty}
-            />
+            {activeDocument && <section className="office-workspace" aria-label={activeDocument.name}>
+              {restoreNotice && <p className="local-office-notice" role="status">{restoreNotice}</p>}
+              <LocalOfficeEditor
+                key={`${activeDocument.id}:${editorReset}`}
+                documentId={activeDocument.id}
+                toolbarTarget={officeToolbar}
+                onGenerated={handleEditorGenerated}
+              />
+            </section>}
 
           </div>
 
