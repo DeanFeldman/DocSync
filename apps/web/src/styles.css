@@ -4623,3 +4623,24 @@ textarea:focus-visible {
 .sync-skip-list li {
   overflow-wrap: anywhere;
 }
+
+
+.table-review-popover {
+  width: min(26rem, calc(100vw - 2rem));
+}
+
+.table-review-popover p {
+  margin: 0 0 0.75rem;
+}
+
+.table-review-popover li label,
+.table-review-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.table-review-actions {
+  justify-content: flex-end;
+  padding-top: 0.75rem;
+}

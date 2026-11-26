@@ -3724,6 +3724,7 @@ def save_office_document_versions(
     content: bytes,
     related: dict[str, tuple[str, bytes]],
     skipped: list[dict],
+    table_review: list[dict],
 ) -> None:
     _save_document_copy(
         session,
@@ -3733,7 +3734,21 @@ def save_office_document_versions(
         office_session_version_id=editor_version_id,
         related=related,
         office_skipped=skipped,
+        office_table_review=table_review,
     )
+
+
+
+def save_reviewed_office_tables(session: Session, changes: dict[str, tuple[str, bytes]]) -> dict:
+    document_id, (version_id, content) = next(iter(changes.items()))
+    related = {key: value for key, value in changes.items() if key != document_id}
+    result = _save_document_copy(
+        session, document_id, version_id, edited_content=content, related=related, queue_preview=False,
+    )
+    return {
+        **serialize_editor_generation_status(session, result["operation_id"]),
+        "document_set": result["document_set"],
+    }
 
 
 def _save_document_copy(
@@ -3746,6 +3761,8 @@ def _save_document_copy(
     office_session_version_id: str | None = None,
     related: dict[str, tuple[str, bytes]] | None = None,
     office_skipped: list[dict] | None = None,
+    office_table_review: list[dict] | None = None,
+    queue_preview: bool = True,
 ) -> dict:
     with EDITOR_GENERATION_LOCK:
         committed = False
@@ -3913,9 +3930,17 @@ def _save_document_copy(
                     **({
                         "office_session_version_id": office_session_version_id,
                         "office_skipped": office_skipped or [],
-                        "affected_document_ids": [item.id for item, _, _ in copies],
-                        "affected_document_names": [item.original_name for item, _, _ in copies],
+                        "office_table_review": [
+                            {
+                                **file,
+                                "version_id": versions[file["document_id"]].id
+                                if file["document_id"] in versions else file["version_id"],
+                            }
+                            for file in office_table_review or []
+                        ],
                     } if office_session_version_id else {}),
+                    "affected_document_ids": [item.id for item, _, _ in copies],
+                    "affected_document_names": [item.original_name for item, _, _ in copies],
                     "writes_performed": True,
                     "status": "completed",
                 },
@@ -3967,7 +3992,7 @@ def _save_document_copy(
             if office_session_version_id is not None:
                 return {}
             version = versions[document.id]
-            preview_jobs = _queue_previews_safely(session, [version.id])
+            preview_jobs = _queue_previews_safely(session, [version.id]) if queue_preview else []
 
             return {
                 "operation_id": operation.id,

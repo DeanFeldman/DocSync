@@ -1,10 +1,13 @@
 import importlib
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from threading import Event
 from urllib.parse import urlsplit
 
 from docx import Document
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
@@ -157,7 +160,7 @@ def test_local_office_saves_and_syncs_only_changed_shared_paragraphs(tmp_path, m
                 cell = Document(BytesIO(content)).tables[0].cell(0, 0)
                 expected = text.replace(" ", "   " if doc["name"] == "Three.docx" else "\t")
                 assert [paragraph.text for paragraph in cell.paragraphs] == [
-                    expected, "Details unique to target", "Unchanged shared wording",
+                    *([expected] if expected else []), "Details unique to target", "Unchanged shared wording",
                 ]
             assert all(current_ids[doc["id"]] == doc["version_id"] for doc in other)
             if previous:
@@ -323,3 +326,334 @@ def test_local_office_repeated_insertions_beside_a_word_line_break(tmp_path, mon
                 expected_details = Document(BytesIO(originals[name])).tables[0].cell(0, 0).paragraphs[1].text
                 assert cell.paragraphs[0].text == "Shared opening" + gap + words + "Terms follow"
                 assert cell.paragraphs[1].text == expected_details
+
+
+
+def test_local_office_syncs_mixed_wording_and_paragraph_edits_in_one_save(tmp_path, monkeypatch):
+    app = _load_test_app(tmp_path, monkeypatch)
+    office = importlib.import_module("app.local_office")
+    monkeypatch.setenv("DOCSYNC_ONLYOFFICE_URL", "http://127.0.0.1:8080")
+    monkeypatch.setenv("DOCSYNC_ONLYOFFICE_SECRET", "local-document-server-test-secret")
+
+    original = (
+        "Opening shared terms", "The buyer must promptly pay the deposit", "Closing shared terms",
+        "", "Shared anchor after blank", "Obsolete shared paragraph", "Last shared terms",
+        "Clear this shared paragraph", "End of common terms",
+    )
+    edited = (
+        "Opening shared terms", "The buyer must pay the deposit by Friday", "",
+        "A new standalone condition", "Closing shared terms", "Shared anchor after blank",
+        "Last shared terms with a new ending", "", "End of common terms",
+    )
+    matching_with_distinct_wording = (*original, "Target-specific terms")
+    with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+        upload = client.post("/api/document-sets", data={"name": "Mixed paragraph edits"}, files=[
+            ("files", ("Source.docx", _docx(*original, "Source-specific terms"), office.MIME)),
+            ("files", ("Matching.docx", _docx(*matching_with_distinct_wording), office.MIME)),
+            ("files", ("Second match.docx", _docx(*original, "Different target details"), office.MIME)),
+            ("files", ("Different.docx", _docx("The tenant must promptly pay the deposit"), office.MIME)),
+        ])
+        assert upload.status_code == 201, upload.text
+        documents = {row["name"]: row for row in upload.json()["documents"]}
+        editor = client.post(f"/api/documents/{documents['Source.docx']['id']}/onlyoffice/open").json()
+        service = urlsplit(editor["embed_url"]).path.replace("onlyoffice-bridge", "onlyoffice-service")
+        token = office._sign({
+            "operation": "callback", "status": 6, "key": service.rsplit("/", 1)[-1],
+            "url": "http://127.0.0.1:8080/edited.docx",
+        })
+        draft = _docx(*edited, "Source-specific terms")
+        monkeypatch.setattr(office, "_download_draft", lambda *_: draft)
+        saved = client.post(service + "/callback", json={"token": token})
+        assert saved.status_code == 200, saved.text
+        assert saved.json() == {"error": 0}, saved.text
+        result = client.get(f"/api/onlyoffice/{editor['version_id']}/save-status").json()["save"]
+        updated = {row["name"]: row for row in result["document_set"]["documents"]}
+        for name, details in (
+            ("Matching.docx", "Target-specific terms"),
+            ("Second match.docx", "Different target details"),
+        ):
+            exported = Document(BytesIO(client.get(updated[name]["download_url"]).content))
+            assert tuple(p.text for p in exported.tables[0].cell(0, 0).paragraphs) == (*edited, details)
+        assert updated["Different.docx"]["version_id"] == documents["Different.docx"]["version_id"]
+
+
+
+def test_local_office_syncs_word_soft_breaks_and_appends_before_private_text(tmp_path, monkeypatch):
+    app = _load_test_app(tmp_path, monkeypatch)
+    office = importlib.import_module("app.local_office")
+    monkeypatch.setenv("DOCSYNC_ONLYOFFICE_URL", "http://127.0.0.1:8080")
+    monkeypatch.setenv("DOCSYNC_ONLYOFFICE_SECRET", "local-document-server-test-secret")
+
+    with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+        upload = client.post("/api/document-sets", data={"name": "Line and paragraph endings"}, files=[
+            ("files", ("Source.docx", _docx("Common sentence continues"), office.MIME)),
+            ("files", ("Matching.docx", _docx("Common sentence continues", "Private detail"), office.MIME)),
+            ("files", ("Other.docx", _docx("A different sentence"), office.MIME)),
+        ])
+        assert upload.status_code == 201, upload.text
+        documents = {row["name"]: row for row in upload.json()["documents"]}
+        editor = client.post(f"/api/documents/{documents['Source.docx']['id']}/onlyoffice/open").json()
+        service = urlsplit(editor["embed_url"]).path.replace("onlyoffice-bridge", "onlyoffice-service")
+        token = office._sign({
+            "operation": "callback", "status": 6, "key": service.rsplit("/", 1)[-1],
+            "url": "http://127.0.0.1:8080/edited.docx",
+        })
+        for paragraphs in (
+            ("Common sentence\n\ncontinues", "", "New text"),
+            ("Common sentence continues", "", "New text"),
+        ):
+            draft = _docx(*paragraphs)
+            monkeypatch.setattr(office, "_download_draft", lambda *_: draft)
+            saved = client.post(service + "/callback", json={"token": token})
+            assert saved.status_code == 200, saved.text
+            result = client.get(f"/api/onlyoffice/{editor['version_id']}/save-status").json()["save"]
+            current = {item["name"]: item for item in result["document_set"]["documents"]}
+            assert current["Other.docx"]["version_id"] == documents["Other.docx"]["version_id"]
+            exported = Document(BytesIO(client.get(current["Matching.docx"]["download_url"]).content))
+            cell = exported.tables[0].cell(0, 0)
+            assert tuple(p.text for p in cell.paragraphs) == (*paragraphs, "Private detail")
+            assert len(cell.paragraphs[0]._p.xpath(".//w:br")) == paragraphs[0].count("\n")
+
+
+
+def test_local_office_continues_target_numbered_and_bulleted_lists(tmp_path, monkeypatch):
+    app = _load_test_app(tmp_path, monkeypatch)
+    office = importlib.import_module("app.local_office")
+    monkeypatch.setenv("DOCSYNC_ONLYOFFICE_URL", "http://127.0.0.1:8080")
+    monkeypatch.setenv("DOCSYNC_ONLYOFFICE_SECRET", "local-document-server-test-secret")
+
+    def document(numbered, bullets, *, numbering_ids=None, details="Source details"):
+        doc = Document()
+        numbering = doc.part.numbering_part.element
+        for texts, style, base_id in (
+            (numbered, "List Number", 5),
+            (bullets, "List Bullet", 1),
+        ):
+            num_id = numbering_ids[base_id] if numbering_ids is not None else base_id
+            if num_id != base_id:
+                instance = deepcopy(numbering.num_having_numId(base_id))
+                instance.set(qn("w:numId"), str(num_id))
+                numbering.append(instance)
+            for text in texts:
+                paragraph = doc.add_paragraph(text, style=style if numbering_ids is None else None)
+                if numbering_ids is not None:
+                    props = paragraph._p.get_or_add_pPr().get_or_add_numPr()
+                    props.get_or_add_ilvl().val = 0
+                    props.get_or_add_numId().val = num_id
+            if base_id == 5:
+                doc.add_paragraph("End of numbered section")
+        doc.add_paragraph(details)
+        output = BytesIO()
+        doc.save(output)
+        return output.getvalue()
+
+    number_start = ("First numbered item", "Last numbered item")
+    bullet_start = ("First bullet",)
+    source_ids, target_ids = {5: 5, 1: 1}, {5: 42, 1: 43}
+    with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+        upload = client.post("/api/document-sets", data={"name": "Common lists"}, files=[
+            ("files", ("Source.docx", document(number_start, bullet_start, numbering_ids=source_ids), office.MIME)),
+            ("files", ("Direct.docx", document(number_start, bullet_start, numbering_ids=target_ids,
+                                                   details="Direct details"), office.MIME)),
+            ("files", ("Styled.docx", document(number_start, bullet_start, details="Styled details"), office.MIME)),
+            ("files", ("Local clause.docx", document(("Local opening item", number_start[1]), bullet_start,
+                                                     numbering_ids=target_ids, details="Local details"), office.MIME)),
+        ])
+        assert upload.status_code == 201, upload.text
+        documents = {row["name"]: row for row in upload.json()["documents"]}
+        editor = client.post(f"/api/documents/{documents['Source.docx']['id']}/onlyoffice/open").json()
+        service = urlsplit(editor["embed_url"]).path.replace("onlyoffice-bridge", "onlyoffice-service")
+        token = office._sign({
+            "operation": "callback", "status": 6, "key": service.rsplit("/", 1)[-1],
+            "url": "http://127.0.0.1:8080/edited.docx",
+        })
+
+        for numbered, bullets in (
+            (("First numbered item", "Inserted numbered item", "Last numbered item"),
+             ("First bullet", "")),
+            (("First numbered item", "Inserted numbered item", "Last numbered item", "Another numbered item"),
+             ("First bullet", "Inserted bullet", "Another bullet")),
+        ):
+            draft = document(numbered, bullets, numbering_ids=source_ids)
+            monkeypatch.setattr(office, "_download_draft", lambda *_: draft)
+            response = client.post(service + "/callback", json={"token": token})
+            assert response.status_code == 200, response.text
+            result = client.get(f"/api/onlyoffice/{editor['version_id']}/save-status").json()["save"]
+            assert result["skipped_documents"] == []
+            current = {item["name"]: item for item in result["document_set"]["documents"]}
+            for name, ids, details in (
+                ("Direct.docx", target_ids, "Direct details"),
+                ("Styled.docx", source_ids, "Styled details"),
+                ("Local clause.docx", target_ids, "Local details"),
+            ):
+                content = client.get(current[name]["download_url"]).content
+                doc = Document(BytesIO(content))
+                expected_numbered = ("Local opening item", *numbered[1:]) if name == "Local clause.docx" else numbered
+                assert [p.text for p in doc.paragraphs] == [*expected_numbered, "End of numbered section", *bullets, details]
+                inventory = importlib.import_module("app.text_inventory_service").build_text_inventory(
+                    content, document_id="test", version_id="test", include_empty_paragraphs=True,
+                    include_paragraph_lists=True,
+                )
+                body = [segment for segment in inventory.segments if segment.location["kind"] == "body"]
+                expected = [
+                    *[(str(ids[5]), "0", False)] * len(numbered), None,
+                    *[(str(ids[1]), "0", True)] * len(bullets), None,
+                ]
+                assert [
+                    (segment.numbering.num_id, segment.numbering.level, segment.numbering.is_bullet)
+                    if segment.numbering is not None else None
+                    for segment in body
+                ] == expected
+                inserted = doc.paragraphs[1]._p.pPr.numPr
+                assert inserted.ilvl.val == 0 and inserted.numId.val == ids[5]
+
+
+
+def test_local_office_deletes_only_complete_matching_tables(tmp_path, monkeypatch):
+    app = _load_test_app(tmp_path, monkeypatch)
+    office = importlib.import_module("app.local_office")
+    monkeypatch.setenv("DOCSYNC_ONLYOFFICE_URL", "http://127.0.0.1:8080")
+    monkeypatch.setenv("DOCSYNC_ONLYOFFICE_SECRET", "local-document-server-test-secret")
+
+    deleted = ("Obsolete shared heading", "Obsolete shared amount")
+    surviving = ("Current heading", "Original current amount")
+    updated = (surviving[0], "Updated current amount")
+
+    def document(*tables, closing="Private source wording"):
+        doc = Document()
+        for cells in tables:
+            table = doc.add_table(rows=1, cols=len(cells))
+            for cell, text in zip(table.rows[0].cells, cells, strict=True):
+                cell.text = text
+        doc.add_paragraph(closing)
+        output = BytesIO()
+        doc.save(output)
+        return output.getvalue()
+
+    with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+        files = {
+            "Source.docx": document(deleted, surviving),
+            "Match.docx": document(deleted, surviving, closing="Private target wording"),
+            "Similar.docx": document((deleted[0], "A private amount"), surviving),
+            "Different shape.docx": document((" ".join(deleted),), surviving),
+            "Ambiguous.docx": document(deleted, deleted, surviving),
+        }
+        upload = client.post("/api/document-sets", data={"name": "Delete whole shared table"}, files=[
+            ("files", (name, content, office.MIME)) for name, content in files.items()
+        ])
+        assert upload.status_code == 201, upload.text
+        documents = {row["name"]: row for row in upload.json()["documents"]}
+        editor = client.post(f"/api/documents/{documents['Source.docx']['id']}/onlyoffice/open").json()
+        service = urlsplit(editor["embed_url"]).path.replace("onlyoffice-bridge", "onlyoffice-service")
+        token = office._sign({
+            "operation": "callback", "status": 6, "key": service.rsplit("/", 1)[-1],
+            "url": "http://127.0.0.1:8080/edited.docx",
+        })
+        draft = document(updated)
+        monkeypatch.setattr(office, "_download_draft", lambda *_: draft)
+        response = client.post(service + "/callback", json={"token": token})
+        assert response.status_code == 200, response.text
+        saved = client.get(f"/api/onlyoffice/{editor['version_id']}/save-status").json()["save"]
+        current = {row["name"]: row for row in saved["document_set"]["documents"]}
+        assert {item["document_name"]: item["reasons"] for item in saved["skipped_documents"]} == {
+            "Ambiguous.docx": ["ambiguous"],
+        }
+        expected = {
+            "Source.docx": [updated],
+            "Match.docx": [updated],
+            "Similar.docx": [(deleted[0], "A private amount"), updated],
+            "Different shape.docx": [(" ".join(deleted),), updated],
+            "Ambiguous.docx": [deleted, deleted, updated],
+        }
+        for name, tables in expected.items():
+            content = client.get(current[name]["download_url"]).content
+            doc = Document(BytesIO(content))
+            assert [tuple(cell.text for cell in table.rows[0].cells) for table in doc.tables] == tables
+            closing = "Private target wording" if name == "Match.docx" else "Private source wording"
+            assert [p.text for p in doc.paragraphs] == [closing]
+
+        assert client.post(service + "/callback", json={"token": token}).json() == {"error": 0}
+        assert client.get(f"/api/onlyoffice/{editor['version_id']}/save-status", params={
+            "after_operation": saved["operation_id"],
+        }).json() == {"save": None}
+
+
+
+def test_local_office_asks_before_deleting_table_with_file_specific_text(tmp_path, monkeypatch):
+    app = _load_test_app(tmp_path, monkeypatch)
+    office = importlib.import_module("app.local_office")
+    monkeypatch.setenv("DOCSYNC_ONLYOFFICE_URL", "http://127.0.0.1:8080")
+    monkeypatch.setenv("DOCSYNC_ONLYOFFICE_SECRET", "local-document-server-test-secret")
+
+    def document(local_row, *, after="Before shared edit"):
+        doc = Document()
+        if local_row is not None:
+            table = doc.add_table(rows=3, cols=1)
+            for row, text in zip(table.rows, ("Shared title", "Shared subtitle", local_row), strict=True):
+                row.cells[0].text = text
+            paragraph = table.cell(0, 0).paragraphs[0]
+            for tag in ("bookmarkStart", "bookmarkEnd"):
+                mark = OxmlElement("w:" + tag)
+                mark.set(qn("w:id"), "12")
+                if tag == "bookmarkStart":
+                    mark.set(qn("w:name"), "CoverTitle")
+                paragraph._p.append(mark)
+            paragraph.runs[0]._r.append(OxmlElement("w:softHyphen"))
+        doc.add_paragraph(after)
+        output = BytesIO()
+        doc.save(output)
+        return output.getvalue()
+
+    with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+        originals = {
+            "Source.docx": document("Source detail"),
+            "Exact.docx": document("Source detail"),
+            "Approved.docx": document("Approved local detail"),
+            "Kept.docx": document("Kept local detail"),
+        }
+        upload = client.post("/api/document-sets", data={"name": "Review different cover tables"}, files=[
+            ("files", (name, content, office.MIME)) for name, content in originals.items()
+        ])
+        assert upload.status_code == 201, upload.text
+        docs = {row["name"]: row for row in upload.json()["documents"]}
+        doc_id = docs["Source.docx"]["id"]
+        editor = client.post(f"/api/documents/{doc_id}/onlyoffice/open").json()
+        service = urlsplit(editor["embed_url"]).path.replace("onlyoffice-bridge", "onlyoffice-service")
+        token = office._sign({
+            "operation": "callback", "status": 6, "key": service.rsplit("/", 1)[-1],
+            "url": "http://127.0.0.1:8080/edited.docx",
+        })
+        draft = document(None, after="After shared edit")
+        monkeypatch.setattr(office, "_download_draft", lambda *_: draft)
+        response = client.post(service + "/callback", json={"token": token})
+        assert response.status_code == 200, response.text
+        saved = client.get(f"/api/onlyoffice/{editor['version_id']}/save-status").json()["save"]
+        history_url = f"/api/documents/{doc_id}/onlyoffice/table-reviews"
+        review = saved["table_review"]
+        assert [item["document_name"] for item in review] == ["Approved.docx", "Kept.docx"]
+        assert all(item["tables"] == [{"index": 0, "table_number": 1, "different_row": 3}] for item in review)
+        assert client.get(history_url).json() == [{"operation_id": saved["operation_id"], "files": review}]
+        current = {row["name"]: row for row in saved["document_set"]["documents"]}
+
+        def read_doc(file):
+            return Document(BytesIO(client.get(file["download_url"]).content))
+
+        assert not read_doc(current["Exact.docx"]).tables
+        for name in ("Approved.docx", "Kept.docx"):
+            assert read_doc(current[name]).tables[0].cell(2, 0).text == name.split(".")[0] + " local detail"
+            assert read_doc(current[name]).paragraphs[0].text == "After shared edit"
+            assert current[name]["version_id"] != docs[name]["version_id"]
+
+        review_url = f"/api/onlyoffice/table-reviews/{saved['operation_id']}"
+        rejected = client.post(review_url, json={"delete_document_ids": [docs["Exact.docx"]["id"]]})
+        assert rejected.status_code == 422
+        approved = client.post(review_url, json={"delete_document_ids": [docs["Approved.docx"]["id"]]})
+        assert approved.status_code == 200, approved.text
+        result = approved.json()
+        assert [version["document_id"] for version in result["versions"]] == [docs["Approved.docx"]["id"]]
+        new = {row["name"]: row for row in result["document_set"]["documents"]}
+        assert not read_doc(new["Approved.docx"]).tables
+        assert new["Kept.docx"]["version_id"] == current["Kept.docx"]["version_id"]
+        assert new["Source.docx"]["version_id"] == current["Source.docx"]["version_id"]
+        assert client.get(history_url).json() == []
+        assert client.post(review_url, json={"delete_document_ids": [docs["Approved.docx"]["id"]]}).status_code == 404

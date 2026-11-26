@@ -28,6 +28,22 @@ interface SkippedDocument {
   reasons: (keyof typeof skipReasons)[];
 }
 
+interface TableReviewFile {
+  document_id: string;
+  document_name: string;
+  tables: { index: number; table_number: number; different_row: number }[];
+}
+
+interface TableReview {
+  operation_id: string;
+  files: TableReviewFile[];
+}
+
+function mergeTableReviews(existing: TableReview[], incoming: TableReview[]) {
+  const known = new Set(existing.map((review) => review.operation_id));
+  return [...existing, ...incoming.filter((review) => !known.has(review.operation_id))];
+}
+
 interface Props {
   documentId: string;
   toolbarTarget: HTMLElement | null;
@@ -40,6 +56,10 @@ export default function LocalOfficeEditor({ documentId, toolbarTarget, onGenerat
   const [saveMessage, setSaveMessage] = useState("");
   const [saveOperation, setSaveOperation] = useState("");
   const [skipped, setSkipped] = useState<SkippedDocument[]>([]);
+  const [tableReviews, setTableReviews] = useState<TableReview[]>([]);
+  const [reviewSelection, setReviewSelection] = useState<string[]>([]);
+  const [reviewBusy, setReviewBusy] = useState(false);
+  const [reviewError, setReviewError] = useState("");
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
   const [scopeBusy, setScopeBusy] = useState(false);
@@ -61,6 +81,14 @@ export default function LocalOfficeEditor({ documentId, toolbarTarget, onGenerat
     }).catch((cause) => {
       if (!controller.signal.aborted) setOpenError(cause instanceof Error ? cause.message : String(cause));
     });
+    void read<TableReview[]>(
+      `/api/documents/${encodeURIComponent(documentId)}/onlyoffice/table-reviews`,
+      { signal: controller.signal },
+    ).then((reviews) => {
+      if (!controller.signal.aborted) setTableReviews((existing) => mergeTableReviews(existing, reviews));
+    }).catch((cause) => {
+      if (!controller.signal.aborted) setReviewError(cause instanceof Error ? cause.message : String(cause));
+    });
     return () => controller.abort();
   }, [documentId, retry]);
 
@@ -73,7 +101,10 @@ export default function LocalOfficeEditor({ documentId, toolbarTarget, onGenerat
       try {
         const params = new URLSearchParams({ after_operation: lastOperation });
         const progress = await read<{
-          save: (EditorGenerationResponse & { skipped_documents?: SkippedDocument[] }) | null;
+          save: (EditorGenerationResponse & {
+            skipped_documents?: SkippedDocument[];
+            table_review?: TableReviewFile[];
+          }) | null;
           saving?: boolean;
           save_error?: string;
         }>(
@@ -87,10 +118,16 @@ export default function LocalOfficeEditor({ documentId, toolbarTarget, onGenerat
         lastOperation = save.generation_id;
         setSaveOperation(save.generation_id);
         setSkipped(save.skipped_documents ?? []);
+        if (save.table_review?.length) {
+          const review = { operation_id: save.generation_id, files: save.table_review };
+          setTableReviews((existing) => mergeTableReviews(existing, [review]));
+        }
         const related = (save.affected_documents ?? []).filter((document) => document.id !== documentId);
         setSaveMessage(related.length
-          ? `Saved. Shared paragraphs updated in ${related.map((document) => document.name).join(", ")}.`
-          : "Saved. No shared paragraph updates in this save.");
+          ? `Saved. Updated ${related.map((document) => document.name).join(", ")}.`
+          : save.table_review?.length
+            ? "Saved. Review tables with file-specific text."
+            : "Saved. No shared paragraph updates in this save.");
         setError("");
         onGeneratedRef.current(save);
       } catch (error) {
@@ -129,6 +166,39 @@ export default function LocalOfficeEditor({ documentId, toolbarTarget, onGenerat
     }
   }
 
+  const tableReview = tableReviews[0];
+  const tableReviewPopover = "table-review-" + documentId;
+
+  async function resolveTableReview(deleteDocumentIds: string[]) {
+    if (!tableReview) return;
+    setReviewBusy(true);
+    setReviewError("");
+    try {
+      const result = await read<EditorGenerationResponse | null>(
+        "/api/onlyoffice/table-reviews/" + encodeURIComponent(tableReview.operation_id),
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ delete_document_ids: deleteDocumentIds }),
+        },
+      );
+      document.getElementById(tableReviewPopover)?.hidePopover();
+      setTableReviews((reviews) => reviews.filter((review) => review.operation_id !== tableReview.operation_id));
+      setReviewSelection([]);
+      if (result) {
+        const files = deleteDocumentIds.length === 1 ? "one file" : `${deleteDocumentIds.length} files`;
+        setSaveMessage(`Deleted approved tables in ${files}.`);
+        onGeneratedRef.current(result);
+      } else {
+        setSaveMessage("Kept the tables in matching files.");
+      }
+    } catch (cause) {
+      setReviewError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setReviewBusy(false);
+    }
+  }
+
   if (!editor) return <div className="local-office-empty">
     {openError ? <>
       <p role="alert">{openError}</p>
@@ -159,6 +229,43 @@ export default function LocalOfficeEditor({ documentId, toolbarTarget, onGenerat
           ? "Save to sync matching files."
           : "Save in ONLYOFFICE to update this file."}
       </span>
+      {tableReview && <>
+        <button type="button" className="quiet-button sync-skip-button" popoverTarget={tableReviewPopover}
+          disabled={saving || reviewBusy}>
+          Review table deletions ({tableReview.files.length})
+        </button>
+        <div id={tableReviewPopover} className="file-actions-popover sync-skip-list table-review-popover" popover="auto">
+          <p>These tables contain file-specific text. Select the files where you want to delete them.</p>
+          <ul>
+            {tableReview.files.map((file) => <li key={file.document_id}>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={reviewSelection.includes(file.document_id)}
+                  disabled={reviewBusy}
+                  onChange={(event) => {
+                    const checked = event.target.checked;
+                    setReviewSelection((selected) => checked
+                      ? [...selected, file.document_id]
+                      : selected.filter((id) => id !== file.document_id));
+                  }}
+                />
+                <strong>{file.document_name}</strong>
+              </label>
+              {file.tables.map((table) => <span key={table.index}>
+                Table {table.table_number} · row {table.different_row} differs
+              </span>)}
+            </li>)}
+          </ul>
+          <div className="table-review-actions">
+            <button type="button" className="quiet-button" disabled={reviewBusy}
+              onClick={() => void resolveTableReview([])}>Keep all</button>
+            <button type="button" className="quiet-button" disabled={reviewBusy || !reviewSelection.length}
+              onClick={() => void resolveTableReview(reviewSelection)}>Delete selected</button>
+          </div>
+          {reviewError && <p role="alert">{reviewError}</p>}
+        </div>
+      </>}
       {!saving && !saveError && skipped.length > 0 && <>
         <button type="button" className="quiet-button sync-skip-button"
           popoverTarget={`sync-skips-${documentId}`}>
@@ -174,7 +281,9 @@ export default function LocalOfficeEditor({ documentId, toolbarTarget, onGenerat
         </div>
       </>}
     </div>, toolbarTarget)}
-    {(saveError || error) && <p className="local-office-error" role="alert">{saveError || error}</p>}
+    {(saveError || error || (!tableReview && reviewError)) && <p className="local-office-error" role="alert">
+      {saveError || error || reviewError}
+    </p>}
     <iframe
       className="local-office-frame"
       src={editor.url}

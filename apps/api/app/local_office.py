@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 import httpx
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .config import settings
@@ -27,10 +28,12 @@ from .editor_service import (
     document_version_path,
     get_version_or_404,
     save_office_document_versions,
+    save_reviewed_office_tables,
     serialize_editor_generation_status,
 )
 from .models import DocumentRecord, EditorOperation
 from .office_related import sync_related_paragraphs
+from .text_inventory_service import apply_text_replacements, build_text_inventory
 from .validation_service import DocumentValidationService
 
 
@@ -297,11 +300,11 @@ def office_callback(version_id: str, key: str, request: Request, body: dict, ses
             if original != content:
                 DocumentValidationService.validate_package(content, filename="draft.docx")
                 DocumentValidationService.parse_file(content, filename="draft.docx")
-                related, skipped = {}, []
+                related, skipped, table_review = {}, [], []
                 if _save_scope(version_id) == "shared":
-                    related, skipped = sync_related_paragraphs(session, current, original, content)
+                    related, skipped, table_review = sync_related_paragraphs(session, current, original, content)
                 save_office_document_versions(
-                    session, current.document_id, current.id, version_id, content, related, skipped,
+                    session, current.document_id, current.id, version_id, content, related, skipped, table_review,
                 )
         except HTTPException as exc:
             failure = str(exc.detail)
@@ -341,6 +344,69 @@ def office_save_status(
     if operation is None or operation.id == after_operation:
         return {"save": None}
     result = serialize_editor_generation_status(session, operation.id)
-    result["skipped_documents"] = (operation.preview_json or {}).get("office_skipped", [])
+    metadata = operation.preview_json or {}
+    result["skipped_documents"] = metadata.get("office_skipped", [])
+    result["table_review"] = metadata.get("office_table_review", [])
     result["document_set"] = serialize_document_set(get_document_set_or_404(session, current.document.document_set_id))
     return {"save": result}
+
+
+
+@router.get("/api/documents/{document_id}/onlyoffice/table-reviews")
+def office_table_reviews(document_id: str, request: Request, session: Session = Depends(get_session)):
+    _enabled(request)
+    operations = session.scalars(select(EditorOperation).where(
+        EditorOperation.operation_type == "external_edit",
+        EditorOperation.document_set_id == select(DocumentRecord.document_set_id)
+            .where(DocumentRecord.id == document_id).scalar_subquery(),
+        EditorOperation.preview_json["document_id"].as_string() == document_id,
+        EditorOperation.preview_json["office_table_review"].as_string().is_not(None),
+    ).order_by(EditorOperation.created_at))
+    return [
+        {"operation_id": operation.id, "files": operation.preview_json["office_table_review"]}
+        for operation in operations if operation.preview_json["office_table_review"]
+    ]
+
+
+@router.post("/api/onlyoffice/table-reviews/{operation_id}")
+def resolve_office_table_review(
+    operation_id: str,
+    request: Request,
+    delete_document_ids: list[str] = Body(embed=True),
+    session: Session = Depends(get_session),
+):
+    _enabled(request)
+    with lock, EDITOR_GENERATION_LOCK:
+        operation = session.get(EditorOperation, operation_id)
+        metadata = operation.preview_json if operation and operation.operation_type == "external_edit" else None
+        review = metadata.get("office_table_review") if isinstance(metadata, dict) else None
+        if not review:
+            raise HTTPException(404, "This table review has already been resolved or is unavailable.")
+        files = {file["document_id"]: file for file in review}
+        if not set(delete_document_ids) <= files.keys():
+            raise HTTPException(422, "Choose files from this table review.")
+        changes = {}
+        for document_id in dict.fromkeys(delete_document_ids):
+            file = files[document_id]
+            document = session.get(DocumentRecord, document_id)
+            if document is None or document.document_set_id != operation.document_set_id:
+                raise HTTPException(409, "A reviewed document is no longer in this set.")
+            version = current_version_for_document(session, document)
+            if version.id != file["version_id"]:
+                raise HTTPException(409, "A selected file changed after this review was created. Keep its table or review a new save.")
+            content = document_version_path(version).read_bytes()
+            inventory = build_text_inventory(
+                content, document_id=document_id, version_id=version.id, include_body_tables=True,
+            )
+            by_index = {table.index: table for table in inventory.body_tables if table.removable}
+            indexes = {table["index"] for table in file["tables"]}
+            if not indexes <= by_index.keys():
+                raise HTTPException(409, "A reviewed table is no longer available for deletion.")
+            changes[document_id] = (version.id, apply_text_replacements(
+                content, inventory, [], table_removals=tuple(by_index[index] for index in sorted(indexes)),
+            ))
+        operation.preview_json = {**metadata, "office_table_review": []}
+        if changes:
+            return save_reviewed_office_tables(session, changes)
+        session.commit()
+        return None
