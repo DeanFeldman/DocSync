@@ -6,6 +6,8 @@ interface DocSyncLocalWorkspace {
 
 interface Window {
   docSync?: {
+    prepareOffice?(): Promise<string | null>;
+    openOfficeSetupGuide?(): Promise<void>;
     localData?: {
       listWorkspaces(): Promise<DocSyncLocalWorkspace[]>;
       openWorkspace(id: string): Promise<void>;

@@ -4,7 +4,6 @@
 [![Release](https://github.com/DeanFeldman/DocSync/actions/workflows/release.yml/badge.svg)](https://github.com/DeanFeldman/DocSync/actions/workflows/release.yml)
 [![Latest Release](https://img.shields.io/github/v/release/DeanFeldman/DocSync)](https://github.com/DeanFeldman/DocSync/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-Windows-0078D4)](#requirements)
-[![Version](https://img.shields.io/badge/version-1.17.0-blue)](#latest-release)
 
 DocSync is a local-first Windows desktop application for safely coordinating edits across related Microsoft Word documents.
 
@@ -36,9 +35,10 @@ SHA256SUMS.txt
 
 ## Local ONLYOFFICE editor
 
-Selecting a file opens the embedded editor. The installer requires a separate
-trusted local ONLYOFFICE Docs service. See the [Windows setup guide](docs/local-onlyoffice-windows.md)
-for configuring the service and opening the installed app. To launch a built
+Selecting a file opens the embedded editor. Set up a trusted local ONLYOFFICE
+Docs service once. DocSync starts or reuses it from the normal Windows
+shortcut. See the [Windows setup guide](docs/local-onlyoffice-windows.md)
+for configuring the service. To launch a built
 source checkout with a service already configured, run:
 
 ```powershell
@@ -383,7 +383,7 @@ The release workflow runs when a tag beginning with `v` is pushed.
 Example:
 
 ```powershell
-$version = "1.17.0"
+$version = "1.18.1"
 
 git switch main
 git pull origin main

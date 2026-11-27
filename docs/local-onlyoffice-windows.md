@@ -1,6 +1,6 @@
 # Configure the local editor on Windows
 
-DocSync uses a local ONLYOFFICE Docs service to open and save Word files. The Windows installer includes DocSync and its launcher. Install the document service separately.
+DocSync uses a local ONLYOFFICE Docs service to open and save Word files. Set up the service once. After that, DocSync starts or reuses it from the normal Windows shortcut.
 
 ## Set up the service
 
@@ -19,15 +19,11 @@ unset JWT_SECRET
 
 ## Start DocSync
 
-In the folder where you installed DocSync, run the included launcher in PowerShell:
+Open **DocSync** from the Start menu or desktop. It starts the configured container if needed, waits for it to respond, and opens the embedded editor. When initial setup is incomplete, use **Windows setup guide** from the editor error screen and then **Try again**.
 
-```powershell
-.\resources\onlyoffice\start-installed-onlyoffice.ps1
-```
+DocSync looks for `docsync-onlyoffice` in Ubuntu and reads the container's published loopback port. If you use a different distribution or container name, set `DOCSYNC_ONLYOFFICE_WSL_DISTRIBUTION` or `DOCSYNC_ONLYOFFICE_CONTAINER` in the Windows user environment once.
 
-The launcher starts the configured container, reads its signing secret, waits for it to respond, and opens DocSync with the local WSL relay. Keep the launcher open while editing. If your Ubuntu distribution, container name, or published port differs, pass `-Distribution`, `-Container`, or `-Port` as needed. Close any existing DocSync window before using the launcher.
-
-Windows loopback port 8080 and WSL adapter port 8092 must be available. You can check the document service from Windows with `Invoke-RestMethod http://127.0.0.1:8080/healthcheck`. A healthy service returns `true`.
+Windows loopback port 8080 must be available for the setup above. You can check the document service from Windows with `Invoke-RestMethod http://127.0.0.1:8080/healthcheck`. A healthy service returns `true`.
 
 ## Verify the installation
 

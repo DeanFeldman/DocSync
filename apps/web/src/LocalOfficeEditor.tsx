@@ -71,24 +71,30 @@ export default function LocalOfficeEditor({ documentId, toolbarTarget, onGenerat
 
   useEffect(() => {
     const controller = new AbortController();
-    void read<{ embed_url: string; version_id: string; save_scope: SaveScope }>(
-      `/api/documents/${encodeURIComponent(documentId)}/onlyoffice/open`,
-      { method: "POST", signal: controller.signal },
-    ).then((result) => {
-      if (controller.signal.aborted) return;
-      setScope(result.save_scope);
-      setEditor({ url: result.embed_url, endpoint: `/api/onlyoffice/${encodeURIComponent(result.version_id)}` });
-    }).catch((cause) => {
-      if (!controller.signal.aborted) setOpenError(cause instanceof Error ? cause.message : String(cause));
-    });
-    void read<TableReview[]>(
-      `/api/documents/${encodeURIComponent(documentId)}/onlyoffice/table-reviews`,
-      { signal: controller.signal },
-    ).then((reviews) => {
-      if (!controller.signal.aborted) setTableReviews((existing) => mergeTableReviews(existing, reviews));
-    }).catch((cause) => {
-      if (!controller.signal.aborted) setReviewError(cause instanceof Error ? cause.message : String(cause));
-    });
+    async function open() {
+      const documentApi = `/api/documents/${encodeURIComponent(documentId)}`;
+      try {
+        const startupError = await window.docSync?.prepareOffice?.();
+        if (controller.signal.aborted) return;
+        if (startupError) throw new Error(startupError);
+        const result = await read<{ embed_url: string; version_id: string; save_scope: SaveScope }>(
+          documentApi + "/onlyoffice/open", { method: "POST", signal: controller.signal },
+        );
+        if (controller.signal.aborted) return;
+        setScope(result.save_scope);
+        setEditor({ url: result.embed_url, endpoint: `/api/onlyoffice/${encodeURIComponent(result.version_id)}` });
+      } catch (cause) {
+        if (!controller.signal.aborted) setOpenError(cause instanceof Error ? cause.message : String(cause));
+        return;
+      }
+      try {
+        const reviews = await read<TableReview[]>(documentApi + "/onlyoffice/table-reviews", { signal: controller.signal });
+        if (!controller.signal.aborted) setTableReviews((existing) => mergeTableReviews(existing, reviews));
+      } catch (cause) {
+        if (!controller.signal.aborted) setReviewError(cause instanceof Error ? cause.message : String(cause));
+      }
+    }
+    void open();
     return () => controller.abort();
   }, [documentId, retry]);
 
@@ -206,7 +212,10 @@ export default function LocalOfficeEditor({ documentId, toolbarTarget, onGenerat
         setOpenError("");
         setRetry((value) => value + 1);
       }}>Try again</button>
-    </> : <p role="status">Opening ONLYOFFICE…</p>}
+      {window.docSync?.openOfficeSetupGuide && <button
+        type="button" className="text-button" onClick={() => void window.docSync?.openOfficeSetupGuide?.()}
+      >Windows setup guide</button>}
+    </> : <p role="status">Starting the local ONLYOFFICE editor…</p>}
   </div>;
 
   return <>

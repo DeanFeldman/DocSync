@@ -103,10 +103,11 @@ test("version badge is injected from the root package and precedes the theme con
   const app = read("apps/web/src/App.tsx");
   const styles = read("apps/web/src/styles.css");
 
-  assert.equal(rootPackage.version, "1.18.0");
+  assert.match(rootPackage.version, /^\d+\.\d+\.\d+$/);
   assert.equal(webPackage.version, rootPackage.version);
-  assert.match(apiMain, /version="1\.18\.0"/);
-  assert.match(auditLogger, /APP_VERSION = "1\.18\.0"/);
+  assert.match(apiMain, /version=APP_VERSION/);
+  assert.ok(auditLogger.includes(`APP_VERSION = "${rootPackage.version}"`));
+  assert.ok(read("apps/api/pyproject.toml").includes(`version = "${rootPackage.version}"`));
   assert.match(vite, /new URL\("\.\.\/\.\.\/package\.json", import\.meta\.url\)/);
   assert.match(vite, /__DOCSYNC_VERSION__/);
   assert.match(vite, /valid semantic version/);

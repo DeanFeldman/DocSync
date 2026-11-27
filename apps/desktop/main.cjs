@@ -6,6 +6,7 @@ const fs = require("node:fs");
 const http = require("node:http");
 const net = require("node:net");
 const path = require("node:path");
+const { onlyOfficeStartup } = require("./onlyoffice-startup.cjs");
 const { workspaceChoices, selectInitialWorkspace, rememberWorkspace,
   stageLocation, moveImportedWorkspace } = require("./device-workspaces.cjs");
 const {
@@ -20,6 +21,7 @@ const {
   dialog,
   ipcMain,
   session,
+  shell,
 } = require("electron");
 
 app.enableSandbox();
@@ -38,6 +40,19 @@ let backendWorkspacePath = "";
 let mainWindow = null;
 const developmentWebUrl = process.env.DOCUMENTSYNC_WEB_DEV_URL || "";
 const externalBackendOrigin = process.env.DOCUMENTSYNC_BACKEND_ORIGIN || "";
+const officeControlToken = crypto.randomBytes(32).toString("base64url");
+const officeDirectory = app.isPackaged
+  ? path.join(process.resourcesPath, "onlyoffice")
+  : path.join(__dirname, "..", "..", "scripts");
+const managedOffice = process.platform === "win32" && !externalBackendOrigin &&
+  !(process.env.DOCSYNC_ONLYOFFICE_URL && process.env.DOCSYNC_ONLYOFFICE_SECRET);
+const officeStartup = managedOffice ? onlyOfficeStartup({
+  probePath: path.join(officeDirectory, "resolve-onlyoffice.ps1"),
+  createRelay: require(path.join(officeDirectory, "onlyoffice-wsl-relay.cjs")).createOfficeRelay,
+  getBackend: () => backendProcess && backendSessionToken
+    ? { origin: backendOrigin, sessionToken: backendSessionToken, controlToken: officeControlToken }
+    : null,
+}) : null;
 const THEME_PREFERENCE_KEY = "docsync-theme";
 
 function themePreferencePath() {
@@ -176,6 +191,7 @@ async function startBackend(preferredPort = null) {
       DOCUMENTSYNC_RENDER_SCRIPT: paths.renderScript,
       DOCUMENTSYNC_WORD_WORKER_SCRIPT: paths.wordWorkerScript,
       DOCUMENTSYNC_SESSION_TOKEN: backendSessionToken,
+      DOCSYNC_ONLYOFFICE_CONTROL_TOKEN: officeStartup ? officeControlToken : "",
       DOCUMENTSYNC_CORS_ORIGINS: backendOrigin,
       DOCUMENTSYNC_PORT: String(backendPort),
       DOCUMENTSYNC_SUPABASE_URL: "",
@@ -322,6 +338,20 @@ if (hasSingleInstanceLock) {
   });
 
   app.whenReady().then(async () => {
+    ipcMain.handle("office:prepare", async (event) => {
+      if (!isTrustedUrl(event.senderFrame?.url)) throw new Error("Editor startup is unavailable.");
+      try {
+        await officeStartup?.prepare();
+        return null;
+      } catch (error) {
+        return error.message;
+      }
+    });
+    ipcMain.handle("office:setup-guide", (event) => {
+      if (isTrustedUrl(event.senderFrame?.url)) {
+        return shell.openExternal("https://github.com/DeanFeldman/DocSync/blob/main/docs/local-onlyoffice-windows.md");
+      }
+    });
     ipcMain.on("theme:get-preference", (event) => { event.returnValue = readThemePreference(); });
     ipcMain.on("theme:set-preference", (_event, preference) => persistThemePreference(preference));
     let workspaceChanging = false;
@@ -387,6 +417,7 @@ if (hasSingleInstanceLock) {
       backendWorkspacePath = selectInitialWorkspace(app.getPath("userData")).path;
       await startBackend();
       createWindow();
+      void officeStartup?.prepare().catch(() => {});
     } catch (error) {
       dialog.showErrorBox(
         "DocSync could not start",
@@ -402,6 +433,7 @@ if (hasSingleInstanceLock) {
   });
 
   app.on("before-quit", () => {
+    officeStartup?.close();
     stopBackend();
   });
   app.on("window-all-closed", () => app.quit());

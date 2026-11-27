@@ -7,6 +7,8 @@ contextBridge.exposeInMainWorld("docSync", Object.freeze({
   setThemePreference: (preference) => ipcRenderer.send("theme:set-preference", preference),
   getSessionToken: () => ipcRenderer.invoke("session:get-token"),
   saveOutputs: (outputs) => ipcRenderer.invoke("files:save-outputs", outputs),
+  prepareOffice: () => ipcRenderer.invoke("office:prepare"),
+  openOfficeSetupGuide: () => ipcRenderer.invoke("office:setup-guide"),
   localData: Object.freeze({
     listWorkspaces: () => ipcRenderer.invoke("device-data:list"),
     openWorkspace: (id) => ipcRenderer.invoke("device-data:open", id),

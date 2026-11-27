@@ -25,6 +25,41 @@ def _docx(text: str, *additional_paragraphs: str) -> bytes:
     return stream.getvalue()
 
 
+def test_desktop_configures_local_office_at_runtime(tmp_path, monkeypatch):
+    monkeypatch.setenv("DOCSYNC_ONLYOFFICE_CONTROL_TOKEN", "control-secret")
+    monkeypatch.delenv("DOCSYNC_ONLYOFFICE_URL", raising=False)
+    app = _load_test_app(tmp_path, monkeypatch, session_token="desktop-session")
+    office = importlib.import_module("app.local_office")
+    settings = {
+        "origin": "http://127.0.0.1:8080",
+        "secret": "onlyoffice-test-signing-secret",
+        "relayHost": "172.26.208.1",
+        "relayPort": 18452,
+    }
+    with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+        headers = {"Authorization": "Bearer control-secret"}
+        runtime = "/api/onlyoffice/runtime"
+        assert "frame-src 'self' http://localhost:8765" in client.get("/api/health").headers["Content-Security-Policy"]
+        assert client.put(runtime, json=settings, headers=headers).status_code == 401
+        client.cookies.set("docsync_session", "desktop-session")
+        assert client.put(runtime, json=settings).status_code == 403
+        assert client.put(runtime, json={**settings, "relayHost": "8.8.8.8"}, headers=headers).status_code == 422
+        assert client.get("/api/onlyoffice").json() == {"enabled": False}
+        assert client.put(runtime, json=settings, headers=headers).status_code == 204
+        assert client.get("/api/onlyoffice").json() == {"enabled": True}
+        upload = client.post("/api/document-sets", data={"name": "Local editor"}, files=[
+            ("files", (name, _docx("Common wording"), office.MIME))
+            for name in ("One.docx", "Two.docx")
+        ])
+        doc = upload.json()["documents"][0]
+        editor = client.post(f"/api/documents/{doc['id']}/onlyoffice/open")
+        assert editor.status_code == 200
+        bridge = client.get(editor.json()["embed_url"])
+        assert bridge.status_code == 200
+        assert "http://172.26.208.1:18452/8765/onlyoffice-service/" in bridge.text
+        assert settings["secret"] not in bridge.text
+
+
 def test_local_office_saves_and_syncs_only_changed_shared_paragraphs(tmp_path, monkeypatch):
     app = _load_test_app(tmp_path, monkeypatch)
     office = importlib.import_module("app.local_office")

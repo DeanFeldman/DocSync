@@ -109,7 +109,7 @@ from .preview_job_service import (
 from .preview_cache_service import get_or_create_structured_preview
 
 
-from .audit_logger import AuditLogger
+from .audit_logger import APP_VERSION, AuditLogger
 from .backup_service import DocumentBackupService
 from .error_mapper import DocuSyncError, ErrorMapper
 from .storage_service import DocumentStorageService
@@ -118,7 +118,7 @@ from starlette.concurrency import run_in_threadpool
 
 from .device_transfer import APPEARANCES, export_device_workspace, stage_device_import
 from .snapshot_service import SnapshotError, _database_schema_version
-from .local_office import office_origin, router as local_office_router
+from .local_office import office_bridge_allowed, router as local_office_router
 
 logger = logging.getLogger(__name__)
 
@@ -149,7 +149,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="DocumentSync API",
-    version="1.18.0",
+    version=APP_VERSION,
     description="DocSync structured DOCX viewing and controlled editing service.",
     lifespan=lifespan,
 )
@@ -187,7 +187,7 @@ async def secure_local_application(request: Request, call_next):
     connect_src = "connect-src 'self'"
     bridge = request.url.path.startswith("/onlyoffice-bridge/")
     frames = "'self'"
-    if office_origin() and request.url.hostname == "127.0.0.1" and request.url.port:
+    if office_bridge_allowed() and request.url.hostname == "127.0.0.1" and request.url.port:
         frames += f" http://localhost:{request.url.port}"
     response.headers.setdefault("Content-Security-Policy", (
         "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "

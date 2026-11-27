@@ -2,6 +2,7 @@
 
 import base64
 from collections import Counter
+from dataclasses import dataclass
 from ipaddress import IPv4Address
 import hashlib
 import hmac
@@ -46,20 +47,71 @@ failed_saves: dict[str, str] = {}
 MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
 
-def office_origin() -> str:
-    value = os.getenv("DOCSYNC_ONLYOFFICE_URL", "").rstrip("/")
+@dataclass(frozen=True)
+class OfficeConnection:
+    origin: str
+    secret: str
+    relay_host: str
+    relay_port: int
+
+
+runtime_connection: OfficeConnection | None = None
+
+
+def _valid_origin(value: str) -> bool:
     try:
         source = urlsplit(value)
-        if (
+        return bool(
             source.scheme == "http" and source.hostname in {"localhost", "127.0.0.1"}
             and source.netloc == f"{source.hostname}:{source.port}"
             and source.port and not (source.path or source.query or source.fragment)
-            and len(os.getenv("DOCSYNC_ONLYOFFICE_SECRET", "")) >= 24
-        ):
-            return value
+        )
     except ValueError:
-        pass
-    return ""
+        return False
+
+
+def _connection() -> OfficeConnection:
+    return runtime_connection or OfficeConnection(
+        origin=os.getenv("DOCSYNC_ONLYOFFICE_URL", "").rstrip("/"),
+        secret=os.getenv("DOCSYNC_ONLYOFFICE_SECRET", ""),
+        relay_host=os.getenv("DOCSYNC_ONLYOFFICE_WSL_RELAY_HOST", ""),
+        relay_port=8092,
+    )
+
+
+def office_origin() -> str:
+    connection = _connection()
+    return connection.origin if _valid_origin(connection.origin) and len(connection.secret) >= 24 else ""
+
+
+def office_bridge_allowed() -> bool:
+    return bool(office_origin() or (settings.session_token and os.getenv("DOCSYNC_ONLYOFFICE_CONTROL_TOKEN")))
+
+
+@router.put("/api/onlyoffice/runtime", status_code=204)
+def configure_runtime(request: Request, body: dict):
+    global runtime_connection
+    token = os.getenv("DOCSYNC_ONLYOFFICE_CONTROL_TOKEN", "")
+    authorization = request.headers.get("Authorization", "")
+    if not token or request.url.hostname != "127.0.0.1" or not hmac.compare_digest(
+        authorization.encode(), f"Bearer {token}".encode(),
+    ):
+        raise HTTPException(403, "Only the desktop launcher can configure the editor.")
+
+    origin, secret = body.get("origin"), body.get("secret")
+    host, port = body.get("relayHost"), body.get("relayPort")
+    try:
+        address = IPv4Address(host) if isinstance(host, str) else None
+    except ValueError:
+        address = None
+    if (
+        not isinstance(origin, str) or not _valid_origin(origin) or
+        not isinstance(secret, str) or not 24 <= len(secret) <= 4096 or
+        not address or not address.is_private or address.is_loopback or address.is_unspecified or
+        type(port) is not int or not 1024 <= port <= 65535
+    ):
+        raise HTTPException(422, "The local editor connection settings are invalid.")
+    runtime_connection = OfficeConnection(origin, secret, str(address), port)
 
 
 def _enabled(request: Request) -> tuple[str, str]:
@@ -74,7 +126,7 @@ def _b64(value: bytes) -> str:
 
 
 def _signature(value: str) -> str:
-    return _b64(hmac.digest(os.environ["DOCSYNC_ONLYOFFICE_SECRET"].encode(), value.encode(), "sha256"))
+    return _b64(hmac.digest(_connection().secret.encode(), value.encode(), "sha256"))
 
 
 def _sign(claims: dict) -> str:
@@ -199,7 +251,8 @@ def editor_bridge(version_id: str, key: str, request: Request, session: Session 
     _read_key(version_id, key)
     version, _ = _session_version(session, version_id)
     service_origin = local_origin
-    relay_host = os.getenv("DOCSYNC_ONLYOFFICE_WSL_RELAY_HOST")
+    connection = _connection()
+    relay_host = connection.relay_host
     if relay_host:
         try:
             address = IPv4Address(relay_host)
@@ -207,7 +260,7 @@ def editor_bridge(version_id: str, key: str, request: Request, session: Session 
             raise HTTPException(503, "The local document relay address is invalid.") from exc
         if not address.is_private or address.is_loopback:
             raise HTTPException(503, "The document relay needs a private WSL address.")
-        service_origin = f"http://{address}:8092/{request.url.port}"
+        service_origin = f"http://{address}:{connection.relay_port}/{request.url.port}"
     root = f"{service_origin}/onlyoffice-service/{version_id}/{key}"
     config = {
         "documentType": "word", "height": "100%", "width": "100%",

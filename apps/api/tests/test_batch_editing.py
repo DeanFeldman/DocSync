@@ -17,13 +17,13 @@ from app.text_inventory_service import build_text_inventory
 from docx_inventory_fixtures import UNIQUE_PHRASE, make_exhaustive_text_inventory_docx
 
 
-def _load_test_app(tmp_path: Path, monkeypatch):
+def _load_test_app(tmp_path: Path, monkeypatch, *, session_token: str = ""):
     monkeypatch.setenv("DOCUMENTSYNC_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv(
         "DOCUMENTSYNC_DATABASE_URL",
         f"sqlite:///{tmp_path / 'batch-editing.db'}",
     )
-    monkeypatch.setenv("DOCUMENTSYNC_SESSION_TOKEN", "")
+    monkeypatch.setenv("DOCUMENTSYNC_SESSION_TOKEN", session_token)
     monkeypatch.delenv("DOCUMENTSYNC_WEB_DIST", raising=False)
     for module_name in list(sys.modules):
         if module_name == "app" or module_name.startswith("app."):
