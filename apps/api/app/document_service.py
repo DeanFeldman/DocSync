@@ -1023,6 +1023,18 @@ def remove_document_from_set(
     return get_document_set_or_404(session, document_set_id)
 
 
+def rename_document_set(session: Session, document_set_id: str, name: str) -> dict:
+    name = name.strip()
+    if not 1 <= len(name) <= 200:
+        raise HTTPException(422, "Enter a document-set name between 1 and 200 characters.")
+    document_set = session.get(DocumentSet, document_set_id)
+    if document_set is None:
+        raise HTTPException(404, "Document set not found.")
+    document_set.name = name
+    session.commit()
+    return {"id": document_set_id, "name": name}
+
+
 def delete_document_set(session: Session, document_set_id: str) -> dict:
     # Permanently delete a local set and its stored workspace files.
     document_set = get_document_set_or_404(session, document_set_id)

@@ -16,6 +16,7 @@ import {
   fetchEditorGenerationJobs,
   removeDocumentFromSet,
   renameDocumentInSet,
+  renameDocumentSet,
   uploadDocumentSet,
   versionDownloadUrl,
 } from "./api";
@@ -51,7 +52,7 @@ type BusyAction =
   | "open-set"
   | "add-documents"
   | "remove-document"
-  | "rename-document"
+  | "rename"
   | "delete-set"
   | null;
 
@@ -61,6 +62,14 @@ type CreationStage =
   | "editor-preparation"
   | "workspace"
   | null;
+
+function AppearanceIcon({ preference }: { preference: ThemePreference }) {
+  if (preference === "system") {
+    return <span className="theme-toggle-icon theme-system-icon" aria-hidden="true" />;
+  }
+  return <span className="theme-toggle-icon" aria-hidden="true">{preference === "dark" ? "☾" : "☀"}</span>;
+}
+
 function readableBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -110,8 +119,9 @@ const [setNameTouched, setSetNameTouched] = useState(false);
   const [restoreNotice, setRestoreNotice] = useState("");
   const [filesCollapsed, setFilesCollapsed] = useState(false);
   const [officeToolbar, setOfficeToolbar] = useState<HTMLDivElement | null>(null);
-  const [renameTarget, setRenameTarget] = useState<DocumentSummary | null>(null);
+  const [renameTarget, setRenameTarget] = useState<{ kind: "file" | "set"; id: string } | null>(null);
   const [renameName, setRenameName] = useState("");
+  const [inlineSetName, setInlineSetName] = useState<string | null>(null);
   const [renameError, setRenameError] = useState("");
   const renameDialog = useRef<HTMLDialogElement>(null);
   const renameInput = useRef<HTMLInputElement>(null);
@@ -313,6 +323,7 @@ const [setNameTouched, setSetNameTouched] = useState(false);
         );
         return {
           ...(updated ?? current),
+          name: current.name,
           documents: current.documents.map((item) => updatedById.get(item.id) ?? item),
         };
       });
@@ -321,7 +332,6 @@ const [setNameTouched, setSetNameTouched] = useState(false);
           item.id === workspaceId
             ? {
                 ...item,
-                name: updated?.name ?? item.name,
                 document_count:
                   updated?.documents.length ?? item.document_count,
                 edit_count: item.edit_count + 1,
@@ -344,6 +354,7 @@ const [setNameTouched, setSetNameTouched] = useState(false);
     }
 
     setDocumentSet(null);
+    setInlineSetName(null);
     setActiveDocumentId("");
     setHistoryDocumentId("");
     setRestoreNotice("");
@@ -503,21 +514,57 @@ async function handleUpload(event: FormEvent) {
     setRenameTarget(null);
   }
 
+  function beginRename(kind: "file" | "set", id: string, name: string) {
+    setRenameName(kind === "file" ? name.replace(/\.docx$/i, "") : name);
+    setRenameError("");
+    setRenameTarget({ kind, id });
+  }
+
+  async function saveSetName(id: string, name: string) {
+    const renamed = await renameDocumentSet(id, name);
+    setDocumentSet((current) => current?.id === renamed.id ? { ...current, name: renamed.name } : current);
+    setSavedSets((current) => current.map((item) => item.id === renamed.id ? { ...item, name: renamed.name } : item));
+  }
+
+  async function finishInlineSetRename(value: string) {
+    setInlineSetName(null);
+    const name = value.trim();
+    if (!documentSet || !name || name === documentSet.name || busyAction) return;
+    const id = documentSet.id;
+    setBusyAction("rename");
+    setError("");
+    try {
+      if (await confirm({
+        title: "Rename document set?",
+        message: `Rename “${documentSet.name}” to “${name}”?`,
+        action: "Rename",
+      })) await saveSetName(id, name);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "The name could not be saved.");
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
   async function handleRename(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!documentSet || !renameTarget || !renameName.trim() || busyAction) return;
-    const setId = documentSet.id;
-    setBusyAction("rename-document");
+    if (!renameTarget || !renameName.trim() || busyAction) return;
+    setBusyAction("rename");
     setRenameError("");
     try {
-      const renamed = await renameDocumentInSet(setId, renameTarget.id, renameName);
-      setDocumentSet((current) => current?.id === setId ? {
-        ...current,
-        documents: current.documents.map((file) => file.id === renamed.id ? { ...file, name: renamed.name } : file),
-      } : current);
+      if (renameTarget.kind === "set") {
+        await saveSetName(renameTarget.id, renameName);
+      } else if (documentSet) {
+        const setId = documentSet.id;
+        const renamed = await renameDocumentInSet(setId, renameTarget.id, renameName);
+        setDocumentSet((current) => current?.id === setId ? {
+          ...current,
+          documents: current.documents.map((file) => file.id === renamed.id ? { ...file, name: renamed.name } : file),
+        } : current);
+      }
       closeRename();
     } catch (cause) {
-      setRenameError(cause instanceof Error ? cause.message : "The document could not be renamed.");
+      setRenameError(cause instanceof Error ? cause.message : "The name could not be saved.");
     } finally {
       setBusyAction(null);
     }
@@ -570,13 +617,12 @@ async function handleUpload(event: FormEvent) {
       for (const changedVersion of result.versions ?? []) {
         invalidateDocumentHeadResources(updated.id, changedVersion.document_id);
       }
-      setDocumentSet((current) => current?.id === updated.id ? updated : current);
+      setDocumentSet((current) => current?.id === updated.id ? { ...updated, name: current.name } : current);
       setSavedSets((current) =>
         current.map((item) =>
           item.id === updated.id
             ? {
                 ...item,
-                name: updated.name,
                 document_count: updated.documents.length,
                 edit_count: item.edit_count + 1,
               }
@@ -615,8 +661,7 @@ async function handleUpload(event: FormEvent) {
           </button>
         ) : (
           <a className="brand" href="#top" aria-label="DocSync home">
-            <span className="brand-mark" aria-hidden="true">DS</span>
-            <span><strong>DocSync</strong><small>Local-first documents</small></span>
+            <strong>DocSync</strong>
           </a>
         )}
 
@@ -628,12 +673,16 @@ async function handleUpload(event: FormEvent) {
             v{__DOCSYNC_VERSION__}
           </span>
           <details ref={appearanceMenuRef} className="theme-selector">
-            <summary aria-label="Choose appearance"><span className="theme-toggle-icon" aria-hidden="true">{themePreference === "dark" ? "☾" : themePreference === "light" ? "☀" : "▣"}</span> Appearance</summary>
-            <div className="theme-selector-menu" role="menu" aria-label="Appearance">
+            <summary aria-label="Choose appearance">
+              <AppearanceIcon preference={themePreference} />
+              <span>Appearance</span>
+            </summary>
+            <div className="theme-selector-menu appearance-options" role="menu" aria-label="Appearance">
               <strong>Appearance</strong>
               {(["system", "light", "dark"] as ThemePreference[]).map((preference) => (
                 <button key={preference} type="button" className={themePreference === preference ? "selected" : ""} onClick={() => selectThemePreference(preference)} role="menuitemradio" aria-checked={themePreference === preference}>
-                  {themePreference === preference ? "✓ " : ""}{preference === "system" ? "System" : preference[0].toUpperCase() + preference.slice(1)}
+                  <AppearanceIcon preference={preference} />
+                  <span>{preference[0].toUpperCase() + preference.slice(1)}</span>
                 </button>
               ))}
             </div>
@@ -657,26 +706,26 @@ async function handleUpload(event: FormEvent) {
       {renameTarget && <dialog
         ref={renameDialog}
         className="workspace-confirmation"
-        aria-labelledby="rename-document-title"
+        aria-labelledby="rename-title"
         onCancel={(event) => {
           event.preventDefault();
-          if (busyAction !== "rename-document") closeRename();
+          if (busyAction !== "rename") closeRename();
         }}
         onClick={(event) => {
-          if (event.target === event.currentTarget && busyAction !== "rename-document") closeRename();
+          if (event.target === event.currentTarget && busyAction !== "rename") closeRename();
         }}
       >
         <form className="workspace-confirmation-content rename-file-form" onSubmit={(event) => void handleRename(event)}>
-          <h2 id="rename-document-title">Rename file</h2>
+          <h2 id="rename-title">{renameTarget.kind === "set" ? "Rename document set" : "Rename file"}</h2>
           <label>
-            File name
-            <input ref={renameInput} autoFocus required value={renameName} maxLength={250}
-              onChange={(event) => setRenameName(event.target.value)} disabled={busyAction === "rename-document"} />
+            {renameTarget.kind === "set" ? "Document set name" : "File name"}
+            <input ref={renameInput} autoFocus required value={renameName} maxLength={renameTarget.kind === "set" ? 200 : 250}
+              onChange={(event) => setRenameName(event.target.value)} disabled={busyAction === "rename"} />
           </label>
           {renameError && <p role="alert">{renameError}</p>}
           <div className="workspace-confirmation-actions">
-            <button type="button" className="quiet-button" onClick={closeRename} disabled={busyAction === "rename-document"}>Cancel</button>
-            <button type="submit" className="primary-button" disabled={!renameName.trim() || busyAction === "rename-document"}>Rename</button>
+            <button type="button" className="quiet-button" onClick={closeRename} disabled={busyAction === "rename"}>Cancel</button>
+            <button type="submit" className="primary-button" disabled={!renameName.trim() || busyAction === "rename"}>Rename</button>
           </div>
         </form>
       </dialog>}
@@ -700,25 +749,14 @@ async function handleUpload(event: FormEvent) {
           {/* </section> */}
 
           <section className="upload-workspace" aria-labelledby="upload-title">
-            <div className="section-heading">
-              <div>
-                <p className="eyebrow">Start a workspace</p>
-                <h2 id="upload-title">Upload a related document set</h2>
-              </div>
-              <p>Choose 2–20 DOCX files. DocSync keeps the Word layout and converts saved cross-reference values to editable text.</p>
-            </div>
-
             {error && (
               <ErrorAlert message={error} onDismiss={() => setError("")} />
             )}
 
-<form
-  className="upload-panel"
-  onSubmit={handleUpload}
-  noValidate
->
+            <form className="upload-panel" onSubmit={handleUpload} noValidate>
+              <h2 id="upload-title" className="upload-title">Start a workspace</h2>
               <label className="field">
-                <span>Document-set name</span>
+                <span>Name</span>
 
                 <input
                   value={setName}
@@ -760,7 +798,10 @@ async function handleUpload(event: FormEvent) {
                   onChange={handleFiles}
                 />
                 <span className="file-icon" aria-hidden="true">DOCX</span>
-                <strong>Select Word documents</strong>
+                <span className="file-drop-label">
+                  <strong>Select Word documents</strong>
+                  <small>Choose 2–20 DOCX files</small>
+                </span>
                 <small>Files stay private to the local DocumentSync workspace.</small>
               </label>
               {files.length > 0 && (
@@ -861,15 +902,26 @@ async function handleUpload(event: FormEvent) {
                             : "Open workspace"}
                         </span>
                       </button>
-                      <button
-                        type="button"
-                        className="saved-workspace-delete"
-                        onClick={() => void handleDeleteDocumentSet(item)}
-                        disabled={Boolean(busyAction)}
-                        aria-label={`Delete ${item.name}`}
-                      >
-                        Delete
-                      </button>
+                      <div className="saved-workspace-actions">
+                        <button
+                          type="button"
+                          className="quiet-button"
+                          onClick={() => beginRename("set", item.id, item.name)}
+                          disabled={Boolean(busyAction)}
+                          aria-label={`Rename ${item.name}`}
+                        >
+                          Rename
+                        </button>
+                        <button
+                          type="button"
+                          className="saved-workspace-delete"
+                          onClick={() => void handleDeleteDocumentSet(item)}
+                          disabled={Boolean(busyAction)}
+                          aria-label={`Delete ${item.name}`}
+                        >
+                          Delete
+                        </button>
+                      </div>
                     </article>
                   ))}
                 </div>
@@ -882,7 +934,25 @@ async function handleUpload(event: FormEvent) {
           <section className="workspace-heading" aria-labelledby="workspace-title">
             <h1 id="workspace-title">
               <span className="workspace-set-label">Document set:</span>
-              <span className="workspace-set-name" title={documentSet.name}>{documentSet.name}</span>
+              {inlineSetName === null ? (
+                <button type="button" className="workspace-set-name" disabled={Boolean(busyAction)}
+                  aria-label={`Rename ${documentSet.name}`} title="Click to rename"
+                  onClick={() => setInlineSetName(documentSet.name)}>{documentSet.name}</button>
+              ) : (
+                <input className="workspace-set-name-input" aria-label="Document set name" maxLength={200}
+                  autoFocus value={inlineSetName} onFocus={(event) => event.currentTarget.select()}
+                  onChange={(event) => setInlineSetName(event.currentTarget.value)}
+                  onBlur={(event) => void finishInlineSetRename(event.currentTarget.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Escape") {
+                      event.preventDefault();
+                      setInlineSetName(null);
+                    } else if (event.key === "Enter") {
+                      event.preventDefault();
+                      event.currentTarget.blur();
+                    }
+                  }} />
+              )}
             </h1>
             <div className="workspace-heading-controls">
               <div className="office-toolbar-slot" ref={setOfficeToolbar} />
@@ -942,9 +1012,7 @@ async function handleUpload(event: FormEvent) {
                         disabled={Boolean(busyAction)}
                         onClick={(event) => {
                           event.currentTarget.closest<HTMLElement>("[popover]")?.hidePopover();
-                          setRenameName(document.name.replace(/\.docx$/i, ""));
-                          setRenameError("");
-                          setRenameTarget(document);
+                          beginRename("file", document.id, document.name);
                         }}
                       >
                         Rename…

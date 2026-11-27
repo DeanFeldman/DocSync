@@ -284,6 +284,21 @@ def test_saved_document_set_library_lists_and_reopens_workspaces(tmp_path: Path)
         assert reopened.json()["id"] == workspace["id"]
         assert len(reopened.json()["documents"]) == 2
 
+        workspace_url = f"/api/document-sets/{workspace['id']}"
+        for invalid in ("   ", "x" * 201):
+            assert client.patch(workspace_url, json={"name": invalid}).status_code == 422
+        assert client.patch("/api/document-sets/missing", json={"name": "Renamed"}).status_code == 404
+        renamed = client.patch(workspace_url, json={"name": "  Renamed building agreements  "})
+        assert renamed.status_code == 200, renamed.text
+        assert renamed.json() == {"id": workspace["id"], "name": "Renamed building agreements"}
+
+    with TestClient(app) as reopened_client:
+        saved = reopened_client.get(workspace_url).json()
+        assert saved == {**reopened.json(), "name": "Renamed building agreements"}
+        assert reopened_client.get("/api/document-sets").json()["document_sets"] == [
+            {**library.json()["document_sets"][0], "name": "Renamed building agreements"}
+        ]
+
 
 def test_exact_match_preview_generation_and_original_immutability(tmp_path: Path) -> None:
     shared = "The building manager must submit the report every month."

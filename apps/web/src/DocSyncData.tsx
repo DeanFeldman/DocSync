@@ -104,7 +104,9 @@ export default function DocSyncData({ appearance }: { appearance: string }) {
             href={"/api/local-workspace/export?appearance=" + encodeURIComponent(appearance)}
             download
           >
-            <span className="local-data-symbol" aria-hidden="true">↓</span>
+            <svg className="local-data-symbol" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M3 16v5h18v-5M12 17V3M7.5 7.5 12 3l4.5 4.5" />
+            </svg>
             <span>Export all DocSync data</span>
           </a>
           {local && !preview && (
@@ -115,7 +117,9 @@ export default function DocSyncData({ appearance }: { appearance: string }) {
                 disabled={busy}
                 onClick={() => fileInputRef.current?.click()}
               >
-                <span className="local-data-symbol" aria-hidden="true">↑</span>
+                <svg className="local-data-symbol" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <path d="M3 16v5h18v-5M12 3v14m-4.5-4.5L12 17l4.5-4.5" />
+                </svg>
                 <span>Import backup ZIP</span>
               </button>
               <input

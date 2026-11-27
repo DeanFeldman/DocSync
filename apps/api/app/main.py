@@ -42,6 +42,7 @@ from .document_service import (
     list_document_sets,
     preview_edit,
     remove_document_from_set,
+    rename_document_set,
     safe_download_name,
     render_document_with_word,
     rendered_pdf_path,
@@ -326,6 +327,15 @@ def read_document_set(
 ) -> dict:
     return serialize_document_set(get_document_set_or_404(session, document_set_id))
 
+
+@app.patch("/api/document-sets/{document_set_id}")
+def rename_saved_document_set(
+    document_set_id: str,
+    name: str = Body(embed=True),
+    session: Session = Depends(get_session),
+) -> dict:
+    with EDITOR_GENERATION_LOCK:
+        return rename_document_set(session, document_set_id, name)
 
 
 @app.post("/api/document-sets/{document_set_id}/documents", status_code=201)
