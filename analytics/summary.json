@@ -1,9 +1,9 @@
 {
-  "last_updated": "2026-11-27T10:50:44Z",
-  "total_installer_downloads": 38,
-  "downloads_today": 24,
-  "downloads_7d": 24,
-  "downloads_30d": 24,
+  "last_updated": "2026-11-28T10:25:25Z",
+  "total_installer_downloads": 40,
+  "downloads_today": 2,
+  "downloads_7d": 26,
+  "downloads_30d": 26,
   "downloads_by_release": {
     "v1.1.0": 1,
     "v1.10.0": 2,
@@ -15,6 +15,7 @@
     "v1.16.0": 1,
     "v1.17.0": 2,
     "v1.18.0": 2,
+    "v1.18.1": 2,
     "v1.2.0": 2,
     "v1.2.1": 2,
     "v1.3.0": 2,
